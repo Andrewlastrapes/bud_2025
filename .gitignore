@@ -4,6 +4,7 @@
 # Never commit your development or production settings!
 **/appsettings.Development.json
 **/appsettings.Production.json
+**/appsettings.json
 *.user
 
 # =================
