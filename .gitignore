@@ -1,0 +1,30 @@
+# =================
+#  SECRET FILES
+# =================
+# Never commit your development or production settings!
+**/appsettings.Development.json
+**/appsettings.Production.json
+*.user
+
+# =================
+#  .NET CORE
+# =================
+# Ignores build output folders
+**/[Oo]bj/
+**/[Bb]in/
+
+# =================
+#  NODE / EXPO
+# =================
+# Ignores all node_modules folders
+**/node_modules/
+# Ignores Expo's temporary build folder
+**/.expo/
+npm-debug.log
+yarn-error.log
+
+# =================
+#  OS FILES
+# =================
+# Mac
+.DS_Store
