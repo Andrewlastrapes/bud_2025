@@ -29,10 +29,33 @@ export default function LoginScreen() {
         setIsLoading(true);
         setError(null);
         try {
-            await createUserWithEmailAndPassword(auth, email, password);
-            // No navigation needed, the listener will handle it!
+            // Create user in Firebase Authentication
+            const userCredential = await createUserWithEmailAndPassword(auth, email, password);
+            const firebaseUser = userCredential.user;
+
+            // Register user in your database with the Firebase ID
+            const response = await fetch('http://localhost:5150/api/users/register', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({
+                    name: firebaseUser.email?.split('@')[0] || 'User', // Use email prefix as name
+                    email: firebaseUser.email,
+                    firebaseUuid: firebaseUser.uid
+                })
+            });
+
+            if (!response.ok) {
+                throw new Error('Failed to register user in database');
+            }
+
+            const userData = await response.json();
+            console.log('User registered successfully:', userData);
+
         } catch (e) {
             setError(e.message);
+            console.error('Registration error:', e);
         }
         setIsLoading(false);
     };

@@ -6,8 +6,16 @@ using Going.Plaid.Item;
 using Going.Plaid.Link;
 using Microsoft.EntityFrameworkCore;
 using Refit;
+using FirebaseAdmin;
+using Google.Apis.Auth.OAuth2;
 
+// --- App Setup ---
 var builder = WebApplication.CreateBuilder(args);
+
+FirebaseApp.Create(new AppOptions()
+{
+    Credential = GoogleCredential.FromFile("firebase-service-account.json")
+});
 
 // --- SERVICE CONFIGURATION ---
 var plaidConfig = builder.Configuration.GetSection("Plaid");
@@ -30,13 +38,12 @@ builder.Services.AddDbContext<ApiDbContext>(options =>
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen();
 
-
 builder.Services.AddCors(options =>
 {
     options.AddPolicy(name: MyAllowSpecificOrigins,
                       policy =>
                       {
-                          policy.AllowAnyOrigin() // <-- This allows any origin
+                          policy.AllowAnyOrigin()
                                 .AllowAnyHeader()
                                 .AllowAnyMethod();
                       });
@@ -54,9 +61,46 @@ if (app.Environment.IsDevelopment())
 app.UseHttpsRedirection();
 app.UseCors(MyAllowSpecificOrigins);
 
-
-
 // --- API ENDPOINTS ---
+
+// POST: /api/users/register
+app.MapPost("/api/users/register", async (ApiDbContext dbContext, UserRegistrationRequest requestBody) =>
+{
+    try
+    {
+        var existingUser = await dbContext.Users.FirstOrDefaultAsync(u => u.Email == requestBody.Email);
+        if (existingUser != null)
+        {
+            return Results.Conflict(new { message = "User with this email already exists." });
+        }
+
+        var newUser = new User
+        {
+            Name = requestBody.Name,
+            Email = requestBody.Email,
+            FirebaseUuid = requestBody.FirebaseUuid ?? Guid.NewGuid().ToString(),
+            CreatedAt = DateTime.UtcNow,
+            UpdatedAt = DateTime.UtcNow
+        };
+
+        await dbContext.Users.AddAsync(newUser);
+        await dbContext.SaveChangesAsync();
+
+        return Results.Ok(new
+        {
+            message = "User registered successfully",
+            userId = newUser.Id,
+            name = newUser.Name,
+            email = newUser.Email
+        });
+    }
+    catch (Exception e)
+    {
+        return Results.Problem($"Registration failed: {e.Message}");
+    }
+})
+.WithName("RegisterUser")
+.WithOpenApi();
 
 // GET: /api/plaid/categories
 app.MapGet("/api/plaid/categories", async (PlaidClient plaidClient) =>
@@ -69,7 +113,6 @@ app.MapGet("/api/plaid/categories", async (PlaidClient plaidClient) =>
     }
     catch (ApiException e)
     {
-        // THE FIX: Use e.Content to return the raw error string.
         return Results.Problem(e.Content);
     }
 })
@@ -77,11 +120,10 @@ app.MapGet("/api/plaid/categories", async (PlaidClient plaidClient) =>
 .WithOpenApi();
 
 // POST: /api/plaid/create_link_token
-app.MapPost("/api/plaid/create_link_token", async (PlaidClient plaidClient, IConfiguration config) =>
+app.MapPost("/api/plaid/create_link_token", async (PlaidClient plaidClient, IConfiguration config, CreateLinkTokenRequest requestBody) =>
 {
-    var user = new LinkTokenCreateRequestUser { ClientUserId = "user-id-123" };
+    var user = new LinkTokenCreateRequestUser { ClientUserId = requestBody.FirebaseUserId };
 
-    // Parse comma-separated strings from configuration
     var productsString = config["Plaid:Products"] ?? "transactions";
     var products = productsString.Split(',')
         .Select(p => Enum.Parse<Products>(p.Trim(), true))
@@ -92,7 +134,7 @@ app.MapPost("/api/plaid/create_link_token", async (PlaidClient plaidClient, ICon
         .Select(c => Enum.Parse<CountryCode>(c.Trim(), true))
         .ToList();
 
-    var request = new LinkTokenCreateRequest
+    var plaidRequest = new LinkTokenCreateRequest
     {
         ClientName = "Dynamic Budget App",
         Language = Language.English,
@@ -103,8 +145,7 @@ app.MapPost("/api/plaid/create_link_token", async (PlaidClient plaidClient, ICon
 
     try
     {
-        var response = await plaidClient.LinkTokenCreateAsync(request);
-        // Return the token in the format expected by the frontend
+        var response = await plaidClient.LinkTokenCreateAsync(plaidRequest);
         return Results.Ok(new { linkToken = response.LinkToken });
     }
     catch (ApiException e)
@@ -118,35 +159,28 @@ app.MapPost("/api/plaid/create_link_token", async (PlaidClient plaidClient, ICon
 
 // POST: /api/plaid/exchange_public_token
 app.MapPost("/api/plaid/exchange_public_token",
-    async (PlaidClient plaidClient, ApiDbContext dbContext) =>
+    async (PlaidClient plaidClient, ApiDbContext dbContext, ExchangeTokenRequest requestBody) =>
     {
-        var userId = "user-id-123";
-        var publicToken = "A_PUBLIC_TOKEN_FROM_PLAID_LINK";
-
-        var request = new ItemPublicTokenExchangeRequest { PublicToken = publicToken };
+        var plaidRequest = new ItemPublicTokenExchangeRequest { PublicToken = requestBody.PublicToken };
 
         try
         {
-            var response = await plaidClient.ItemPublicTokenExchangeAsync(request);
+            var response = await plaidClient.ItemPublicTokenExchangeAsync(plaidRequest);
 
-            // Find the user's internal database ID from their Firebase ID
-            // We use Andrew's Firebase ID as the default for testing
-            var firebaseId = "QDcsuRf2fjO4KUuVZ9XTdsCExJw2";
-            var user = await dbContext.Users.FirstOrDefaultAsync(u => u.FirebaseUuid == firebaseId);
+            var user = await dbContext.Users.FirstOrDefaultAsync(u => u.FirebaseUuid == requestBody.FirebaseUuid);
 
             if (user == null)
             {
                 return Results.NotFound(new { message = "User not found." });
             }
 
-            // Create the new PlaidItem, matching your existing schema
             var newItem = new PlaidItem
             {
-                UserId = user.Id, // Use the integer ID
+                UserId = user.Id,
                 AccessToken = response.AccessToken,
                 ItemId = response.ItemId,
-                InstitutionName = "New Institution", // We can get this from another Plaid call
-                InstitutionLogo = null, // We'd fetch this too
+                InstitutionName = "New Institution",
+                InstitutionLogo = null,
                 CreatedAt = DateTime.UtcNow,
                 UpdatedAt = DateTime.UtcNow
             };
@@ -158,12 +192,68 @@ app.MapPost("/api/plaid/exchange_public_token",
         }
         catch (ApiException e)
         {
-            // THE FIX: And here.
             return Results.Problem(e.Content);
         }
     })
 .WithName("ExchangePublicToken")
 .WithOpenApi();
 
+app.MapGet("/api/plaid/accounts", async (ApiDbContext dbContext, HttpContext httpContext) =>
+{
+    try
+    {
+        // 1. Get the token from the Authorization header
+        string? idToken = httpContext.Request.Headers["Authorization"].FirstOrDefault()?.Split(" ").Last();
+        if (string.IsNullOrEmpty(idToken))
+        {
+            return Results.Unauthorized();
+        }
+
+        // 2. Verify the token with Firebase
+        var decodedToken = await FirebaseAdmin.Auth.FirebaseAuth.DefaultInstance
+            .VerifyIdTokenAsync(idToken);
+        var firebaseUuid = decodedToken.Uid;
+
+        // 3. Find the user in your database
+        var user = await dbContext.Users.FirstOrDefaultAsync(u => u.FirebaseUuid == firebaseUuid);
+        if (user == null)
+        {
+            return Results.NotFound(new { message = "User not found." });
+        }
+
+        // 4. Fetch the user's Plaid items
+        var accounts = await dbContext.PlaidItems
+            .Where(item => item.UserId == user.Id)
+            .Select(item => new
+            { // Only return safe data
+                item.Id,
+                item.InstitutionName,
+                item.InstitutionLogo
+            })
+            .ToListAsync();
+
+        return Results.Ok(accounts);
+    }
+    catch (Exception e)
+    {
+        // Handle token verification errors or database errors
+        return Results.Problem(e.Message);
+    }
+})
+.WithName("GetUserPlaidAccounts")
+.WithOpenApi();
+
 // --- RUN THE APP ---
 app.Run();
+
+// --- TYPE DECLARATIONS (MUST COME AFTER TOP-LEVEL STATEMENTS) ---
+// These classes/records define the expected JSON data for your API endpoints.
+
+// Used for POST /api/users/register
+public record UserRegistrationRequest(string Name, string Email, string FirebaseUuid);
+
+// Used for POST /api/plaid/create_link_token
+public record CreateLinkTokenRequest(string FirebaseUserId);
+
+// Used for POST /api/plaid/exchange_public_token
+public record ExchangeTokenRequest(string PublicToken, string FirebaseUuid);

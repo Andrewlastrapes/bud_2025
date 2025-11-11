@@ -29,3 +29,6 @@ yarn-error.log
 # =================
 # Mac
 .DS_Store
+
+
+**/firebase-service-account.json
