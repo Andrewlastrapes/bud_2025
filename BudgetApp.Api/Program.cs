@@ -243,6 +243,86 @@ app.MapGet("/api/plaid/accounts", async (ApiDbContext dbContext, HttpContext htt
 .WithName("GetUserPlaidAccounts")
 .WithOpenApi();
 
+// ... after your Plaid endpoints ...
+
+// GET: /api/balance (Get the current dynamic amount)
+app.MapGet("/api/balance", async (ApiDbContext dbContext, HttpContext httpContext) =>
+{
+    try
+    {
+        // 1. Securely get the user from the token
+        string? idToken = httpContext.Request.Headers["Authorization"].FirstOrDefault()?.Split(" ").Last();
+        if (string.IsNullOrEmpty(idToken)) return Results.Unauthorized();
+
+        var decodedToken = await FirebaseAdmin.Auth.FirebaseAuth.DefaultInstance.VerifyIdTokenAsync(idToken);
+        var firebaseUuid = decodedToken.Uid;
+
+        var user = await dbContext.Users.FirstOrDefaultAsync(u => u.FirebaseUuid == firebaseUuid);
+        if (user == null) return Results.NotFound("User not found.");
+
+        // 2. Get the balance
+        var balanceRecord = await dbContext.Balances.FirstOrDefaultAsync(b => b.UserId == user.Id);
+
+        // If no balance exists yet, return 0
+        return Results.Ok(new { amount = balanceRecord?.BalanceAmount ?? 0 });
+    }
+    catch (Exception e)
+    {
+        return Results.Problem(e.Message);
+    }
+})
+.WithName("GetBalance")
+.WithOpenApi();
+
+// POST: /api/balance (Set the initial paycheck amount)
+app.MapPost("/api/balance", async (ApiDbContext dbContext, HttpContext httpContext, SetBalanceRequest request) =>
+{
+    try
+    {
+        // 1. Securely get the user
+        string? idToken = httpContext.Request.Headers["Authorization"].FirstOrDefault()?.Split(" ").Last();
+        if (string.IsNullOrEmpty(idToken)) return Results.Unauthorized();
+
+        var decodedToken = await FirebaseAdmin.Auth.FirebaseAuth.DefaultInstance.VerifyIdTokenAsync(idToken);
+        var firebaseUuid = decodedToken.Uid;
+
+        var user = await dbContext.Users.FirstOrDefaultAsync(u => u.FirebaseUuid == firebaseUuid);
+        if (user == null) return Results.NotFound("User not found.");
+
+        // 2. Find existing balance or create new one
+        var balanceRecord = await dbContext.Balances.FirstOrDefaultAsync(b => b.UserId == user.Id);
+
+        if (balanceRecord == null)
+        {
+            // Create new
+            balanceRecord = new Balance
+            {
+                UserId = user.Id,
+                BalanceAmount = request.Amount,
+                CreatedAt = DateTime.UtcNow,
+                UpdatedAt = DateTime.UtcNow
+            };
+            await dbContext.Balances.AddAsync(balanceRecord);
+        }
+        else
+        {
+            // Update existing
+            balanceRecord.BalanceAmount = request.Amount;
+            balanceRecord.UpdatedAt = DateTime.UtcNow;
+        }
+
+        await dbContext.SaveChangesAsync();
+
+        return Results.Ok(new { message = "Balance updated successfully", amount = balanceRecord.BalanceAmount });
+    }
+    catch (Exception e)
+    {
+        return Results.Problem(e.Message);
+    }
+})
+.WithName("SetBalance")
+.WithOpenApi();
+
 // --- RUN THE APP ---
 app.Run();
 

@@ -8,6 +8,7 @@ public class PlaidItem
 {
     [Key]
     [DatabaseGenerated(DatabaseGeneratedOption.Identity)]
+    [Column("id")]
     public int Id { get; set; }
 
     [Column("institution_name")]
@@ -19,18 +20,18 @@ public class PlaidItem
     [Column("access_token")]
     public string AccessToken { get; set; } = string.Empty;
 
-    [Column("itemIds")] // You had "itemIds" - is this one Item ID or many?
-    public string ItemId { get; set; } = string.Empty; // Renamed for clarity in C#
+    [Column("itemIds")]
+    public string ItemId { get; set; } = string.Empty;
 
     [Column("userId")]
-    public int UserId { get; set; } // Foreign key
+    public int UserId { get; set; }
 
     [Column("createdAt")]
     public DateTime CreatedAt { get; set; }
+
     [Column("updatedAt")]
     public DateTime UpdatedAt { get; set; }
 
-    // Navigation property
     [ForeignKey(nameof(UserId))]
     public virtual User? User { get; set; }
 }

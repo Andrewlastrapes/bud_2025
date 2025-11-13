@@ -3,13 +3,13 @@ import { View, ActivityIndicator, StyleSheet } from 'react-native';
 import { NavigationContainer } from '@react-navigation/native';
 import { createBottomTabNavigator } from '@react-navigation/bottom-tabs';
 import { createNativeStackNavigator } from '@react-navigation/native-stack';
-import { PaperProvider, DefaultTheme } from 'react-native-paper';
+import { PaperProvider, DefaultTheme, Button } from 'react-native-paper';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
 import MaterialCommunityIcons from 'react-native-vector-icons/MaterialCommunityIcons';
 
-// Import our auth object
+// Import auth object
 import { auth } from './firebaseConfig';
-import { onAuthStateChanged } from 'firebase/auth';
+import { onAuthStateChanged, signOut } from 'firebase/auth';
 
 // --- Import Screens ---
 import HomeScreen from './screens/HomeScreen';
@@ -22,7 +22,8 @@ const Stack = createNativeStackNavigator();
 const Tab = createBottomTabNavigator();
 
 /**
- * This is our main app, shown ONLY to logged-in users.
+ * This is the main tab navigator.
+ * We HIDE the header here because the parent Stack will provide it.
  */
 function AppTabs() {
   return (
@@ -30,7 +31,7 @@ function AppTabs() {
       initialRouteName="Home"
       screenOptions={{
         tabBarActiveTintColor: '#6200ee',
-        headerShown: false,
+        headerShown: false, // Hide tab-level headers
       }}
     >
       <Tab.Screen
@@ -68,7 +69,7 @@ function AppTabs() {
 }
 
 /**
- * This is the loading screen, shown while we check for a user.
+ * Loading screen
  */
 function LoadingScreen() {
   return (
@@ -79,21 +80,24 @@ function LoadingScreen() {
 }
 
 /**
- * This is the main App component.
- * It's now the "gatekeeper" that decides what to show.
+ * Main App Component
  */
 export default function App() {
-  const [user, setUser] = useState(null); // The logged-in user
-  const [isLoading, setIsLoading] = useState(true); // Check if we're validating auth
+  const [user, setUser] = useState(null);
+  const [isLoading, setIsLoading] = useState(true);
 
-  // Listen for auth state changes
   useEffect(() => {
     const unsubscribe = onAuthStateChanged(auth, (user) => {
-      setUser(user); // Set the user (or null)
-      setIsLoading(false); // Done loading
-    });
 
-    // Cleanup subscription on unmount
+      if (user) {
+        console.log("✅ LOGGED IN USER:", user.email);
+        console.log("   UID:", user.uid);
+      } else {
+        console.log("❌ No user is logged in");
+      }
+      setUser(user);
+      setIsLoading(false);
+    });
     return () => unsubscribe();
   }, []);
 
@@ -101,16 +105,27 @@ export default function App() {
     <SafeAreaProvider>
       <PaperProvider theme={DefaultTheme}>
         <NavigationContainer>
-          {/* This is the "gatekeeper" logic:
-            - If loading, show loading screen
-            - If no user, show Login screen
-            - If user, show the main app
-          */}
           {isLoading ? (
             <LoadingScreen />
           ) : user ? (
-            <AppTabs />
+            // --- LOGGED IN STACK ---
+            // We wrap AppTabs in a Stack to give it a global header
+            <Stack.Navigator>
+              <Stack.Screen
+                name="App"
+                component={AppTabs}
+                options={{
+                  // Title is the user's email prefix (e.g., "andrewlastrapes")
+                  title: user.email ? user.email.split('@')[0] : 'Budget App',
+                  // Right header button is Logout
+                  headerRight: () => (
+                    <Button onPress={() => signOut(auth)}>Logout</Button>
+                  ),
+                }}
+              />
+            </Stack.Navigator>
           ) : (
+            // --- LOGGED OUT STACK ---
             <Stack.Navigator>
               <Stack.Screen
                 name="Login"

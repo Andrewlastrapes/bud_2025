@@ -21,6 +21,6 @@ public class ApiDbContext : DbContext
         // It tells EF to respect the names we defined in the [Table] attributes.
         modelBuilder.Entity<User>().ToTable("Users");
         modelBuilder.Entity<PlaidItem>().ToTable("PlaidItems");
-        modelBuilder.Entity<Balance>().ToTable("Balance");
+        modelBuilder.Entity<Balance>().ToTable("Balances");
     }
 }
