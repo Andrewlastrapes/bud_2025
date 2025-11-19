@@ -3,7 +3,7 @@ using System.ComponentModel.DataAnnotations.Schema;
 
 namespace BudgetApp.Api.Data;
 
-[Table("users")]
+[Table("Users")]
 public class User
 {
     [Key]
@@ -25,6 +25,9 @@ public class User
 
     [Column("updatedAt")]
     public DateTime UpdatedAt { get; set; }
+
+    [Column("onboarding_complete")]
+    public bool OnboardingComplete { get; set; } = false;
 
     public virtual ICollection<PlaidItem> PlaidItems { get; set; } = new List<PlaidItem>();
     public virtual ICollection<Balance> Balances { get; set; } = new List<Balance>();

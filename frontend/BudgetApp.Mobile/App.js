@@ -6,37 +6,47 @@ import { createNativeStackNavigator } from '@react-navigation/native-stack';
 import { PaperProvider, DefaultTheme, Button } from 'react-native-paper';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
 import MaterialCommunityIcons from 'react-native-vector-icons/MaterialCommunityIcons';
+import axios from 'axios';
 
-// Import auth object
+// Import our auth object
 import { auth } from './firebaseConfig';
 import { onAuthStateChanged, signOut } from 'firebase/auth';
 
-// --- Import Screens ---
+// --- Import Screens & Navigators ---
 import HomeScreen from './screens/HomeScreen';
 import TransactionsScreen from './screens/TransactionsScreen';
 import SettingsScreen from './screens/SettingsScreen';
 import LoginScreen from './screens/LoginScreen';
+import OnboardingStack from './navigation/OnboardingStack'; // Renders the multi-page flow
+
+// --- API Base URL ---
+const API_BASE_URL = 'http://localhost:5150';
 
 // --- Create Navigators ---
 const Stack = createNativeStackNavigator();
 const Tab = createBottomTabNavigator();
 
 /**
- * This is the main tab navigator.
- * We HIDE the header here because the parent Stack will provide it.
+ * Main Tab Navigator (The visible tabs at the bottom)
+ */
+// File: App.js
+
+// File: App.js
+
+/**
+ * This is our main tab navigator.
  */
 function AppTabs() {
   return (
     <Tab.Navigator
-      initialRouteName="Home"
       screenOptions={{
         tabBarActiveTintColor: '#6200ee',
-        headerShown: false, // Hide tab-level headers
+        headerShown: false,
       }}
     >
       <Tab.Screen
         name="Home"
-        component={HomeScreen}
+        component={HomeScreen} // <--- MUST have this line
         options={{
           tabBarLabel: 'Home',
           tabBarIcon: ({ color, size }) => (
@@ -46,7 +56,7 @@ function AppTabs() {
       />
       <Tab.Screen
         name="Transactions"
-        component={TransactionsScreen}
+        component={TransactionsScreen} // <--- MUST have this line
         options={{
           tabBarLabel: 'Spending',
           tabBarIcon: ({ color, size }) => (
@@ -56,7 +66,7 @@ function AppTabs() {
       />
       <Tab.Screen
         name="Settings"
-        component={SettingsScreen}
+        component={SettingsScreen} // <--- MUST have this line
         options={{
           tabBarLabel: 'Settings',
           tabBarIcon: ({ color, size }) => (
@@ -80,22 +90,83 @@ function LoadingScreen() {
 }
 
 /**
- * Main App Component
+ * Content Navigator (Checks the DB and routes to AppTabs or Onboarding)
  */
-export default function App() {
-  const [user, setUser] = useState(null);
+function MainContentNavigator({ fbUser }) {
+  const [dbUser, setDbUser] = useState(null); // Database User (to check onboarding status)
   const [isLoading, setIsLoading] = useState(true);
 
+  // Fetches the user's full database record (including onboarding_complete)
+  const fetchUserProfile = async () => {
+    try {
+      const idToken = await fbUser.getIdToken();
+      const response = await axios.get(`${API_BASE_URL}/api/users/profile`, {
+        headers: { 'Authorization': `Bearer ${idToken}` }
+      });
+
+      console.log("Fetched user profile:", response.data);
+      // The backend returns the user object with the onboardingComplete flag
+      setDbUser(response.data);
+    } catch (e) {
+      console.error("Failed to fetch user profile:", e);
+      setDbUser(null);
+    }
+    setIsLoading(false);
+  };
+
+  useEffect(() => {
+    // Fetch profile only if we have a Firebase user
+    if (fbUser) {
+      fetchUserProfile();
+    }
+  }, [fbUser]);
+
+  if (isLoading) {
+    return <LoadingScreen />;
+  }
+
+  // --- GATEKEEPER LOGIC ---
+  // If user is in DB but has not completed onboarding
+  if (dbUser && !dbUser.onboardingComplete) {
+    return (
+      <Stack.Navigator screenOptions={{ headerShown: false }}>
+        <Stack.Screen name="OnboardingFlow" component={OnboardingStack} />
+      </Stack.Navigator>
+    );
+  }
+
+  // User is logged in and onboarding is complete, show main app
+  return (
+    <Stack.Navigator>
+      <Stack.Screen
+        name="App"
+        component={AppTabs}
+        options={{
+          // Use the user's name from the database, or fall back to email prefix
+          title: dbUser?.name || fbUser?.email?.split('@')[0] || 'Budget App',
+          headerRight: () => (
+            <Button onPress={() => signOut(auth)}>
+              Logout
+            </Button>
+          ),
+        }}
+      />
+    </Stack.Navigator>
+  );
+}
+
+
+/**
+ * Main App Component (The initial Gatekeeper)
+ */
+export default function App() {
+  const [fbUser, setFbUser] = useState(null);
+  const [isLoading, setIsLoading] = useState(true);
+
+  // Listen for Firebase auth state changes
   useEffect(() => {
     const unsubscribe = onAuthStateChanged(auth, (user) => {
-
-      if (user) {
-        console.log("✅ LOGGED IN USER:", user.email);
-        console.log("   UID:", user.uid);
-      } else {
-        console.log("❌ No user is logged in");
-      }
-      setUser(user);
+      setFbUser(user);
       setIsLoading(false);
     });
     return () => unsubscribe();
@@ -107,25 +178,11 @@ export default function App() {
         <NavigationContainer>
           {isLoading ? (
             <LoadingScreen />
-          ) : user ? (
-            // --- LOGGED IN STACK ---
-            // We wrap AppTabs in a Stack to give it a global header
-            <Stack.Navigator>
-              <Stack.Screen
-                name="App"
-                component={AppTabs}
-                options={{
-                  // Title is the user's email prefix (e.g., "andrewlastrapes")
-                  title: user.email ? user.email.split('@')[0] : 'Budget App',
-                  // Right header button is Logout
-                  headerRight: () => (
-                    <Button onPress={() => signOut(auth)}>Logout</Button>
-                  ),
-                }}
-              />
-            </Stack.Navigator>
+          ) : fbUser ? (
+            // Logged in: Check DB status via MainContentNavigator
+            <MainContentNavigator fbUser={fbUser} />
           ) : (
-            // --- LOGGED OUT STACK ---
+            // Logged out: Show Login Screen
             <Stack.Navigator>
               <Stack.Screen
                 name="Login"

@@ -11,6 +11,9 @@ public class ApiDbContext : DbContext
     public DbSet<User> Users { get; set; }
     public DbSet<PlaidItem> PlaidItems { get; set; }
     public DbSet<Balance> Balances { get; set; }
+    public DbSet<Transaction> Transactions { get; set; }
+    public DbSet<FixedCost> FixedCosts { get; set; }
+
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
@@ -22,5 +25,8 @@ public class ApiDbContext : DbContext
         modelBuilder.Entity<User>().ToTable("Users");
         modelBuilder.Entity<PlaidItem>().ToTable("PlaidItems");
         modelBuilder.Entity<Balance>().ToTable("Balances");
+        modelBuilder.Entity<Transaction>().ToTable("Transactions");
+        modelBuilder.Entity<FixedCost>().ToTable("FixedCosts");
+
     }
 }

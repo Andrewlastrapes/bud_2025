@@ -323,6 +323,317 @@ app.MapPost("/api/balance", async (ApiDbContext dbContext, HttpContext httpConte
 .WithName("SetBalance")
 .WithOpenApi();
 
+// POST: /api/transactions/sync
+app.MapPost("/api/transactions/sync", async (ApiDbContext dbContext, PlaidClient plaidClient, HttpContext httpContext) =>
+{
+    try
+    {
+        // 1. Auth: Securely get the User from Firebase Token
+        string? idToken = httpContext.Request.Headers["Authorization"].FirstOrDefault()?.Split(" ").Last();
+        if (string.IsNullOrEmpty(idToken)) return Results.Unauthorized();
+
+        var decodedToken = await FirebaseAdmin.Auth.FirebaseAuth.DefaultInstance.VerifyIdTokenAsync(idToken);
+        var user = await dbContext.Users.FirstOrDefaultAsync(u => u.FirebaseUuid == decodedToken.Uid);
+        if (user == null) return Results.NotFound("User not found.");
+
+        // 2. Get the User's Plaid Link (Access Token)
+        var plaidItem = await dbContext.PlaidItems.FirstOrDefaultAsync(p => p.UserId == user.Id);
+        if (plaidItem == null) return Results.Ok(new { message = "No bank linked." });
+
+        // 3. Fetch User's Fixed Costs (to check against new transactions)
+        var fixedCosts = await dbContext.FixedCosts
+            .Where(fc => fc.UserId == user.Id)
+            .ToListAsync();
+
+        // 4. Call Plaid API for new data
+        var request = new Going.Plaid.Transactions.TransactionsSyncRequest
+        {
+            AccessToken = plaidItem.AccessToken,
+            Cursor = plaidItem.Cursor, // Send our last known position
+            Count = 100
+        };
+
+        var response = await plaidClient.TransactionsSyncAsync(request);
+
+        var newTransactions = new List<BudgetApp.Api.Data.Transaction>();
+        decimal variableSpend = 0; // We only track spend that ISN'T a fixed cost
+
+        // 5. Process "Added" Transactions
+        foreach (var t in response.Added)
+        {
+            // Idempotency Check: Skip if we already saved this transaction
+            var exists = await dbContext.Transactions.AnyAsync(x => x.PlaidTransactionId == t.TransactionId);
+            if (!exists)
+            {
+                // FIX: Convert Plaid's DateOnly to a UTC DateTime for Postgres
+                DateTime txDate = t.Date.GetValueOrDefault(DateOnly.FromDateTime(DateTime.UtcNow)).ToDateTime(TimeOnly.MinValue);
+                DateTime txDateUtc = DateTime.SpecifyKind(txDate, DateTimeKind.Utc);
+
+                // Use the clean MerchantName if available, otherwise the raw Name
+                string merchantName = t.MerchantName ?? t.Name;
+
+                var newTx = new BudgetApp.Api.Data.Transaction
+                {
+                    UserId = user.Id,
+                    PlaidTransactionId = t.TransactionId,
+                    AccountId = t.AccountId,
+                    Amount = t.Amount ?? 0m, // Handle nullable decimal
+                    Date = txDateUtc,
+                    Name = merchantName,
+                    MerchantName = t.MerchantName,
+                    Pending = t.Pending ?? false,
+                    CreatedAt = DateTime.UtcNow,
+                    UpdatedAt = DateTime.UtcNow
+                };
+
+                await dbContext.Transactions.AddAsync(newTx);
+                newTransactions.Add(newTx);
+
+                // --- SMART LOGIC: Check if this is a Fixed Cost ---
+                // We check if the incoming name matches either the User's Name ("My Netflix") 
+                // or the official Plaid Merchant Name ("Netflix") stored in FixedCosts.
+                bool isFixed = fixedCosts.Any(fc =>
+                    (fc.Name.Equals(merchantName, StringComparison.OrdinalIgnoreCase)) ||
+                    (!string.IsNullOrEmpty(fc.PlaidMerchantName) && fc.PlaidMerchantName.Equals(merchantName, StringComparison.OrdinalIgnoreCase))
+                );
+
+                if (isFixed)
+                {
+                    // It matches a Fixed Cost! Ignore it for the balance calculation.
+                    Console.WriteLine($"IGNORED FIXED COST: {merchantName} (${newTx.Amount})");
+                }
+                else
+                {
+                    // It's a VARIABLE cost (coffee, gas), so we add it to the deduction total.
+                    variableSpend += newTx.Amount;
+                }
+            }
+        }
+
+        // 6. Update Balance ONLY with Variable Spend
+        if (variableSpend > 0)
+        {
+            var balanceRecord = await dbContext.Balances.FirstOrDefaultAsync(b => b.UserId == user.Id);
+            if (balanceRecord != null)
+            {
+                balanceRecord.BalanceAmount -= variableSpend;
+                balanceRecord.UpdatedAt = DateTime.UtcNow;
+            }
+        }
+
+        // 7. Save Cursor and DB Changes
+        plaidItem.Cursor = response.NextCursor;
+        await dbContext.SaveChangesAsync();
+
+        return Results.Ok(new
+        {
+            message = "Sync complete",
+            added = response.Added.Count,
+            ignoredFixedCostsCount = newTransactions.Count(t => !fixedCosts.Any(fc => fc.Name == t.Name)), // Approx count for debug
+            deductedAmount = variableSpend
+        });
+    }
+    catch (Exception e)
+    {
+        return Results.Problem(e.Message);
+    }
+})
+.WithName("SyncTransactions")
+.WithOpenApi();
+// GET: /api/transactions (Get all transactions for the user)
+app.MapGet("/api/transactions", async (ApiDbContext dbContext, HttpContext httpContext) =>
+{
+    try
+    {
+        // 1. Auth: Get the User
+        string? idToken = httpContext.Request.Headers["Authorization"].FirstOrDefault()?.Split(" ").Last();
+        if (string.IsNullOrEmpty(idToken)) return Results.Unauthorized();
+
+        var decodedToken = await FirebaseAdmin.Auth.FirebaseAuth.DefaultInstance.VerifyIdTokenAsync(idToken);
+        var user = await dbContext.Users.FirstOrDefaultAsync(u => u.FirebaseUuid == decodedToken.Uid);
+        if (user == null) return Results.NotFound("User not found.");
+
+        // 2. Fetch all transactions for this user, newest first
+        var transactions = await dbContext.Transactions
+            .Where(t => t.UserId == user.Id)
+            .OrderByDescending(t => t.Date)
+            .ToListAsync();
+
+        return Results.Ok(transactions);
+    }
+    catch (Exception e)
+    {
+        return Results.Problem(e.Message);
+    }
+})
+.WithName("GetTransactions")
+.WithOpenApi();
+
+// --- Endpoint to GET all fixed costs for the user ---
+app.MapGet("/api/fixed-costs", async (ApiDbContext dbContext, HttpContext httpContext) =>
+{
+    try
+    {
+        string? idToken = httpContext.Request.Headers["Authorization"].FirstOrDefault()?.Split(" ").Last();
+        if (string.IsNullOrEmpty(idToken)) return Results.Unauthorized();
+
+        var decodedToken = await FirebaseAdmin.Auth.FirebaseAuth.DefaultInstance.VerifyIdTokenAsync(idToken);
+        var user = await dbContext.Users.FirstOrDefaultAsync(u => u.FirebaseUuid == decodedToken.Uid);
+        if (user == null) return Results.NotFound("User not found.");
+
+        var costs = await dbContext.FixedCosts
+            .Where(fc => fc.UserId == user.Id)
+            .OrderBy(fc => fc.Name)
+            .ToListAsync();
+
+        return Results.Ok(costs);
+    }
+    catch (Exception e)
+    {
+        return Results.Problem(e.Message);
+    }
+})
+.WithName("GetFixedCosts")
+.WithOpenApi();
+
+// --- Endpoint to ADD a new MANUAL fixed cost ---
+app.MapPost("/api/fixed-costs", async (ApiDbContext dbContext, HttpContext httpContext, FixedCost requestBody) =>
+{
+    try
+    {
+        string? idToken = httpContext.Request.Headers["Authorization"].FirstOrDefault()?.Split(" ").Last();
+        if (string.IsNullOrEmpty(idToken)) return Results.Unauthorized();
+
+        var decodedToken = await FirebaseAdmin.Auth.FirebaseAuth.DefaultInstance.VerifyIdTokenAsync(idToken);
+        var user = await dbContext.Users.FirstOrDefaultAsync(u => u.FirebaseUuid == decodedToken.Uid);
+        if (user == null) return Results.NotFound("User not found.");
+
+        // Create new FixedCost from the request body
+        var newCost = new FixedCost
+        {
+            UserId = user.Id,
+            Name = requestBody.Name,
+            Amount = requestBody.Amount,
+            Category = requestBody.Category ?? "other",
+            Type = "manual", // Explicitly set as manual
+            PlaidMerchantName = requestBody.PlaidMerchantName,
+            UserHasApproved = true,
+            CreatedAt = DateTime.UtcNow,
+            UpdatedAt = DateTime.UtcNow
+        };
+
+        await dbContext.FixedCosts.AddAsync(newCost);
+        await dbContext.SaveChangesAsync();
+
+        return Results.Ok(newCost);
+    }
+    catch (Exception e)
+    {
+        return Results.Problem(e.Message);
+    }
+})
+.WithName("AddFixedCost")
+.WithOpenApi();
+
+// --- Endpoint to DELETE a fixed cost ---
+app.MapDelete("/api/fixed-costs/{id}", async (ApiDbContext dbContext, HttpContext httpContext, int id) =>
+{
+    try
+    {
+        string? idToken = httpContext.Request.Headers["Authorization"].FirstOrDefault()?.Split(" ").Last();
+        if (string.IsNullOrEmpty(idToken)) return Results.Unauthorized();
+
+        var decodedToken = await FirebaseAdmin.Auth.FirebaseAuth.DefaultInstance.VerifyIdTokenAsync(idToken);
+        var user = await dbContext.Users.FirstOrDefaultAsync(u => u.FirebaseUuid == decodedToken.Uid);
+        if (user == null) return Results.NotFound("User not found.");
+
+        // Find the cost by its ID and make sure it belongs to this user
+        var cost = await dbContext.FixedCosts.FirstOrDefaultAsync(fc => fc.Id == id && fc.UserId == user.Id);
+        if (cost == null)
+        {
+            return Results.NotFound("Cost not found or you do not have permission.");
+        }
+
+        dbContext.FixedCosts.Remove(cost);
+        await dbContext.SaveChangesAsync();
+
+        return Results.Ok(new { message = "Fixed cost deleted." });
+    }
+    catch (Exception e)
+    {
+        return Results.Problem(e.Message);
+    }
+})
+.WithName("DeleteFixedCost")
+.WithOpenApi();
+
+// GET: /api/users/profile
+app.MapGet("/api/users/profile", async (ApiDbContext dbContext, HttpContext httpContext) =>
+{
+    try
+    {
+        string? idToken = httpContext.Request.Headers["Authorization"].FirstOrDefault()?.Split(" ").Last();
+        if (string.IsNullOrEmpty(idToken)) return Results.Unauthorized();
+
+        var decodedToken = await FirebaseAdmin.Auth.FirebaseAuth.DefaultInstance.VerifyIdTokenAsync(idToken);
+        var firebaseUuid = decodedToken.Uid;
+
+        var user = await dbContext.Users.FirstOrDefaultAsync(u => u.FirebaseUuid == firebaseUuid);
+
+        if (user == null)
+        {
+            return Results.NotFound(new { message = "User not found in database." });
+        }
+
+        return Results.Ok(user);
+    }
+    catch (Exception e)
+    {
+        return Results.Problem($"Error fetching profile: {e.Message}");
+    }
+})
+.WithName("GetUserProfile")
+.WithOpenApi();
+
+// GET: /api/plaid/recurring (Fetches Plaid's AI-detected recurring expenses)
+app.MapGet("/api/plaid/recurring", async (ApiDbContext dbContext, PlaidClient plaidClient, HttpContext httpContext) =>
+{
+    try
+    {
+        // 1. Auth: Securely get the User
+        string? idToken = httpContext.Request.Headers["Authorization"].FirstOrDefault()?.Split(" ").Last();
+        if (string.IsNullOrEmpty(idToken)) return Results.Unauthorized();
+
+        var decodedToken = await FirebaseAdmin.Auth.FirebaseAuth.DefaultInstance.VerifyIdTokenAsync(idToken);
+        var user = await dbContext.Users.FirstOrDefaultAsync(u => u.FirebaseUuid == decodedToken.Uid);
+        if (user == null) return Results.NotFound("User not found.");
+
+        // 2. Get the Plaid Item (Access Token)
+        var plaidItem = await dbContext.PlaidItems.FirstOrDefaultAsync(p => p.UserId == user.Id);
+        if (plaidItem == null) return Results.Ok(new { message = "No bank linked." });
+
+        // 3. Call Plaid /transactions/recurring/get (Plaid recommends 180 days of history)
+        var request = new Going.Plaid.Transactions.TransactionsRecurringGetRequest
+        {
+            AccessToken = plaidItem.AccessToken,
+        };
+
+        var response = await plaidClient.TransactionsRecurringGetAsync(request);
+
+        // 4. Return the recurring streams (subscriptions)
+        return Results.Ok(new
+        {
+            inflow_streams = response.InflowStreams,
+            outflow_streams = response.OutflowStreams
+        });
+    }
+    catch (Exception e)
+    {
+        return Results.Problem(e.Message);
+    }
+})
+.WithName("GetPlaidRecurring")
+.WithOpenApi();
 // --- RUN THE APP ---
 app.Run();
 

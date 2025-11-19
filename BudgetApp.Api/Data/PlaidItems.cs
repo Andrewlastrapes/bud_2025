@@ -32,6 +32,9 @@ public class PlaidItem
     [Column("updatedAt")]
     public DateTime UpdatedAt { get; set; }
 
+    [Column("cursor")]
+    public string? Cursor { get; set; }
+
     [ForeignKey(nameof(UserId))]
     public virtual User? User { get; set; }
 }
