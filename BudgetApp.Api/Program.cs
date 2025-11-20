@@ -8,6 +8,7 @@ using Microsoft.EntityFrameworkCore;
 using Refit;
 using FirebaseAdmin;
 using Google.Apis.Auth.OAuth2;
+using BudgetApp.Api.Services; // <-- This is the missing line
 
 // --- App Setup ---
 var builder = WebApplication.CreateBuilder(args);
@@ -37,6 +38,8 @@ builder.Services.AddDbContext<ApiDbContext>(options =>
 
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen();
+
+builder.Services.AddScoped<ITransactionService, TransactionService>();
 
 builder.Services.AddCors(options =>
 {
@@ -324,119 +327,31 @@ app.MapPost("/api/balance", async (ApiDbContext dbContext, HttpContext httpConte
 .WithOpenApi();
 
 // POST: /api/transactions/sync
-app.MapPost("/api/transactions/sync", async (ApiDbContext dbContext, PlaidClient plaidClient, HttpContext httpContext) =>
+app.MapPost("/api/transactions/sync", async (ITransactionService transactionService, HttpContext httpContext) =>
 {
     try
     {
-        // 1. Auth: Securely get the User from Firebase Token
+        // 1. Auth: Securely get the User's UID from the token
         string? idToken = httpContext.Request.Headers["Authorization"].FirstOrDefault()?.Split(" ").Last();
         if (string.IsNullOrEmpty(idToken)) return Results.Unauthorized();
 
         var decodedToken = await FirebaseAdmin.Auth.FirebaseAuth.DefaultInstance.VerifyIdTokenAsync(idToken);
-        var user = await dbContext.Users.FirstOrDefaultAsync(u => u.FirebaseUuid == decodedToken.Uid);
-        if (user == null) return Results.NotFound("User not found.");
+        var firebaseUuid = decodedToken.Uid;
 
-        // 2. Get the User's Plaid Link (Access Token)
-        var plaidItem = await dbContext.PlaidItems.FirstOrDefaultAsync(p => p.UserId == user.Id);
-        if (plaidItem == null) return Results.Ok(new { message = "No bank linked." });
+        // 2. Call the reusable service logic
+        var response = await transactionService.SyncAndProcessTransactions(firebaseUuid);
 
-        // 3. Fetch User's Fixed Costs (to check against new transactions)
-        var fixedCosts = await dbContext.FixedCosts
-            .Where(fc => fc.UserId == user.Id)
-            .ToListAsync();
-
-        // 4. Call Plaid API for new data
-        var request = new Going.Plaid.Transactions.TransactionsSyncRequest
-        {
-            AccessToken = plaidItem.AccessToken,
-            Cursor = plaidItem.Cursor, // Send our last known position
-            Count = 100
-        };
-
-        var response = await plaidClient.TransactionsSyncAsync(request);
-
-        var newTransactions = new List<BudgetApp.Api.Data.Transaction>();
-        decimal variableSpend = 0; // We only track spend that ISN'T a fixed cost
-
-        // 5. Process "Added" Transactions
-        foreach (var t in response.Added)
-        {
-            // Idempotency Check: Skip if we already saved this transaction
-            var exists = await dbContext.Transactions.AnyAsync(x => x.PlaidTransactionId == t.TransactionId);
-            if (!exists)
-            {
-                // FIX: Convert Plaid's DateOnly to a UTC DateTime for Postgres
-                DateTime txDate = t.Date.GetValueOrDefault(DateOnly.FromDateTime(DateTime.UtcNow)).ToDateTime(TimeOnly.MinValue);
-                DateTime txDateUtc = DateTime.SpecifyKind(txDate, DateTimeKind.Utc);
-
-                // Use the clean MerchantName if available, otherwise the raw Name
-                string merchantName = t.MerchantName ?? t.Name;
-
-                var newTx = new BudgetApp.Api.Data.Transaction
-                {
-                    UserId = user.Id,
-                    PlaidTransactionId = t.TransactionId,
-                    AccountId = t.AccountId,
-                    Amount = t.Amount ?? 0m, // Handle nullable decimal
-                    Date = txDateUtc,
-                    Name = merchantName,
-                    MerchantName = t.MerchantName,
-                    Pending = t.Pending ?? false,
-                    CreatedAt = DateTime.UtcNow,
-                    UpdatedAt = DateTime.UtcNow
-                };
-
-                await dbContext.Transactions.AddAsync(newTx);
-                newTransactions.Add(newTx);
-
-                // --- SMART LOGIC: Check if this is a Fixed Cost ---
-                // We check if the incoming name matches either the User's Name ("My Netflix") 
-                // or the official Plaid Merchant Name ("Netflix") stored in FixedCosts.
-                bool isFixed = fixedCosts.Any(fc =>
-                    (fc.Name.Equals(merchantName, StringComparison.OrdinalIgnoreCase)) ||
-                    (!string.IsNullOrEmpty(fc.PlaidMerchantName) && fc.PlaidMerchantName.Equals(merchantName, StringComparison.OrdinalIgnoreCase))
-                );
-
-                if (isFixed)
-                {
-                    // It matches a Fixed Cost! Ignore it for the balance calculation.
-                    Console.WriteLine($"IGNORED FIXED COST: {merchantName} (${newTx.Amount})");
-                }
-                else
-                {
-                    // It's a VARIABLE cost (coffee, gas), so we add it to the deduction total.
-                    variableSpend += newTx.Amount;
-                }
-            }
-        }
-
-        // 6. Update Balance ONLY with Variable Spend
-        if (variableSpend > 0)
-        {
-            var balanceRecord = await dbContext.Balances.FirstOrDefaultAsync(b => b.UserId == user.Id);
-            if (balanceRecord != null)
-            {
-                balanceRecord.BalanceAmount -= variableSpend;
-                balanceRecord.UpdatedAt = DateTime.UtcNow;
-            }
-        }
-
-        // 7. Save Cursor and DB Changes
-        plaidItem.Cursor = response.NextCursor;
-        await dbContext.SaveChangesAsync();
-
+        // This response no longer contains 'variableSpend', so return simplified stats
         return Results.Ok(new
         {
             message = "Sync complete",
             added = response.Added.Count,
-            ignoredFixedCostsCount = newTransactions.Count(t => !fixedCosts.Any(fc => fc.Name == t.Name)), // Approx count for debug
-            deductedAmount = variableSpend
+            hasMore = response.HasMore
         });
     }
-    catch (Exception e)
-    {
-        return Results.Problem(e.Message);
-    }
+    catch (UnauthorizedAccessException) { return Results.Unauthorized(); }
+    catch (InvalidOperationException e) { return Results.Problem(e.Message); }
+    catch (Exception e) { return Results.Problem(e.Message); }
 })
 .WithName("SyncTransactions")
 .WithOpenApi();
