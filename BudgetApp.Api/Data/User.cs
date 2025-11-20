@@ -29,6 +29,14 @@ public class User
     [Column("onboarding_complete")]
     public bool OnboardingComplete { get; set; } = false;
 
+    [Column("pay_day_1")]
+    public int PayDay1 { get; set; } = 1;
+
+    [Column("pay_day_2")]
+    public int PayDay2 { get; set; } = 15;
+
+    // ...
+
     public virtual ICollection<PlaidItem> PlaidItems { get; set; } = new List<PlaidItem>();
     public virtual ICollection<Balance> Balances { get; set; } = new List<Balance>();
 }

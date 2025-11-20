@@ -2,34 +2,37 @@ import React from 'react';
 import { View, StyleSheet } from 'react-native';
 import { Text, Button } from 'react-native-paper';
 import { SafeAreaView } from 'react-native-safe-area-context';
+import axios from 'axios';
+import { auth } from '../../firebaseConfig';
 
-// NOTE: We will pass the final calculated balance as a prop later
+const API_BASE_URL = 'http://localhost:5150';
+
 export default function DynamicAmountFinalScreen({ navigation, route }) {
-    const { initialAmount, savings } = route.params || {};
+    // FIX: Destructure the correct props: finalAmount and prorateFactor
+    const { finalAmount, prorateFactor } = route.params || {};
 
-    const handleFinish = () => {
-        // TODO: This is where we call the backend to flip the 'onboarding_complete' flag to TRUE
+    const handleFinish = async () => {
+        // The backend API /finalize already flipped the 'onboarding_complete' flag to TRUE, 
+        // so we just need to navigate away.
         navigation.popToTop(); // Go back to the main app stack
     };
 
-    // Placeholder calculation based on passed props
-    const displayedDynamicAmount = initialAmount
-        ? (parseFloat(initialAmount) - parseFloat(savings || 0)).toFixed(2)
-        : "N/A";
+    // Use the correctly passed amount for display
+    const displayedAmount = finalAmount || '0.00';
 
     return (
         <SafeAreaView style={styles.container}>
             <View style={styles.content}>
                 <Text style={styles.header}>Your Dynamic Budget is Ready! (5/5)</Text>
 
-                <Text style={styles.label}>You have set your initial spending budget to:</Text>
+                <Text style={styles.label}>Your current spending budget until your next check is:</Text>
 
                 <Text style={styles.amount}>
-                    ${displayedDynamicAmount}
+                    ${displayedAmount}
                 </Text>
 
                 <Text style={styles.explanation}>
-                    This amount reflects your total paycheck minus your planned savings and estimated fixed costs. We will now subtract your variable spending in real-time.
+                    This amount is your paycheck minus all recurring costs, prorated by {prorateFactor || '0.00'}x to reflect the remaining days in your current cycle.
                 </Text>
             </View>
 

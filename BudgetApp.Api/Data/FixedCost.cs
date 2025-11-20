@@ -42,6 +42,9 @@ public class FixedCost
     [Column("created_at")]
     public DateTime CreatedAt { get; set; }
 
+    [Column("next_due_date")]
+    public DateTime? NextDueDate { get; set; }
+
     [Column("updated_at")]
     public DateTime UpdatedAt { get; set; }
 

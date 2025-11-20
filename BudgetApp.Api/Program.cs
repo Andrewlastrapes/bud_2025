@@ -578,14 +578,25 @@ app.MapGet("/api/users/profile", async (ApiDbContext dbContext, HttpContext http
         var decodedToken = await FirebaseAdmin.Auth.FirebaseAuth.DefaultInstance.VerifyIdTokenAsync(idToken);
         var firebaseUuid = decodedToken.Uid;
 
-        var user = await dbContext.Users.FirstOrDefaultAsync(u => u.FirebaseUuid == firebaseUuid);
+        // --- FIX: Use Projection to select only simple fields ---
+        var userProfile = await dbContext.Users.AsNoTracking()
+            .Where(u => u.FirebaseUuid == firebaseUuid)
+            .Select(u => new
+            {
+                u.Id,
+                u.Name,
+                u.Email,
+                u.FirebaseUuid,
+                u.OnboardingComplete // The critical flag for the frontend
+            })
+            .FirstOrDefaultAsync();
 
-        if (user == null)
+        if (userProfile == null)
         {
             return Results.NotFound(new { message = "User not found in database." });
         }
 
-        return Results.Ok(user);
+        return Results.Ok(userProfile); // This will now return 200 OK with flat JSON data
     }
     catch (Exception e)
     {
@@ -633,6 +644,87 @@ app.MapGet("/api/plaid/recurring", async (ApiDbContext dbContext, PlaidClient pl
     }
 })
 .WithName("GetPlaidRecurring")
+.WithOpenApi();
+
+// POST: /api/budget/finalize (Calculates prorated balance and completes onboarding)
+app.MapPost("/api/budget/finalize", async (ApiDbContext dbContext, HttpContext httpContext, FinalizeBudgetRequest request) =>
+{
+    try
+    {
+        // 1. Auth and User Lookup
+        string? idToken = httpContext.Request.Headers["Authorization"].FirstOrDefault()?.Split(" ").Last();
+        if (string.IsNullOrEmpty(idToken)) return Results.Unauthorized();
+
+        var decodedToken = await FirebaseAdmin.Auth.FirebaseAuth.DefaultInstance.VerifyIdTokenAsync(idToken);
+        var user = await dbContext.Users.FirstOrDefaultAsync(u => u.FirebaseUuid == decodedToken.Uid);
+        if (user == null) return Results.NotFound("User not found.");
+
+        if (user.OnboardingComplete) return Results.Conflict("Onboarding already complete.");
+
+        // 2. Calculate Total Recurring Costs (Rent, Loans, Savings Goal, etc.)
+        var totalRecurringCosts = await dbContext.FixedCosts
+            .Where(fc => fc.UserId == user.Id)
+            .SumAsync(fc => fc.Amount);
+
+        decimal effectivePaycheck = request.PaycheckAmount - totalRecurringCosts;
+
+        // 3. Prorate Calculation (The Tricky Part)
+        // Assume a 15-day cycle for simplicity, as the user gets paid twice monthly.
+        const int PayCycleDays = 15;
+        DateTime today = DateTime.UtcNow.Date;
+        DateTime nextPaycheck = request.NextPaycheckDate.Date;
+
+        int daysUntilNextPaycheck = (int)(nextPaycheck - today).TotalDays;
+
+        if (daysUntilNextPaycheck < 0 || daysUntilNextPaycheck > PayCycleDays)
+        {
+            return Results.BadRequest("Next Paycheck Date is invalid for a bi-monthly cycle (must be 1-15 days away).");
+        }
+
+        // Prorate Factor: 1.0 if the cycle is starting, 0.1 if only 1 day is left
+        decimal prorateFactor = (decimal)daysUntilNextPaycheck / PayCycleDays;
+        decimal finalDynamicBalance = effectivePaycheck * prorateFactor;
+
+        // 4. Save Final Balance (Upsert logic)
+        var balanceRecord = await dbContext.Balances.FirstOrDefaultAsync(b => b.UserId == user.Id);
+        if (balanceRecord == null)
+        {
+            balanceRecord = new Balance
+            {
+                UserId = user.Id,
+                BalanceAmount = finalDynamicBalance,
+                CreatedAt = DateTime.UtcNow,
+                UpdatedAt = DateTime.UtcNow
+            };
+            await dbContext.Balances.AddAsync(balanceRecord);
+        }
+        else
+        {
+            balanceRecord.BalanceAmount = finalDynamicBalance;
+            balanceRecord.UpdatedAt = DateTime.UtcNow;
+        }
+
+        // 5. Flip Onboarding Flag to TRUE
+
+        user.OnboardingComplete = true;
+        user.PayDay1 = request.PayDay1;
+        user.PayDay2 = request.PayDay2;
+
+        await dbContext.SaveChangesAsync();
+
+        return Results.Ok(new
+        {
+            message = "Setup complete.",
+            dynamicBalance = finalDynamicBalance.ToString("0.00"),
+            prorateFactor = prorateFactor.ToString("0.00")
+        });
+    }
+    catch (Exception e)
+    {
+        return Results.Problem($"Finalization failed: {e.Message}");
+    }
+})
+.WithName("FinalizeBudget")
 .WithOpenApi();
 // --- RUN THE APP ---
 app.Run();
