@@ -143,7 +143,8 @@ app.MapPost("/api/plaid/create_link_token", async (PlaidClient plaidClient, ICon
         Language = Language.English,
         CountryCodes = countryCodes,
         User = user,
-        Products = products
+        Products = products,
+        Webhook = config["Plaid:WebhookUrl"] // Fetches the ngrok URL
     };
 
     try
@@ -640,6 +641,40 @@ app.MapPost("/api/budget/finalize", async (ApiDbContext dbContext, HttpContext h
     }
 })
 .WithName("FinalizeBudget")
+.WithOpenApi();
+
+// POST: /api/plaid/webhook (Receives notifications from Plaid)
+app.MapPost("/api/plaid/webhook", async (ITransactionService transactionService, PlaidWebhookRequest requestBody) =>
+{
+    // Webhooks usually require a 200 OK response quickly.
+
+    // We only care about the TRANSACTIONS webhook type for updates and removals.
+    if (requestBody.WebhookType == "TRANSACTIONS" &&
+        (requestBody.WebhookCode == "DEFAULT_UPDATE" ||
+         requestBody.WebhookCode == "TRANSACTIONS_REMOVED" ||
+         requestBody.WebhookCode == "INITIAL_UPDATE"))
+    {
+        try
+        {
+            // Call the reusable service logic to sync and update the balance
+            // We pass the ItemId which the service uses to find the user.
+            var response = await transactionService.SyncAndProcessTransactions(requestBody.ItemId);
+
+            // Return 200 OK immediately after processing
+            return Results.Ok(new { message = "Webhook processed and sync initiated.", added = response.Added.Count });
+        }
+        catch (Exception e)
+        {
+            // Log the error but still return 200 OK to Plaid to prevent retry spam
+            Console.WriteLine($"WEBHOOK FAILED PROCESSING for Item {requestBody.ItemId}: {e.Message}");
+            return Results.Ok(new { message = "Processing failed internally, but response sent." });
+        }
+    }
+
+    // Ignore other webhook types (e.g., ITEM_ERROR, SYNC_UPDATES_AVAILABLE)
+    return Results.Ok(new { message = "Webhook received, action not required for this type." });
+})
+.WithName("PlaidWebhookReceiver")
 .WithOpenApi();
 // --- RUN THE APP ---
 app.Run();

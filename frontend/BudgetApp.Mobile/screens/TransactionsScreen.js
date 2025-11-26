@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { View, StyleSheet, FlatList, Alert, Platform } from 'react-native'; // Ensure Alert and Platform are imported
+import { View, StyleSheet, FlatList, Alert, Platform } from 'react-native'; // ⬅️ Ensure Platform is here
 import { Text, Button, List, ActivityIndicator, IconButton } from 'react-native-paper';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import axios from 'axios';
@@ -50,45 +50,62 @@ export default function TransactionsScreen() {
         setIsSyncing(false);
     };
 
-    // --- LOGIC TO ADD/SAVE FIXED COST (The missing piece) ---
+    // --- LOGIC TO ADD/SAVE FIXED COST ---
     const saveFixedCost = async (transaction) => {
         try {
             const config = await getAuthHeader();
 
-            // Payload matches the FixedCost model we updated in the backend
+            // The 'name' used for the transaction list display is the best match string.
+            const merchantMatchName = transaction.merchantName || transaction.name;
+
+            // Payload matches the FixedCost model
             const payload = {
                 name: transaction.name,
                 amount: transaction.amount,
-                // Use PlaidMerchantName for robust future matching
-                plaidMerchantName: transaction.merchantName || transaction.name,
-                category: "subscription", // Default category
-                type: "manual" // Marking it as manually confirmed recurring
+                // Use the best available merchant name for the backend matching logic
+                plaidMerchantName: merchantMatchName,
+                category: "subscription",
+                type: "manual"
             };
 
             await axios.post(`${API_BASE_URL}/api/fixed-costs`, payload, config);
 
             Alert.alert("Success", "Added to Fixed Costs. Future charges will be ignored.");
-            // We could refresh the Fixed Costs screen here if needed, but not required.
         } catch (e) {
             console.error("Failed to save fixed cost:", e);
-            Alert.alert("Error", "Could not save fixed cost.");
+            // Error handling needs to be aware of the 500 error structure
+            const errorMessage = e.response?.data?.detail || e.message;
+            Alert.alert("Error", `Could not save fixed cost: ${errorMessage}`);
         }
     };
 
-    // --- METHOD CALLED BY onPress (The method you were missing) ---
+    // --- METHOD CALLED BY onPress ---
     const handleMarkAsRecurring = (transaction) => {
-        console.log("--- ATTEMPTING TO MARK RECURRING ---"); // <-- ADD THIS
-        Alert.alert(
-            "Mark as Fixed Cost?",
-            `Do you want to add "${transaction.name}" ($${transaction.amount}) to your Fixed Costs?`,
-            [
-                { text: "Cancel", style: "cancel" },
-                {
-                    text: "Yes, Mark as Recurring",
-                    onPress: () => saveFixedCost(transaction)
-                }
-            ]
-        );
+        // console.log("--- ATTEMPTING TO MARK RECURRING ---"); // Removed log
+
+        const onConfirm = () => {
+            saveFixedCost(transaction);
+        };
+
+        // Platform-specific Alert Fix (Allows custom buttons on mobile, simple confirm on web)
+        if (Platform.OS === 'web') {
+            const confirmed = window.confirm(`Mark "${transaction.name}" as a recurring fixed cost?`);
+            if (confirmed) {
+                onConfirm();
+            }
+        } else {
+            Alert.alert(
+                "Mark as Fixed Cost?",
+                `Do you want to add "${transaction.name}" ($${transaction.amount.toFixed(2)}) to your Fixed Costs?`,
+                [
+                    { text: "Cancel", style: "cancel" },
+                    {
+                        text: "Yes, Mark as Recurring",
+                        onPress: onConfirm
+                    }
+                ]
+            );
+        }
     };
     // ------------------------------------------------------------------
 
@@ -119,8 +136,7 @@ export default function TransactionsScreen() {
                         <List.Item
                             title={item.name}
                             description={item.merchantName}
-                            // This is what makes the row clickable
-                            onPress={() => handleMarkAsRecurring(item)}
+                            onPress={() => handleMarkAsRecurring(item)} // Now calls the platform-aware function
                             right={() => (
                                 <View style={{ flexDirection: 'row', alignItems: 'center' }}>
                                     <Text style={item.amount < 0 ? styles.amountIncome : styles.amountExpense}>

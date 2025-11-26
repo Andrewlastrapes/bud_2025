@@ -1,30 +1,28 @@
 using BudgetApp.Api.Data;
 using FirebaseAdmin.Auth;
 using Microsoft.EntityFrameworkCore;
-using Going.Plaid; // This root using is what resolves PlaidClient in your version
+using Going.Plaid; // <--- FIX 1: Add the root namespace
 using Going.Plaid.Transactions;
 using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Threading.Tasks;
-// REMOVED: using Going.Plaid.Client; // This line was causing the build error
+// REMOVED: using Going.Plaid.Client; // This was causing the build error
 
 namespace BudgetApp.Api.Services;
 
+// Interface is now defined in the same file
 public interface ITransactionService
 {
-    // Use the class names directly
-    Task<TransactionsSyncResponse> SyncAndProcessTransactions(string firebaseUuid);
+    Task<TransactionsSyncResponse> SyncAndProcessTransactions(string itemId);
 }
 
 public class TransactionService : ITransactionService
 {
-    // FIX 1: Use PlaidClient directly (resolved by the root 'using Going.Plaid;')
-    private readonly PlaidClient _plaidClient;
+    private readonly PlaidClient _plaidClient; // FIX 2: This type is now resolved by 'using Going.Plaid;'
     private readonly ApiDbContext _dbContext;
     private readonly IConfiguration _config;
 
-    // FIX 2: Use PlaidClient directly in the constructor
     public TransactionService(ApiDbContext dbContext, PlaidClient plaidClient, IConfiguration config)
     {
         _dbContext = dbContext;
@@ -32,16 +30,22 @@ public class TransactionService : ITransactionService
         _config = config;
     }
 
-    // Core logic to fetch, process, and update the balance
-    public async Task<TransactionsSyncResponse> SyncAndProcessTransactions(string firebaseUuid)
+    // File: Services/TransactionService.cs (inside TransactionService class)
+
+    // FIX: Method signature accepts ItemId
+    public async Task<TransactionsSyncResponse> SyncAndProcessTransactions(string itemId)
     {
         try
         {
-            var user = await _dbContext.Users.FirstOrDefaultAsync(u => u.FirebaseUuid == firebaseUuid);
-            if (user == null) throw new UnauthorizedAccessException("User not found.");
+            // --- 1. FIND PLID ITEM AND USER ---
+            // Find Plaid Item using ItemId first
+            var plaidItem = await _dbContext.PlaidItems.FirstOrDefaultAsync(p => p.ItemId == itemId);
+            if (plaidItem == null) throw new InvalidOperationException($"Plaid Item {itemId} not found.");
 
-            var plaidItem = await _dbContext.PlaidItems.FirstOrDefaultAsync(p => p.UserId == user.Id);
-            if (plaidItem == null) throw new InvalidOperationException("No bank linked for this user.");
+            // Find User using the PlaidItem's UserId
+            var user = await _dbContext.Users.FirstOrDefaultAsync(u => u.Id == plaidItem.UserId);
+            if (user == null) throw new UnauthorizedAccessException("User linked to this Item not found.");
+            // ------------------------------------
 
             var fixedCosts = await _dbContext.FixedCosts.Where(fc => fc.UserId == user.Id).ToListAsync();
 
@@ -52,7 +56,6 @@ public class TransactionService : ITransactionService
                 Cursor = plaidItem.Cursor,
                 Count = 100
             };
-            // FIX 3: Call PlaidClient directly
             var response = await _plaidClient.TransactionsSyncAsync(request);
 
             decimal variableSpend = 0;

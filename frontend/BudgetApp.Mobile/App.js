@@ -1,3 +1,5 @@
+// File: App.js
+
 import React, { useState, useEffect } from 'react';
 import { View, ActivityIndicator, StyleSheet } from 'react-native';
 import { NavigationContainer } from '@react-navigation/native';
@@ -8,11 +10,10 @@ import { SafeAreaProvider } from 'react-native-safe-area-context';
 import MaterialCommunityIcons from 'react-native-vector-icons/MaterialCommunityIcons';
 import axios from 'axios';
 
-// Import our auth object
 import { auth } from './firebaseConfig';
 import { onAuthStateChanged, signOut } from 'firebase/auth';
 
-// --- Import Screens & Navigators ---
+// --- Screens & Navigators ---
 import HomeScreen from './screens/HomeScreen';
 import TransactionsScreen from './screens/TransactionsScreen';
 import SettingsScreen from './screens/SettingsScreen';
@@ -23,18 +24,12 @@ import OnboardingStack from './navigation/OnboardingStack';
 // --- API Base URL ---
 const API_BASE_URL = 'http://localhost:5150';
 
-// --- Create Navigators ---
+// --- Navigators ---
 const Stack = createNativeStackNavigator();
 const Tab = createBottomTabNavigator();
 
 /**
- * Main Tab Navigator (The visible tabs at the bottom)
- */
-// File: App.js
-
-/**
- * This is our main tab navigator.
- * Must define all screens it contains here.
+ * Bottom tab navigator for the main app
  */
 function AppTabs() {
   return (
@@ -44,7 +39,6 @@ function AppTabs() {
         headerShown: false,
       }}
     >
-      {/* 🛑 FIX: Ensure these three screens are defined here 🛑 */}
       <Tab.Screen
         name="Home"
         component={HomeScreen}
@@ -61,7 +55,11 @@ function AppTabs() {
         options={{
           tabBarLabel: 'Spending',
           tabBarIcon: ({ color, size }) => (
-            <MaterialCommunityIcons name="format-list-bulleted" color={color} size={size} />
+            <MaterialCommunityIcons
+              name="format-list-bulleted"
+              color={color}
+              size={size}
+            />
           ),
         }}
       />
@@ -71,7 +69,11 @@ function AppTabs() {
         options={{
           tabBarLabel: 'Fixed',
           tabBarIcon: ({ color, size }) => (
-            <MaterialCommunityIcons name="currency-usd" color={color} size={size} />
+            <MaterialCommunityIcons
+              name="currency-usd"
+              color={color}
+              size={size}
+            />
           ),
         }}
       />
@@ -90,76 +92,78 @@ function AppTabs() {
 }
 
 /**
- * Loading screen
+ * Simple loading screen used in a few places
  */
 function LoadingScreen() {
   return (
-    <View style={styles.container}>
+    <View style={styles.loadingContainer}>
       <ActivityIndicator size="large" />
     </View>
   );
 }
 
 /**
- * Content Navigator (Checks the DB and routes to AppTabs or Onboarding)
+ * Main content navigator:
+ * - Always defines both "App" and "OnboardingFlow"
+ * - Chooses initialRouteName based on onboardingComplete flag
  */
 function MainContentNavigator({ fbUser }) {
   const [dbUser, setDbUser] = useState(null);
   const [isLoading, setIsLoading] = useState(true);
 
-  // Fetches the user's full database record (including onboarding_complete)
   const fetchUserProfile = async (retryCount = 0) => {
     try {
       const idToken = await fbUser.getIdToken();
       const response = await axios.get(`${API_BASE_URL}/api/users/profile`, {
-        headers: { 'Authorization': `Bearer ${idToken}` }
+        headers: { Authorization: `Bearer ${idToken}` },
       });
 
-      console.log("Fetched user profile:", response.data);
+      console.log('Fetched user profile:', response.data);
       setDbUser(response.data);
       setIsLoading(false);
     } catch (e) {
-      // 🛑 FIX: If we get a 404 (user not found) AND haven't exceeded retries, try again
       if (e.response && e.response.status === 404 && retryCount < 5) {
-        console.warn(`[RETRYING] User not in DB yet. Waiting... (Attempt ${retryCount + 1})`);
-        await new Promise(resolve => setTimeout(resolve, 1000)); // Wait 1 second
-        await fetchUserProfile(retryCount + 1); // Recurse with incremented count
+        console.warn(
+          `[RETRYING] User not in DB yet. Waiting... (Attempt ${retryCount + 1
+          })`,
+        );
+        await new Promise((resolve) => setTimeout(resolve, 1000));
+        await fetchUserProfile(retryCount + 1);
         return;
       }
 
-      // Final failure or non-404 error
-      console.error("Failed to fetch user profile:", e);
+      console.error('Failed to fetch user profile:', e);
       setDbUser(null);
       setIsLoading(false);
     }
   };
 
   useEffect(() => {
-    // This runs ONCE when MainContentNavigator first mounts (i.e., user logs in)
     fetchUserProfile();
-  }, [fbUser]); // Dependency on fbUser is necessary
+  }, [fbUser]);
 
   if (isLoading) {
     return <LoadingScreen />;
   }
 
-  // --- GATEKEEPER LOGIC ---
-  if (dbUser && !dbUser.onboardingComplete) {
-    return (
-      <Stack.Navigator screenOptions={{ headerShown: false }}>
-        <Stack.Screen name="OnboardingFlow" component={OnboardingStack} />
-      </Stack.Navigator>
-    );
-  }
+  const initialRouteName =
+    dbUser && !dbUser.onboardingComplete ? 'OnboardingFlow' : 'App';
 
-  // User is logged in and onboarding is complete, show main app
   return (
-    <Stack.Navigator>
+    <Stack.Navigator
+      initialRouteName={initialRouteName}
+      screenOptions={{ headerShown: false }}
+    >
+      {/* Main app tabs – always registered */}
       <Stack.Screen
         name="App"
         component={AppTabs}
         options={{
-          title: dbUser?.name || fbUser?.email?.split('@')[0] || 'Budget App',
+          headerShown: true,
+          title:
+            dbUser?.name ||
+            fbUser?.email?.split('@')[0] ||
+            'Budget App',
           headerRight: () => (
             <Button onPress={() => signOut(auth)}>
               Logout
@@ -167,25 +171,32 @@ function MainContentNavigator({ fbUser }) {
           ),
         }}
       />
+
+      {/* Onboarding flow – only present while onboarding is incomplete */}
+      {!dbUser?.onboardingComplete && (
+        <Stack.Screen
+          name="OnboardingFlow"
+          component={OnboardingStack}
+          options={{ headerShown: false }}
+        />
+      )}
     </Stack.Navigator>
   );
 }
 
-
 /**
- * Main App Component (The initial Gatekeeper)
+ * Root app: gatekeeper on Firebase auth
  */
 export default function App() {
   const [fbUser, setFbUser] = useState(null);
   const [isLoading, setIsLoading] = useState(true);
 
-  // Listen for Firebase auth state changes
   useEffect(() => {
     const unsubscribe = onAuthStateChanged(auth, async (user) => {
       setFbUser(user);
-      // NOTE: We rely on the MainContentNavigator to handle DB lookups and delays
       setIsLoading(false);
     });
+
     return () => unsubscribe();
   }, []);
 
@@ -196,10 +207,8 @@ export default function App() {
           {isLoading ? (
             <LoadingScreen />
           ) : fbUser ? (
-            // Logged in: Check DB status via MainContentNavigator
             <MainContentNavigator fbUser={fbUser} />
           ) : (
-            // Logged out: Show Login Screen
             <Stack.Navigator>
               <Stack.Screen
                 name="Login"
@@ -215,7 +224,7 @@ export default function App() {
 }
 
 const styles = StyleSheet.create({
-  container: {
+  loadingContainer: {
     flex: 1,
     justifyContent: 'center',
     alignItems: 'center',

@@ -73,7 +73,7 @@ export default function HomeScreen() {
                 onPress={() => setVisible(true)}
                 style={styles.button}
             >
-                Set Upcoming Paycheck
+                Edit Upcoming Paycheck
             </Button>
 
             {/* Modal for entering amount */}
