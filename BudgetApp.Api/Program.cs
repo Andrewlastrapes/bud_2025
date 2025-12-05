@@ -8,7 +8,8 @@ using Microsoft.EntityFrameworkCore;
 using Refit;
 using FirebaseAdmin;
 using Google.Apis.Auth.OAuth2;
-using BudgetApp.Api.Services; // <-- This is the missing line
+using BudgetApp.Api.Services;
+using System.Linq;
 
 // --- App Setup ---
 var builder = WebApplication.CreateBuilder(args);
@@ -144,7 +145,7 @@ app.MapPost("/api/plaid/create_link_token", async (PlaidClient plaidClient, ICon
         CountryCodes = countryCodes,
         User = user,
         Products = products,
-        Webhook = config["Plaid:WebhookUrl"] // Fetches the ngrok URL
+        Webhook = config["Plaid:WebhookUrl"]
     };
 
     try
@@ -202,34 +203,31 @@ app.MapPost("/api/plaid/exchange_public_token",
 .WithName("ExchangePublicToken")
 .WithOpenApi();
 
+// GET: /api/plaid/accounts
 app.MapGet("/api/plaid/accounts", async (ApiDbContext dbContext, HttpContext httpContext) =>
 {
     try
     {
-        // 1. Get the token from the Authorization header
         string? idToken = httpContext.Request.Headers["Authorization"].FirstOrDefault()?.Split(" ").Last();
         if (string.IsNullOrEmpty(idToken))
         {
             return Results.Unauthorized();
         }
 
-        // 2. Verify the token with Firebase
         var decodedToken = await FirebaseAdmin.Auth.FirebaseAuth.DefaultInstance
             .VerifyIdTokenAsync(idToken);
         var firebaseUuid = decodedToken.Uid;
 
-        // 3. Find the user in your database
         var user = await dbContext.Users.FirstOrDefaultAsync(u => u.FirebaseUuid == firebaseUuid);
         if (user == null)
         {
             return Results.NotFound(new { message = "User not found." });
         }
 
-        // 4. Fetch the user's Plaid items
         var accounts = await dbContext.PlaidItems
             .Where(item => item.UserId == user.Id)
             .Select(item => new
-            { // Only return safe data
+            {
                 item.Id,
                 item.InstitutionName,
                 item.InstitutionLogo
@@ -240,21 +238,17 @@ app.MapGet("/api/plaid/accounts", async (ApiDbContext dbContext, HttpContext htt
     }
     catch (Exception e)
     {
-        // Handle token verification errors or database errors
         return Results.Problem(e.Message);
     }
 })
 .WithName("GetUserPlaidAccounts")
 .WithOpenApi();
 
-// ... after your Plaid endpoints ...
-
-// GET: /api/balance (Get the current dynamic amount)
+// GET: /api/balance
 app.MapGet("/api/balance", async (ApiDbContext dbContext, HttpContext httpContext) =>
 {
     try
     {
-        // 1. Securely get the user from the token
         string? idToken = httpContext.Request.Headers["Authorization"].FirstOrDefault()?.Split(" ").Last();
         if (string.IsNullOrEmpty(idToken)) return Results.Unauthorized();
 
@@ -264,10 +258,8 @@ app.MapGet("/api/balance", async (ApiDbContext dbContext, HttpContext httpContex
         var user = await dbContext.Users.FirstOrDefaultAsync(u => u.FirebaseUuid == firebaseUuid);
         if (user == null) return Results.NotFound("User not found.");
 
-        // 2. Get the balance
         var balanceRecord = await dbContext.Balances.FirstOrDefaultAsync(b => b.UserId == user.Id);
 
-        // If no balance exists yet, return 0
         return Results.Ok(new { amount = balanceRecord?.BalanceAmount ?? 0 });
     }
     catch (Exception e)
@@ -278,12 +270,11 @@ app.MapGet("/api/balance", async (ApiDbContext dbContext, HttpContext httpContex
 .WithName("GetBalance")
 .WithOpenApi();
 
-// POST: /api/balance (Set the initial paycheck amount)
+// POST: /api/balance
 app.MapPost("/api/balance", async (ApiDbContext dbContext, HttpContext httpContext, SetBalanceRequest request) =>
 {
     try
     {
-        // 1. Securely get the user
         string? idToken = httpContext.Request.Headers["Authorization"].FirstOrDefault()?.Split(" ").Last();
         if (string.IsNullOrEmpty(idToken)) return Results.Unauthorized();
 
@@ -293,12 +284,10 @@ app.MapPost("/api/balance", async (ApiDbContext dbContext, HttpContext httpConte
         var user = await dbContext.Users.FirstOrDefaultAsync(u => u.FirebaseUuid == firebaseUuid);
         if (user == null) return Results.NotFound("User not found.");
 
-        // 2. Find existing balance or create new one
         var balanceRecord = await dbContext.Balances.FirstOrDefaultAsync(b => b.UserId == user.Id);
 
         if (balanceRecord == null)
         {
-            // Create new
             balanceRecord = new Balance
             {
                 UserId = user.Id,
@@ -310,7 +299,6 @@ app.MapPost("/api/balance", async (ApiDbContext dbContext, HttpContext httpConte
         }
         else
         {
-            // Update existing
             balanceRecord.BalanceAmount = request.Amount;
             balanceRecord.UpdatedAt = DateTime.UtcNow;
         }
@@ -328,21 +316,24 @@ app.MapPost("/api/balance", async (ApiDbContext dbContext, HttpContext httpConte
 .WithOpenApi();
 
 // POST: /api/transactions/sync
-app.MapPost("/api/transactions/sync", async (ITransactionService transactionService, HttpContext httpContext) =>
+app.MapPost("/api/transactions/sync", async (ITransactionService transactionService, ApiDbContext dbContext, HttpContext httpContext) =>
 {
     try
     {
-        // 1. Auth: Securely get the User's UID from the token
         string? idToken = httpContext.Request.Headers["Authorization"].FirstOrDefault()?.Split(" ").Last();
         if (string.IsNullOrEmpty(idToken)) return Results.Unauthorized();
 
         var decodedToken = await FirebaseAdmin.Auth.FirebaseAuth.DefaultInstance.VerifyIdTokenAsync(idToken);
         var firebaseUuid = decodedToken.Uid;
 
-        // 2. Call the reusable service logic
-        var response = await transactionService.SyncAndProcessTransactions(firebaseUuid);
+        var user = await dbContext.Users.FirstOrDefaultAsync(u => u.FirebaseUuid == firebaseUuid);
+        if (user == null) return Results.NotFound("User not found.");
 
-        // This response no longer contains 'variableSpend', so return simplified stats
+        var plaidItem = await dbContext.PlaidItems.FirstOrDefaultAsync(p => p.UserId == user.Id);
+        if (plaidItem == null) return Results.BadRequest("No Plaid item linked for this user.");
+
+        var response = await transactionService.SyncAndProcessTransactions(plaidItem.ItemId);
+
         return Results.Ok(new
         {
             message = "Sync complete",
@@ -356,12 +347,12 @@ app.MapPost("/api/transactions/sync", async (ITransactionService transactionServ
 })
 .WithName("SyncTransactions")
 .WithOpenApi();
-// GET: /api/transactions (Get all transactions for the user)
+
+// GET: /api/transactions
 app.MapGet("/api/transactions", async (ApiDbContext dbContext, HttpContext httpContext) =>
 {
     try
     {
-        // 1. Auth: Get the User
         string? idToken = httpContext.Request.Headers["Authorization"].FirstOrDefault()?.Split(" ").Last();
         if (string.IsNullOrEmpty(idToken)) return Results.Unauthorized();
 
@@ -369,7 +360,6 @@ app.MapGet("/api/transactions", async (ApiDbContext dbContext, HttpContext httpC
         var user = await dbContext.Users.FirstOrDefaultAsync(u => u.FirebaseUuid == decodedToken.Uid);
         if (user == null) return Results.NotFound("User not found.");
 
-        // 2. Fetch all transactions for this user, newest first
         var transactions = await dbContext.Transactions
             .Where(t => t.UserId == user.Id)
             .OrderByDescending(t => t.Date)
@@ -385,7 +375,7 @@ app.MapGet("/api/transactions", async (ApiDbContext dbContext, HttpContext httpC
 .WithName("GetTransactions")
 .WithOpenApi();
 
-// --- Endpoint to GET all fixed costs for the user ---
+// GET: /api/fixed-costs
 app.MapGet("/api/fixed-costs", async (ApiDbContext dbContext, HttpContext httpContext) =>
 {
     try
@@ -412,7 +402,7 @@ app.MapGet("/api/fixed-costs", async (ApiDbContext dbContext, HttpContext httpCo
 .WithName("GetFixedCosts")
 .WithOpenApi();
 
-// --- Endpoint to ADD a new MANUAL fixed cost ---
+// POST: /api/fixed-costs
 app.MapPost("/api/fixed-costs", async (ApiDbContext dbContext, HttpContext httpContext, FixedCost requestBody) =>
 {
     try
@@ -424,18 +414,19 @@ app.MapPost("/api/fixed-costs", async (ApiDbContext dbContext, HttpContext httpC
         var user = await dbContext.Users.FirstOrDefaultAsync(u => u.FirebaseUuid == decodedToken.Uid);
         if (user == null) return Results.NotFound("User not found.");
 
-        // Create new FixedCost from the request body
         var newCost = new FixedCost
         {
             UserId = user.Id,
             Name = requestBody.Name,
             Amount = requestBody.Amount,
             Category = requestBody.Category ?? "other",
-            Type = "manual", // Explicitly set as manual
+            Type = requestBody.Type ?? "manual",
             PlaidMerchantName = requestBody.PlaidMerchantName,
+            PlaidAccountId = requestBody.PlaidAccountId,
             UserHasApproved = true,
             CreatedAt = DateTime.UtcNow,
-            UpdatedAt = DateTime.UtcNow
+            UpdatedAt = DateTime.UtcNow,
+            NextDueDate = requestBody.NextDueDate
         };
 
         await dbContext.FixedCosts.AddAsync(newCost);
@@ -451,7 +442,7 @@ app.MapPost("/api/fixed-costs", async (ApiDbContext dbContext, HttpContext httpC
 .WithName("AddFixedCost")
 .WithOpenApi();
 
-// --- Endpoint to DELETE a fixed cost ---
+// DELETE: /api/fixed-costs/{id}
 app.MapDelete("/api/fixed-costs/{id}", async (ApiDbContext dbContext, HttpContext httpContext, int id) =>
 {
     try
@@ -463,7 +454,6 @@ app.MapDelete("/api/fixed-costs/{id}", async (ApiDbContext dbContext, HttpContex
         var user = await dbContext.Users.FirstOrDefaultAsync(u => u.FirebaseUuid == decodedToken.Uid);
         if (user == null) return Results.NotFound("User not found.");
 
-        // Find the cost by its ID and make sure it belongs to this user
         var cost = await dbContext.FixedCosts.FirstOrDefaultAsync(fc => fc.Id == id && fc.UserId == user.Id);
         if (cost == null)
         {
@@ -494,7 +484,6 @@ app.MapGet("/api/users/profile", async (ApiDbContext dbContext, HttpContext http
         var decodedToken = await FirebaseAdmin.Auth.FirebaseAuth.DefaultInstance.VerifyIdTokenAsync(idToken);
         var firebaseUuid = decodedToken.Uid;
 
-        // --- FIX: Use Projection to select only simple fields ---
         var userProfile = await dbContext.Users.AsNoTracking()
             .Where(u => u.FirebaseUuid == firebaseUuid)
             .Select(u => new
@@ -503,7 +492,7 @@ app.MapGet("/api/users/profile", async (ApiDbContext dbContext, HttpContext http
                 u.Name,
                 u.Email,
                 u.FirebaseUuid,
-                u.OnboardingComplete // The critical flag for the frontend
+                u.OnboardingComplete
             })
             .FirstOrDefaultAsync();
 
@@ -512,7 +501,7 @@ app.MapGet("/api/users/profile", async (ApiDbContext dbContext, HttpContext http
             return Results.NotFound(new { message = "User not found in database." });
         }
 
-        return Results.Ok(userProfile); // This will now return 200 OK with flat JSON data
+        return Results.Ok(userProfile);
     }
     catch (Exception e)
     {
@@ -522,12 +511,11 @@ app.MapGet("/api/users/profile", async (ApiDbContext dbContext, HttpContext http
 .WithName("GetUserProfile")
 .WithOpenApi();
 
-// GET: /api/plaid/recurring (Fetches Plaid's AI-detected recurring expenses)
+// GET: /api/plaid/recurring
 app.MapGet("/api/plaid/recurring", async (ApiDbContext dbContext, PlaidClient plaidClient, HttpContext httpContext) =>
 {
     try
     {
-        // 1. Auth: Securely get the User
         string? idToken = httpContext.Request.Headers["Authorization"].FirstOrDefault()?.Split(" ").Last();
         if (string.IsNullOrEmpty(idToken)) return Results.Unauthorized();
 
@@ -535,11 +523,9 @@ app.MapGet("/api/plaid/recurring", async (ApiDbContext dbContext, PlaidClient pl
         var user = await dbContext.Users.FirstOrDefaultAsync(u => u.FirebaseUuid == decodedToken.Uid);
         if (user == null) return Results.NotFound("User not found.");
 
-        // 2. Get the Plaid Item (Access Token)
         var plaidItem = await dbContext.PlaidItems.FirstOrDefaultAsync(p => p.UserId == user.Id);
         if (plaidItem == null) return Results.Ok(new { message = "No bank linked." });
 
-        // 3. Call Plaid /transactions/recurring/get (Plaid recommends 180 days of history)
         var request = new Going.Plaid.Transactions.TransactionsRecurringGetRequest
         {
             AccessToken = plaidItem.AccessToken,
@@ -547,7 +533,6 @@ app.MapGet("/api/plaid/recurring", async (ApiDbContext dbContext, PlaidClient pl
 
         var response = await plaidClient.TransactionsRecurringGetAsync(request);
 
-        // 4. Return the recurring streams (subscriptions)
         return Results.Ok(new
         {
             inflow_streams = response.InflowStreams,
@@ -562,12 +547,11 @@ app.MapGet("/api/plaid/recurring", async (ApiDbContext dbContext, PlaidClient pl
 .WithName("GetPlaidRecurring")
 .WithOpenApi();
 
-// POST: /api/budget/finalize (Calculates prorated balance and completes onboarding)
+// POST: /api/budget/finalize
 app.MapPost("/api/budget/finalize", async (ApiDbContext dbContext, HttpContext httpContext, FinalizeBudgetRequest request) =>
 {
     try
     {
-        // 1. Auth and User Lookup
         string? idToken = httpContext.Request.Headers["Authorization"].FirstOrDefault()?.Split(" ").Last();
         if (string.IsNullOrEmpty(idToken)) return Results.Unauthorized();
 
@@ -577,31 +561,72 @@ app.MapPost("/api/budget/finalize", async (ApiDbContext dbContext, HttpContext h
 
         if (user.OnboardingComplete) return Results.Conflict("Onboarding already complete.");
 
-        // 2. Calculate Total Recurring Costs (Rent, Loans, Savings Goal, etc.)
-        var totalRecurringCosts = await dbContext.FixedCosts
-            .Where(fc => fc.UserId == user.Id)
-            .SumAsync(fc => fc.Amount);
-
-        decimal effectivePaycheck = request.PaycheckAmount - totalRecurringCosts;
-
-        // 3. Prorate Calculation (The Tricky Part)
-        // Assume a 15-day cycle for simplicity, as the user gets paid twice monthly.
-        const int PayCycleDays = 15;
         DateTime today = DateTime.UtcNow.Date;
         DateTime nextPaycheck = request.NextPaycheckDate.Date;
 
-        int daysUntilNextPaycheck = (int)(nextPaycheck - today).TotalDays;
-
-        if (daysUntilNextPaycheck < 0 || daysUntilNextPaycheck > PayCycleDays)
+        if (nextPaycheck <= today)
         {
-            return Results.BadRequest("Next Paycheck Date is invalid for a bi-monthly cycle (must be 1-15 days away).");
+            return Results.BadRequest("Next paycheck date must be in the future.");
         }
 
-        // Prorate Factor: 1.0 if the cycle is starting, 0.1 if only 1 day is left
-        decimal prorateFactor = (decimal)daysUntilNextPaycheck / PayCycleDays;
+        DateTime CalculatePreviousPaycheckDate(int day1, int day2, DateTime nextPay)
+        {
+            var days = new[] { day1, day2 }.OrderBy(d => d).ToArray();
+            int nextDay = nextPay.Day;
+
+            if (nextDay == days[0])
+            {
+                var prevMonthFirst = new DateTime(nextPay.Year, nextPay.Month, 1).AddMonths(-1);
+                int prevDay = days[1];
+                int daysInPrevMonth = DateTime.DaysInMonth(prevMonthFirst.Year, prevMonthFirst.Month);
+                if (prevDay > daysInPrevMonth) prevDay = daysInPrevMonth;
+
+                return new DateTime(prevMonthFirst.Year, prevMonthFirst.Month, prevDay);
+            }
+            else
+            {
+                int prevDay = days[0];
+                int daysInThisMonth = DateTime.DaysInMonth(nextPay.Year, nextPay.Month);
+                if (prevDay > daysInThisMonth) prevDay = daysInThisMonth;
+
+                return new DateTime(nextPay.Year, nextPay.Month, prevDay);
+            }
+        }
+
+        var previousPaycheck = CalculatePreviousPaycheckDate(request.PayDay1, request.PayDay2, nextPaycheck);
+
+        int payCycleDays = (int)(nextPaycheck - previousPaycheck).TotalDays;
+        if (payCycleDays <= 0)
+        {
+            return Results.BadRequest("Invalid pay cycle detected.");
+        }
+
+        int daysUntilNextPaycheck = (int)(nextPaycheck - today).TotalDays;
+        if (daysUntilNextPaycheck < 0 || daysUntilNextPaycheck > payCycleDays)
+        {
+            return Results.BadRequest("Next paycheck date is inconsistent with pay days / current date.");
+        }
+
+        var fixedBillsThisPeriod = await dbContext.FixedCosts
+            .Where(fc => fc.UserId == user.Id
+                && fc.NextDueDate.HasValue
+                && fc.NextDueDate.Value.Date >= today
+                && fc.NextDueDate.Value.Date <= nextPaycheck)
+            .ToListAsync();
+
+        var savingsThisPeriod = await dbContext.FixedCosts
+            .Where(fc => fc.UserId == user.Id
+                && fc.Category == "Savings")
+            .ToListAsync();
+
+        var totalRecurringCosts = fixedBillsThisPeriod.Sum(fc => fc.Amount)
+                             + savingsThisPeriod.Sum(fc => fc.Amount);
+
+        decimal effectivePaycheck = request.PaycheckAmount - totalRecurringCosts;
+
+        decimal prorateFactor = (decimal)daysUntilNextPaycheck / payCycleDays;
         decimal finalDynamicBalance = effectivePaycheck * prorateFactor;
 
-        // 4. Save Final Balance (Upsert logic)
         var balanceRecord = await dbContext.Balances.FirstOrDefaultAsync(b => b.UserId == user.Id);
         if (balanceRecord == null)
         {
@@ -619,8 +644,6 @@ app.MapPost("/api/budget/finalize", async (ApiDbContext dbContext, HttpContext h
             balanceRecord.BalanceAmount = finalDynamicBalance;
             balanceRecord.UpdatedAt = DateTime.UtcNow;
         }
-
-        // 5. Flip Onboarding Flag to TRUE
 
         user.OnboardingComplete = true;
         user.PayDay1 = request.PayDay1;
@@ -643,12 +666,9 @@ app.MapPost("/api/budget/finalize", async (ApiDbContext dbContext, HttpContext h
 .WithName("FinalizeBudget")
 .WithOpenApi();
 
-// POST: /api/plaid/webhook (Receives notifications from Plaid)
+// POST: /api/plaid/webhook
 app.MapPost("/api/plaid/webhook", async (ITransactionService transactionService, PlaidWebhookRequest requestBody) =>
 {
-    // Webhooks usually require a 200 OK response quickly.
-
-    // We only care about the TRANSACTIONS webhook type for updates and removals.
     if (requestBody.WebhookType == "TRANSACTIONS" &&
         (requestBody.WebhookCode == "DEFAULT_UPDATE" ||
          requestBody.WebhookCode == "TRANSACTIONS_REMOVED" ||
@@ -656,31 +676,26 @@ app.MapPost("/api/plaid/webhook", async (ITransactionService transactionService,
     {
         try
         {
-            // Call the reusable service logic to sync and update the balance
-            // We pass the ItemId which the service uses to find the user.
             var response = await transactionService.SyncAndProcessTransactions(requestBody.ItemId);
 
-            // Return 200 OK immediately after processing
             return Results.Ok(new { message = "Webhook processed and sync initiated.", added = response.Added.Count });
         }
         catch (Exception e)
         {
-            // Log the error but still return 200 OK to Plaid to prevent retry spam
             Console.WriteLine($"WEBHOOK FAILED PROCESSING for Item {requestBody.ItemId}: {e.Message}");
             return Results.Ok(new { message = "Processing failed internally, but response sent." });
         }
     }
 
-    // Ignore other webhook types (e.g., ITEM_ERROR, SYNC_UPDATES_AVAILABLE)
     return Results.Ok(new { message = "Webhook received, action not required for this type." });
 })
 .WithName("PlaidWebhookReceiver")
 .WithOpenApi();
+
 // --- RUN THE APP ---
 app.Run();
 
-// --- TYPE DECLARATIONS (MUST COME AFTER TOP-LEVEL STATEMENTS) ---
-// These classes/records define the expected JSON data for your API endpoints.
+// --- TYPE DECLARATIONS (if you still keep them here) ---
 
 // Used for POST /api/users/register
 public record UserRegistrationRequest(string Name, string Email, string FirebaseUuid);
