@@ -35,6 +35,10 @@ public class User
     [Column("pay_day_2")]
     public int PayDay2 { get; set; } = 15;
 
+    [Column("expected_paycheck_amount")]
+    public decimal ExpectedPaycheckAmount { get; set; } = 0m;
+
+
     // ...
 
     public virtual ICollection<PlaidItem> PlaidItems { get; set; } = new List<PlaidItem>();

@@ -41,6 +41,8 @@ builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen();
 
 builder.Services.AddScoped<ITransactionService, TransactionService>();
+builder.Services.AddSingleton<IDynamicBudgetEngine, DynamicBudgetEngine>();
+
 
 builder.Services.AddCors(options =>
 {
@@ -348,6 +350,8 @@ app.MapPost("/api/transactions/sync", async (ITransactionService transactionServ
 .WithName("SyncTransactions")
 .WithOpenApi();
 
+
+
 // GET: /api/transactions
 app.MapGet("/api/transactions", async (ApiDbContext dbContext, HttpContext httpContext) =>
 {
@@ -374,6 +378,9 @@ app.MapGet("/api/transactions", async (ApiDbContext dbContext, HttpContext httpC
 })
 .WithName("GetTransactions")
 .WithOpenApi();
+
+
+
 
 // GET: /api/fixed-costs
 app.MapGet("/api/fixed-costs", async (ApiDbContext dbContext, HttpContext httpContext) =>
@@ -648,6 +655,7 @@ app.MapPost("/api/budget/finalize", async (ApiDbContext dbContext, HttpContext h
         user.OnboardingComplete = true;
         user.PayDay1 = request.PayDay1;
         user.PayDay2 = request.PayDay2;
+        user.ExpectedPaycheckAmount = request.PaycheckAmount;
 
         await dbContext.SaveChangesAsync();
 
@@ -692,16 +700,102 @@ app.MapPost("/api/plaid/webhook", async (ITransactionService transactionService,
 .WithName("PlaidWebhookReceiver")
 .WithOpenApi();
 
+// Used to update how a transaction (typically a deposit) affects the dynamic balance
+
+// GET: /api/transactions/deposits/pending
+app.MapGet("/api/transactions/deposits/pending", async (ApiDbContext dbContext, HttpContext httpContext) =>
+{
+    try
+    {
+        string? idToken = httpContext.Request.Headers["Authorization"].FirstOrDefault()?.Split(" ").Last();
+        if (string.IsNullOrEmpty(idToken)) return Results.Unauthorized();
+
+        var decodedToken = await FirebaseAdmin.Auth.FirebaseAuth.DefaultInstance.VerifyIdTokenAsync(idToken);
+        var user = await dbContext.Users.FirstOrDefaultAsync(u => u.FirebaseUuid == decodedToken.Uid);
+        if (user == null) return Results.NotFound("User not found.");
+
+        // "Deposit" = transaction where we set SuggestedKind (credits only),
+        // and where the user has not made a decision yet.
+        var pendingDeposits = await dbContext.Transactions
+            .Where(t => t.UserId == user.Id
+                        && t.SuggestedKind != null
+                        && t.UserDecision == null)
+            .OrderByDescending(t => t.Date)
+            .ToListAsync();
+
+        return Results.Ok(pendingDeposits);
+    }
+    catch (Exception e)
+    {
+        return Results.Problem(e.Message);
+    }
+})
+.WithName("GetPendingDeposits")
+.WithOpenApi();
+
+
+
+app.MapPost("/api/transactions/{id}/decision", async (int id, UpdateTransactionDecisionRequest body, ApiDbContext dbContext, HttpContext httpContext) =>
+{
+    try
+    {
+        // Auth
+        string? idToken = httpContext.Request.Headers["Authorization"].FirstOrDefault()?.Split(" ").Last();
+        if (string.IsNullOrEmpty(idToken)) return Results.Unauthorized();
+
+        var decodedToken = await FirebaseAdmin.Auth.FirebaseAuth.DefaultInstance.VerifyIdTokenAsync(idToken);
+        var user = await dbContext.Users.FirstOrDefaultAsync(u => u.FirebaseUuid == decodedToken.Uid);
+        if (user == null) return Results.NotFound("User not found.");
+
+        // Find transaction for this user
+        var tx = await dbContext.Transactions.FirstOrDefaultAsync(t => t.Id == id && t.UserId == user.Id);
+        if (tx == null) return Results.NotFound("Transaction not found.");
+
+        var decision = body.Decision;
+        if (!Enum.IsDefined(typeof(TransactionUserDecision), decision))
+        {
+            return Results.BadRequest("Invalid decision.");
+        }
+
+        // If user chooses "TreatAsIncome" and we haven't already counted it, add to dynamic
+        if (decision == TransactionUserDecision.TreatAsIncome && !tx.CountedAsIncome)
+        {
+            var balance = await dbContext.Balances.FirstOrDefaultAsync(b => b.UserId == user.Id);
+            if (balance != null)
+            {
+                balance.BalanceAmount += tx.Amount;   // Amount is magnitude
+                balance.UpdatedAt = DateTime.UtcNow;
+            }
+
+            tx.CountedAsIncome = true;
+        }
+
+        // For other decisions (Ignore, DebtPayment, SavingsFunded), we just store the decision for now
+        tx.UserDecision = decision;
+        tx.UpdatedAt = DateTime.UtcNow;
+
+        await dbContext.SaveChangesAsync();
+
+        return Results.Ok(new
+        {
+            message = "Decision saved.",
+            decision = tx.UserDecision.ToString(),
+            countedAsIncome = tx.CountedAsIncome
+        });
+    }
+    catch (Exception e)
+    {
+        return Results.Problem(e.Message);
+    }
+})
+.WithName("DecideOnTransaction")
+.WithOpenApi();
+
+
 // --- RUN THE APP ---
 app.Run();
 
 // --- TYPE DECLARATIONS (if you still keep them here) ---
 
 // Used for POST /api/users/register
-public record UserRegistrationRequest(string Name, string Email, string FirebaseUuid);
 
-// Used for POST /api/plaid/create_link_token
-public record CreateLinkTokenRequest(string FirebaseUserId);
-
-// Used for POST /api/plaid/exchange_public_token
-public record ExchangeTokenRequest(string PublicToken, string FirebaseUuid);

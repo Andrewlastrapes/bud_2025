@@ -41,6 +41,16 @@ public class Transaction
     [Column("updated_at")]
     public DateTime UpdatedAt { get; set; }
 
+    [Column("suggested_kind")]
+    public TransactionSuggestedKind SuggestedKind { get; set; } = TransactionSuggestedKind.Unknown;
+
+    [Column("user_decision")]
+    public TransactionUserDecision UserDecision { get; set; } = TransactionUserDecision.Undecided;
+
+    [Column("counted_as_income")]
+    public bool CountedAsIncome { get; set; } = false;
+
+
     // Navigation property
     [ForeignKey(nameof(UserId))]
     public virtual User? User { get; set; }

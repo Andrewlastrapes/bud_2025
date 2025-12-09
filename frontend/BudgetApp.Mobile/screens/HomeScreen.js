@@ -8,7 +8,7 @@ import { useIsFocused } from '@react-navigation/native';
 
 const API_BASE_URL = 'http://localhost:5150';
 
-export default function HomeScreen() {
+export default function HomeScreen({ navigation }) {
     const [balance, setBalance] = useState(0);
     const [paycheckInput, setPaycheckInput] = useState('');
     const [visible, setVisible] = useState(false); // Controls the modal
@@ -58,13 +58,29 @@ export default function HomeScreen() {
         setIsLoading(false);
     };
 
+    const isOverBudget = balance < 0;
+    const absoluteOver = Math.abs(balance);
+
     return (
         <SafeAreaView style={styles.container}>
-
             {/* The Big Dynamic Number */}
             <View style={styles.balanceContainer}>
-                <Text style={styles.label}>Dynamic Budget</Text>
-                <Text style={styles.amount}>${balance.toFixed(2)}</Text>
+                <Text style={isOverBudget ? styles.labelOver : styles.label}>
+                    {isOverBudget ? 'Over Budget' : 'Dynamic Budget'}
+                </Text>
+
+                <Text style={isOverBudget ? styles.amountOver : styles.amount}>
+                    {isOverBudget
+                        ? `-$${absoluteOver.toFixed(2)}`
+                        : `$${balance.toFixed(2)}`}
+                </Text>
+
+                {isOverBudget && (
+                    <Text style={styles.overBudgetSubtitle}>
+                        You&apos;re currently over budget by ${absoluteOver.toFixed(2)}
+                        {' '}until your next paycheck.
+                    </Text>
+                )}
             </View>
 
             {/* Button to reset/set paycheck */}
@@ -74,6 +90,15 @@ export default function HomeScreen() {
                 style={styles.button}
             >
                 Edit Upcoming Paycheck
+            </Button>
+
+            {/* Deposit Review entry point */}
+            <Button
+                mode="outlined"
+                onPress={() => navigation.navigate('DepositReview')}
+                style={styles.secondaryButton}
+            >
+                Review New Deposits
             </Button>
 
             {/* Modal for entering amount */}
@@ -100,7 +125,6 @@ export default function HomeScreen() {
                     </Card>
                 </Modal>
             </Portal>
-
         </SafeAreaView>
     );
 }
@@ -120,13 +144,34 @@ const styles = StyleSheet.create({
         color: '#666',
         marginBottom: 10,
     },
+    labelOver: {
+        fontSize: 18,
+        color: '#b00020', // material-ish error red
+        marginBottom: 10,
+        fontWeight: '600',
+    },
     amount: {
         fontSize: 48,
         fontWeight: 'bold',
         color: '#6200ee', // Primary color
     },
+    amountOver: {
+        fontSize: 48,
+        fontWeight: 'bold',
+        color: '#b00020',
+    },
+    overBudgetSubtitle: {
+        marginTop: 12,
+        fontSize: 14,
+        color: '#b00020',
+        textAlign: 'center',
+        paddingHorizontal: 10,
+    },
     button: {
         marginTop: 20,
+    },
+    secondaryButton: {
+        marginTop: 10,
     },
     modal: {
         padding: 20,

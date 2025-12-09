@@ -20,6 +20,7 @@ import SettingsScreen from './screens/SettingsScreen';
 import LoginScreen from './screens/LoginScreen';
 import FixedCostsScreen from './screens/FixedCostsScreen';
 import OnboardingStack from './navigation/OnboardingStack';
+import DepositReviewScreen from './screens/DepositReviewScreen';
 
 // --- API Base URL ---
 const API_BASE_URL = 'http://localhost:5150';
@@ -169,6 +170,15 @@ function MainContentNavigator({ fbUser }) {
               Logout
             </Button>
           ),
+        }}
+      />
+
+      <Stack.Screen
+        name="DepositReview"
+        component={DepositReviewScreen}
+        options={{
+          headerShown: true,
+          title: 'Review Deposits',
         }}
       />
 
