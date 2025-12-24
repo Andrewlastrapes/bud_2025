@@ -21,6 +21,8 @@ import FixedCostsScreen from './screens/FixedCostsScreen';
 import OnboardingStack from './navigation/OnboardingStack';
 import DepositReviewScreen from './screens/DepositReviewScreen';
 import { createBottomTabNavigator } from '@react-navigation/bottom-tabs';
+import ReviewLargeExpensesScreen from './screens/ReviewLargeExpensesScreen';
+
 
 // --- API Base URL ---
 const API_BASE_URL = 'http://localhost:5150';
@@ -181,6 +183,12 @@ function MainContentNavigator({ fbUser }) {
           title: 'Review Deposits',
         }}
       />
+      <Stack.Screen
+        name="ReviewLargeExpenses"
+        component={ReviewLargeExpensesScreen}
+        options={{ title: 'Review Large Expenses' }}
+/>
+
 
       {/* Onboarding flow – only present while onboarding is incomplete */}
       {!dbUser?.onboardingComplete && (

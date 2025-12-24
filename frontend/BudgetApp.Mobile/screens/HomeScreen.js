@@ -100,6 +100,13 @@ export default function HomeScreen({ navigation }) {
             >
                 Review New Deposits
             </Button>
+            <Button
+                mode="outlined"
+                style={styles.button}
+                onPress={() => navigation.navigate('ReviewLargeExpenses')}
+                >
+                Review Large Expenses
+                </Button>
 
             {/* Modal for entering amount */}
             <Portal>
