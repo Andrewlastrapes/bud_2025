@@ -3,7 +3,6 @@
 import React, { useState, useEffect } from 'react';
 import { View, ActivityIndicator, StyleSheet } from 'react-native';
 import { NavigationContainer } from '@react-navigation/native';
-import { createBottomTabNavigator } from '@react-navigation/bottom-tabs';
 import { createNativeStackNavigator } from '@react-navigation/native-stack';
 import { PaperProvider, DefaultTheme, Button } from 'react-native-paper';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
@@ -21,6 +20,7 @@ import LoginScreen from './screens/LoginScreen';
 import FixedCostsScreen from './screens/FixedCostsScreen';
 import OnboardingStack from './navigation/OnboardingStack';
 import DepositReviewScreen from './screens/DepositReviewScreen';
+import { createBottomTabNavigator } from '@react-navigation/bottom-tabs';
 
 // --- API Base URL ---
 const API_BASE_URL = 'http://localhost:5150';
