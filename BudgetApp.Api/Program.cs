@@ -792,7 +792,7 @@ app.MapPost("/api/transactions/{id}/decision", async (int id, UpdateTransactionD
 .WithOpenApi();
 
 // GET: /api/transactions/large-expenses
-app.MapGet("/api/transactions/large-expenses", async (ApiDbContext dbContext, HttpContext httpContext) =>
+app.MapGet("/api/transactions/large-expenses/pending", async (ApiDbContext dbContext, HttpContext httpContext) =>
 {
     try
     {
