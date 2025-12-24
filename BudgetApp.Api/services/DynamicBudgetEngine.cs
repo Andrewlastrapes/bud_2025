@@ -1,83 +1,92 @@
-// File: services/DynamicBudgetEngine.cs
 using System;
 using BudgetApp.Api.Data;
 
-namespace BudgetApp.Api.Services
+namespace BudgetApp.Api.Services;
+
+
+public record DepositContext
 {
-    public interface IDynamicBudgetEngine
+    public decimal Amount { get; init; }
+    public DateTime Date { get; init; }
+    public string? MerchantName { get; init; }
+    public int? PayDay1 { get; init; }
+    public int? PayDay2 { get; init; }
+    public decimal? ExpectedPaycheckAmount { get; init; }
+}
+
+public interface IDynamicBudgetEngine
+{
+    TransactionSuggestedKind ClassifyDeposit(DepositContext ctx);
+
+    /// <summary>
+    /// Returns true if an outflow is "large" relative to the user's expected paycheck.
+    /// For now: >= 30% of expected paycheck.
+    /// </summary>
+    bool IsLargeExpense(decimal amount, decimal expectedPaycheckAmount);
+}
+
+public class DynamicBudgetEngine : IDynamicBudgetEngine
+{
+    private const decimal PaycheckAmountTolerance = 0.15m; // 15%
+    private const decimal LargeExpenseThresholdRatio = 0.30m; // 30%
+
+    public TransactionSuggestedKind ClassifyDeposit(DepositContext ctx)
     {
-        TransactionSuggestedKind ClassifyDeposit(DepositContext ctx);
-    }
+        if (ctx.Amount <= 0)
+            return TransactionSuggestedKind.Unknown;
 
-    public class DynamicBudgetEngine : IDynamicBudgetEngine
-    {
-        // How many days around a payday we consider "pay window"
-        private const int PayWindowDays = 5;
-
-        // How close (percentage) to the expected paycheck amount we require
-        private const decimal AmountTolerancePercent = 0.15m; // 15%
-
-        public TransactionSuggestedKind ClassifyDeposit(DepositContext ctx)
+        // If we don't know their expected paycheck, we can't be smart.
+        if (ctx.ExpectedPaycheckAmount is null or <= 0)
         {
-            if (ctx == null) throw new ArgumentNullException(nameof(ctx));
-
-            // No expected paycheck configured → we can't confidently call anything a paycheck.
-            if (ctx.ExpectedPaycheckAmount <= 0m)
-                return TransactionSuggestedKind.Windfall;
-
-            // Amount must be > 0 and reasonably close to expected.
-            if (ctx.Amount <= 0m)
-                return TransactionSuggestedKind.Windfall;
-
-            var isAmountMatch = IsAmountWithinTolerance(
-                ctx.Amount,
-                ctx.ExpectedPaycheckAmount,
-                AmountTolerancePercent
-            );
-
-            // Date must be reasonably close to one of the two configured pay days.
-            var txDate = ctx.Date.Date;
-
-            var inPayWindow =
-                IsInPayWindow(txDate, ctx.PayDay1) ||
-                IsInPayWindow(txDate, ctx.PayDay2);
-
-            if (isAmountMatch && inPayWindow)
+            // Heuristic: if it has a payroll-ish merchant name, call it paycheck.
+            if (!string.IsNullOrWhiteSpace(ctx.MerchantName) &&
+                ctx.MerchantName.Contains("PAYROLL", StringComparison.OrdinalIgnoreCase))
             {
                 return TransactionSuggestedKind.Paycheck;
             }
 
-            // Later we can add more nuanced cases (e.g., "Reimbursement", "Transfer", etc.)
             return TransactionSuggestedKind.Windfall;
         }
 
-        private static bool IsAmountWithinTolerance(
-            decimal actual,
-            decimal expected,
-            decimal tolerancePercent)
+        var expected = ctx.ExpectedPaycheckAmount.Value;
+        var ratio = ctx.Amount / expected;
+        var withinTolerance = Math.Abs(1 - ratio) <= PaycheckAmountTolerance;
+
+        if (!withinTolerance)
         {
-            var diff = Math.Abs(actual - expected);
-            var allowed = expected * tolerancePercent;
-            return diff <= allowed;
+            // Not close enough in amount – probably a windfall / random deposit.
+            return TransactionSuggestedKind.Windfall;
         }
 
-        private static bool IsInPayWindow(DateTime txDate, int payDay)
+        // Check timing against payday windows if provided.
+        if (ctx.PayDay1.HasValue && ctx.PayDay2.HasValue)
         {
-            if (payDay < 1 || payDay > 31)
-                return false;
+            var isOnOrNearPayday = IsWithinPaydayWindow(ctx.Date, ctx.PayDay1.Value, ctx.PayDay2.Value, daysWindow: 2);
+            if (isOnOrNearPayday)
+            {
+                return TransactionSuggestedKind.Paycheck;
+            }
 
-            // Candidate payday in the same month as the transaction.
-            var year = txDate.Year;
-            var month = txDate.Month;
-
-            var daysInMonth = DateTime.DaysInMonth(year, month);
-            var day = payDay > daysInMonth ? daysInMonth : payDay;
-
-            var candidate = new DateTime(year, month, day);
-
-            var deltaDays = Math.Abs((candidate.Date - txDate.Date).TotalDays);
-
-            return deltaDays <= PayWindowDays;
+            // Amount looks like paycheck, but timing is way off ⇒ treat as windfall for now.
+            return TransactionSuggestedKind.Windfall;
         }
+
+        // Fallback: amount matches but we don't have paydays.
+        return TransactionSuggestedKind.Paycheck;
+    }
+
+    public bool IsLargeExpense(decimal amount, decimal expectedPaycheckAmount)
+    {
+        if (amount <= 0 || expectedPaycheckAmount <= 0)
+            return false;
+
+        var ratio = amount / expectedPaycheckAmount;
+        return ratio >= LargeExpenseThresholdRatio;
+    }
+
+    private static bool IsWithinPaydayWindow(DateTime date, int payDay1, int payDay2, int daysWindow)
+    {
+        var d = date.Day;
+        return Math.Abs(d - payDay1) <= daysWindow || Math.Abs(d - payDay2) <= daysWindow;
     }
 }

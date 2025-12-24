@@ -1,32 +1,37 @@
-using BudgetApp.Api.Data;
-using FirebaseAdmin.Auth;
-using Microsoft.EntityFrameworkCore;
-using Going.Plaid; // <--- FIX 1: Add the root namespace
-using Going.Plaid.Transactions;
+// File: services/TransactionService.cs
+
 using System;
-using System.Collections.Generic;
 using System.Linq;
 using System.Threading.Tasks;
-// REMOVED: using Going.Plaid.Client; // This was causing the build error
+using BudgetApp.Api.Data;
+using Going.Plaid;                 // PlaidClient
+using Going.Plaid.Transactions;
+using Microsoft.EntityFrameworkCore;
 
 namespace BudgetApp.Api.Services;
 
-// Interface is now defined in the same file
+// Public interface used by Program.cs and elsewhere
 public interface ITransactionService
 {
+    /// <summary>
+    /// Syncs transactions for the given Plaid ItemId and updates our DB +
+    /// dynamic budget balance based on new spending.
+    /// </summary>
     Task<TransactionsSyncResponse> SyncAndProcessTransactions(string itemId);
 }
 
 public class TransactionService : ITransactionService
 {
-    private readonly PlaidClient _plaidClient; // FIX 2: This type is now resolved by 'using Going.Plaid;'
+    private readonly PlaidClient _plaidClient;
     private readonly ApiDbContext _dbContext;
     private readonly IConfiguration _config;
-
     private readonly IDynamicBudgetEngine _budgetEngine;
 
-
-    public TransactionService(ApiDbContext dbContext, PlaidClient plaidClient, IConfiguration config, IDynamicBudgetEngine budgetEngine)
+    public TransactionService(
+        ApiDbContext dbContext,
+        PlaidClient plaidClient,
+        IConfiguration config,
+        IDynamicBudgetEngine budgetEngine)
     {
         _dbContext = dbContext;
         _plaidClient = plaidClient;
@@ -34,19 +39,25 @@ public class TransactionService : ITransactionService
         _budgetEngine = budgetEngine;
     }
 
-    // File: Services/TransactionService.cs (inside TransactionService class)
-
-    // FIX: Method signature accepts ItemId
+    /// <summary>
+    /// Syncs new Plaid transactions for this ItemId, stores them, and
+    /// decrements the dynamic balance by variable spend only.
+    /// Deposits are classified but do not immediately change the balance.
+    /// </summary>
     public async Task<TransactionsSyncResponse> SyncAndProcessTransactions(string itemId)
     {
         try
         {
             // --- 1. FIND PLAID ITEM AND USER ---
-            var plaidItem = await _dbContext.PlaidItems.FirstOrDefaultAsync(p => p.ItemId == itemId);
+            var plaidItem = await _dbContext.PlaidItems
+                .FirstOrDefaultAsync(p => p.ItemId == itemId);
+
             if (plaidItem == null)
                 throw new InvalidOperationException($"Plaid Item {itemId} not found.");
 
-            var user = await _dbContext.Users.FirstOrDefaultAsync(u => u.Id == plaidItem.UserId);
+            var user = await _dbContext.Users
+                .FirstOrDefaultAsync(u => u.Id == plaidItem.UserId);
+
             if (user == null)
                 throw new UnauthorizedAccessException("User linked to this Item not found.");
 
@@ -74,13 +85,15 @@ public class TransactionService : ITransactionService
 
                 if (exists) continue;
 
-                DateTime txDate = t.Date.GetValueOrDefault(DateOnly.FromDateTime(DateTime.UtcNow))
-                                       .ToDateTime(TimeOnly.MinValue);
+                DateTime txDate = t.Date
+                    .GetValueOrDefault(DateOnly.FromDateTime(DateTime.UtcNow))
+                    .ToDateTime(TimeOnly.MinValue);
+
                 DateTime txDateUtc = DateTime.SpecifyKind(txDate, DateTimeKind.Utc);
                 string merchantName = t.MerchantName ?? t.Name;
 
                 var rawAmount = t.Amount ?? 0m;
-                bool isCredit = rawAmount < 0m;          // Plaid: negative = inflow
+                bool isCredit = rawAmount < 0m;   // Plaid: negative = inflow
                 decimal absAmount = Math.Abs(rawAmount);
 
                 var newTx = new BudgetApp.Api.Data.Transaction
@@ -88,16 +101,15 @@ public class TransactionService : ITransactionService
                     UserId = user.Id,
                     PlaidTransactionId = t.TransactionId,
                     AccountId = t.AccountId,
-                    Amount = absAmount,                   // store magnitude
+                    Amount = absAmount,      // store magnitude only
                     Date = txDateUtc,
-                    Name = merchantName,
+                    Name = t.Name,           // yes, this is obsolete in the model, but still there
                     MerchantName = t.MerchantName,
                     Pending = t.Pending ?? false,
                     CreatedAt = DateTime.UtcNow,
                     UpdatedAt = DateTime.UtcNow,
-                    SuggestedKind = TransactionSuggestedKind.Unknown,
-                    UserDecision = TransactionUserDecision.Undecided,
-                    CountedAsIncome = false
+                    IsLargeExpenseCandidate = false,
+                    LargeExpenseHandled = false
                 };
 
                 if (isCredit)
@@ -113,27 +125,36 @@ public class TransactionService : ITransactionService
                         ExpectedPaycheckAmount = user.ExpectedPaycheckAmount
                     };
 
+                    // NOTE: TransactionSuggestedKind here is from BudgetApp.Api.Data
                     newTx.SuggestedKind = _budgetEngine.ClassifyDeposit(ctx);
                 }
                 else
                 {
-                    // Outflow: treat as spend unless it matches a fixed cost merchant
+                    // Outflow: treat as variable spend unless it matches a fixed cost merchant
                     bool isFixed = fixedCosts.Any(fc =>
                         !string.IsNullOrEmpty(fc.PlaidMerchantName) &&
-                        fc.PlaidMerchantName.Equals(merchantName, StringComparison.OrdinalIgnoreCase)
-                    );
+                        fc.PlaidMerchantName.Equals(merchantName, StringComparison.OrdinalIgnoreCase));
 
                     if (!isFixed)
                     {
                         variableSpend += absAmount;
+
+                        // Large expense detection
+                        // ExpectedPaycheckAmount is a non-nullable decimal on User
+                        if (user.ExpectedPaycheckAmount > 0 &&
+                            _budgetEngine.IsLargeExpense(absAmount, user.ExpectedPaycheckAmount))
+                        {
+                            newTx.IsLargeExpenseCandidate = true;
+                            newTx.LargeExpenseHandled = false;
+                        }
                     }
                 }
 
                 await _dbContext.Transactions.AddAsync(newTx);
             }
 
-            // --- 4. Update Balance ONLY with Variable Spend (outflows) ---
-            if (variableSpend > 0m)
+            // --- 4. Update Balance ONLY with Variable Spend ---
+            if (variableSpend > 0)
             {
                 var balanceRecord = await _dbContext.Balances
                     .FirstOrDefaultAsync(b => b.UserId == user.Id);
@@ -153,8 +174,8 @@ public class TransactionService : ITransactionService
         }
         catch (Exception e)
         {
+            // Surface a single wrapped exception to the controller / endpoint
             throw new Exception("Error syncing and processing transactions.", e);
         }
     }
-
 }

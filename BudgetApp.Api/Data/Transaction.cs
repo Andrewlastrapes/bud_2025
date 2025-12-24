@@ -50,8 +50,19 @@ public class Transaction
     [Column("counted_as_income")]
     public bool CountedAsIncome { get; set; } = false;
 
+    [Column("IsLargeExpenseCandidate")]
+    public bool IsLargeExpenseCandidate { get; set; }
+
+    [Column("LargeExpenseHandled")]
+    public bool LargeExpenseHandled { get; set; }
+
+
+
 
     // Navigation property
     [ForeignKey(nameof(UserId))]
     public virtual User? User { get; set; }
+
+
+    
 }

@@ -791,6 +791,144 @@ app.MapPost("/api/transactions/{id}/decision", async (int id, UpdateTransactionD
 .WithName("DecideOnTransaction")
 .WithOpenApi();
 
+// GET: /api/transactions/large-expenses
+app.MapGet("/api/transactions/large-expenses", async (ApiDbContext dbContext, HttpContext httpContext) =>
+{
+    try
+    {
+        string? idToken = httpContext.Request.Headers["Authorization"].FirstOrDefault()?.Split(" ").Last();
+        if (string.IsNullOrEmpty(idToken)) return Results.Unauthorized();
+
+        var decodedToken = await FirebaseAdmin.Auth.FirebaseAuth.DefaultInstance.VerifyIdTokenAsync(idToken);
+        var user = await dbContext.Users.FirstOrDefaultAsync(u => u.FirebaseUuid == decodedToken.Uid);
+        if (user == null) return Results.NotFound("User not found.");
+
+        var txs = await dbContext.Transactions
+            .Where(t => t.UserId == user.Id && t.IsLargeExpenseCandidate && !t.LargeExpenseHandled)
+            .OrderByDescending(t => t.Date)
+            .ToListAsync();
+
+        return Results.Ok(txs);
+    }
+    catch (Exception e)
+    {
+        return Results.Problem(e.Message);
+    }
+})
+.WithName("GetLargeExpenses")
+.WithOpenApi();
+
+// POST: /api/transactions/{id}/large-expense-decision
+app.MapPost("/api/transactions/{id}/large-expense-decision",
+    async (int id, LargeExpenseDecisionRequest body, ApiDbContext dbContext, HttpContext httpContext) =>
+{
+    try
+    {
+        // Auth
+        string? idToken = httpContext.Request.Headers["Authorization"].FirstOrDefault()?.Split(" ").Last();
+        if (string.IsNullOrEmpty(idToken)) return Results.Unauthorized();
+
+        var decodedToken = await FirebaseAdmin.Auth.FirebaseAuth.DefaultInstance.VerifyIdTokenAsync(idToken);
+        var user = await dbContext.Users.FirstOrDefaultAsync(u => u.FirebaseUuid == decodedToken.Uid);
+        if (user == null) return Results.NotFound("User not found.");
+
+        var tx = await dbContext.Transactions.FirstOrDefaultAsync(t => t.Id == id && t.UserId == user.Id);
+        if (tx == null) return Results.NotFound("Transaction not found.");
+
+        if (tx.Amount <= 0)
+        {
+            return Results.BadRequest("Large-expense decisions only apply to outflow transactions.");
+        }
+
+        var balance = await dbContext.Balances.FirstOrDefaultAsync(b => b.UserId == user.Id);
+
+        switch (body.Option)
+        {
+            case LargeExpenseDecisionOption.TreatAsNormal:
+                tx.UserDecision = TransactionUserDecision.TreatAsVariableSpend;
+                break;
+
+            case LargeExpenseDecisionOption.FromSavings:
+                tx.UserDecision = TransactionUserDecision.LargeExpenseFromSavings;
+                if (balance != null)
+                {
+                    // Refund this amount to the current period spend limit
+                    balance.BalanceAmount += tx.Amount;
+                    balance.UpdatedAt = DateTime.UtcNow;
+                }
+                break;
+
+            case LargeExpenseDecisionOption.ConvertToFixedCost:
+                if (body.SplitOverPeriods is null or <= 0)
+                {
+                    return Results.BadRequest("SplitOverPeriods must be at least 1 for ConvertToFixedCost.");
+                }
+
+                tx.UserDecision = TransactionUserDecision.LargeExpenseToFixedCost;
+
+                if (balance != null)
+                {
+                    // We no longer want this full amount counted as current-period spend
+                    balance.BalanceAmount += tx.Amount;
+                    balance.UpdatedAt = DateTime.UtcNow;
+                }
+
+                int periods = body.SplitOverPeriods.Value;
+                decimal perPeriodAmount = Math.Round(tx.Amount / periods, 2);
+
+                // Very simple bi-weekly approximation for due dates.
+                var baseDate = tx.Date.Date;
+
+                for (int i = 1; i <= periods; i++)
+                {
+                    var dueDate = baseDate.AddDays(14 * i);
+
+                    var fixedCost = new FixedCost
+                    {
+                        UserId = user.Id,
+                        Name = $"Installment: {tx.MerchantName ?? tx.Name ?? "Large purchase"}",
+                        Amount = perPeriodAmount,
+                        Category = "Installment",
+                        Type = "large_expense_plan",
+                        PlaidMerchantName = tx.MerchantName,
+                        PlaidAccountId = tx.AccountId,
+                        UserHasApproved = true,
+                        CreatedAt = DateTime.UtcNow,
+                        UpdatedAt = DateTime.UtcNow,
+                        NextDueDate = dueDate
+                    };
+
+                    await dbContext.FixedCosts.AddAsync(fixedCost);
+                }
+                break;
+
+            default:
+                return Results.BadRequest("Unknown option.");
+        }
+
+        tx.IsLargeExpenseCandidate = false;
+        tx.LargeExpenseHandled = true;
+        tx.UpdatedAt = DateTime.UtcNow;
+
+        await dbContext.SaveChangesAsync();
+
+        return Results.Ok(new
+        {
+            message = "Large expense decision saved.",
+            option = body.Option.ToString(),
+            newBalance = balance?.BalanceAmount
+        });
+    }
+    catch (Exception e)
+    {
+        return Results.Problem(e.Message);
+    }
+})
+.WithName("DecideOnLargeExpense")
+.WithOpenApi();
+
+
+
 
 // --- RUN THE APP ---
 app.Run();
