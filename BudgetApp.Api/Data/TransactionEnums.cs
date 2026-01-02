@@ -11,15 +11,22 @@ public enum TransactionSuggestedKind
 
 public enum TransactionUserDecision
 {
-    // Original decisions
+    // Default / no decision yet
     Undecided = 0,
+
+    // --- Deposit decisions (credits) ---
     TreatAsIncome = 1,
     IgnoreForDynamic = 2,
     DebtPayment = 3,
     SavingsFunded = 4,
 
-    // Large-expense decisions
-    TreatAsVariableSpend = 10,     // “Just count it as normal spending”
-    LargeExpenseFromSavings = 11,  // “It actually came from savings – refund this period”
-    LargeExpenseToFixedCost = 12   // “Turn this into an installment / fixed cost plan”
+    // --- Large expense decisions (big debits) ---
+    // “Just leave it as normal spending – the hit to this period is fine.”
+    TreatAsVariableSpend = 10,
+
+    // “This really came from savings; refund this period’s dynamic budget.”
+    LargeExpenseFromSavings = 11,
+
+    // “Turn this into an installment / fixed cost; refund this period.”
+    LargeExpenseToFixedCost = 12
 }

@@ -1,22 +1,17 @@
-// File: services/TransactionService.cs
-
-using System;
-using System.Linq;
-using System.Threading.Tasks;
 using BudgetApp.Api.Data;
-using Going.Plaid;                 // PlaidClient
+using Going.Plaid;
 using Going.Plaid.Transactions;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Configuration;
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading.Tasks;
 
 namespace BudgetApp.Api.Services;
 
-// Public interface used by Program.cs and elsewhere
 public interface ITransactionService
 {
-    /// <summary>
-    /// Syncs transactions for the given Plaid ItemId and updates our DB +
-    /// dynamic budget balance based on new spending.
-    /// </summary>
     Task<TransactionsSyncResponse> SyncAndProcessTransactions(string itemId);
 }
 
@@ -26,24 +21,22 @@ public class TransactionService : ITransactionService
     private readonly ApiDbContext _dbContext;
     private readonly IConfiguration _config;
     private readonly IDynamicBudgetEngine _budgetEngine;
+    private readonly INotificationService _notificationService;
 
     public TransactionService(
         ApiDbContext dbContext,
         PlaidClient plaidClient,
         IConfiguration config,
-        IDynamicBudgetEngine budgetEngine)
+        IDynamicBudgetEngine budgetEngine,
+        INotificationService notificationService)
     {
         _dbContext = dbContext;
         _plaidClient = plaidClient;
         _config = config;
         _budgetEngine = budgetEngine;
+        _notificationService = notificationService;
     }
 
-    /// <summary>
-    /// Syncs new Plaid transactions for this ItemId, stores them, and
-    /// decrements the dynamic balance by variable spend only.
-    /// Deposits are classified but do not immediately change the balance.
-    /// </summary>
     public async Task<TransactionsSyncResponse> SyncAndProcessTransactions(string itemId)
     {
         try
@@ -75,46 +68,46 @@ public class TransactionService : ITransactionService
 
             var response = await _plaidClient.TransactionsSyncAsync(request);
 
-            decimal variableSpend = 0m;
+            decimal variableSpendDelta = 0m;
+            var notificationCandidates = new List<Transaction>();
 
             // --- 3. Process "Added" Transactions ---
             foreach (var t in response.Added)
             {
                 var exists = await _dbContext.Transactions
                     .AnyAsync(x => x.PlaidTransactionId == t.TransactionId);
-
                 if (exists) continue;
 
-                DateTime txDate = t.Date
-                    .GetValueOrDefault(DateOnly.FromDateTime(DateTime.UtcNow))
+                DateTime txDate = t.Date.GetValueOrDefault(DateOnly.FromDateTime(DateTime.UtcNow))
                     .ToDateTime(TimeOnly.MinValue);
-
                 DateTime txDateUtc = DateTime.SpecifyKind(txDate, DateTimeKind.Utc);
                 string merchantName = t.MerchantName ?? t.Name;
 
                 var rawAmount = t.Amount ?? 0m;
-                bool isCredit = rawAmount < 0m;   // Plaid: negative = inflow
+                bool isCredit = rawAmount < 0m;  // Plaid: negative = inflow
                 decimal absAmount = Math.Abs(rawAmount);
 
-                var newTx = new BudgetApp.Api.Data.Transaction
+                var newTx = new Transaction
                 {
                     UserId = user.Id,
                     PlaidTransactionId = t.TransactionId,
                     AccountId = t.AccountId,
-                    Amount = absAmount,      // store magnitude only
+                    Amount = absAmount,
                     Date = txDateUtc,
-                    Name = t.Name,           // yes, this is obsolete in the model, but still there
+                    Name = t.Name,
                     MerchantName = t.MerchantName,
                     Pending = t.Pending ?? false,
                     CreatedAt = DateTime.UtcNow,
                     UpdatedAt = DateTime.UtcNow,
                     IsLargeExpenseCandidate = false,
-                    LargeExpenseHandled = false
+                    LargeExpenseHandled = false,
+                    SuggestedKind = TransactionSuggestedKind.Unknown,
+                    UserDecision = TransactionUserDecision.Undecided
                 };
 
                 if (isCredit)
                 {
-                    // Deposit: classify, but DO NOT change balance yet.
+                    // Deposit: classify, but DO NOT change balance yet
                     var ctx = new DepositContext
                     {
                         Amount = absAmount,
@@ -125,24 +118,21 @@ public class TransactionService : ITransactionService
                         ExpectedPaycheckAmount = user.ExpectedPaycheckAmount
                     };
 
-                    // NOTE: TransactionSuggestedKind here is from BudgetApp.Api.Data
                     newTx.SuggestedKind = _budgetEngine.ClassifyDeposit(ctx);
                 }
                 else
                 {
-                    // Outflow: treat as variable spend unless it matches a fixed cost merchant
+                    // Outflow: variable spend unless it matches a fixed cost merchant
                     bool isFixed = fixedCosts.Any(fc =>
                         !string.IsNullOrEmpty(fc.PlaidMerchantName) &&
                         fc.PlaidMerchantName.Equals(merchantName, StringComparison.OrdinalIgnoreCase));
 
                     if (!isFixed)
                     {
-                        variableSpend += absAmount;
+                        variableSpendDelta += absAmount;
 
-                        // Large expense detection
-                        // ExpectedPaycheckAmount is a non-nullable decimal on User
-                        if (user.ExpectedPaycheckAmount > 0 &&
-                            _budgetEngine.IsLargeExpense(absAmount, user.ExpectedPaycheckAmount))
+                        // Large expense detection (Feature 3)
+                        if (_budgetEngine.IsLargeExpense(absAmount, user.ExpectedPaycheckAmount))
                         {
                             newTx.IsLargeExpenseCandidate = true;
                             newTx.LargeExpenseHandled = false;
@@ -151,30 +141,56 @@ public class TransactionService : ITransactionService
                 }
 
                 await _dbContext.Transactions.AddAsync(newTx);
+
+                // Decide whether this one should trigger a notification
+                bool shouldNotify =
+                    isCredit ||                             // deposits go through user decision flow
+                    newTx.IsLargeExpenseCandidate ||        // large expense flow
+                    (!isCredit && !string.IsNullOrEmpty(merchantName)); // generic spend / recurring prompt
+
+                if (shouldNotify)
+                {
+                    notificationCandidates.Add(newTx);
+                }
             }
 
             // --- 4. Update Balance ONLY with Variable Spend ---
-            if (variableSpend > 0)
+            Balance? balanceRecord = null;
+
+            if (variableSpendDelta > 0)
             {
-                var balanceRecord = await _dbContext.Balances
+                balanceRecord = await _dbContext.Balances
                     .FirstOrDefaultAsync(b => b.UserId == user.Id);
 
                 if (balanceRecord != null)
                 {
-                    balanceRecord.BalanceAmount -= variableSpend;
+                    balanceRecord.BalanceAmount -= variableSpendDelta;
                     balanceRecord.UpdatedAt = DateTime.UtcNow;
                 }
+            }
+            else
+            {
+                balanceRecord = await _dbContext.Balances
+                    .FirstOrDefaultAsync(b => b.UserId == user.Id);
             }
 
             // --- 5. Update Cursor and Save ---
             plaidItem.Cursor = response.NextCursor;
             await _dbContext.SaveChangesAsync();
 
+            var currentBalance = balanceRecord?.BalanceAmount ?? 0m;
+
+            // --- 6. Fire notifications (best effort) ---
+            foreach (var tx in notificationCandidates)
+            {
+                await _notificationService.SendNewTransactionNotification(tx, currentBalance);
+            }
+
             return response;
         }
         catch (Exception e)
         {
-            // Surface a single wrapped exception to the controller / endpoint
+            // Propagate the exception up to the public endpoint
             throw new Exception("Error syncing and processing transactions.", e);
         }
     }

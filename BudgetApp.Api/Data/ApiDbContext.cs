@@ -13,6 +13,8 @@ public class ApiDbContext : DbContext
     public DbSet<Balance> Balances { get; set; }
     public DbSet<Transaction> Transactions { get; set; }
     public DbSet<FixedCost> FixedCosts { get; set; }
+    public DbSet<UserDevice> UserDevices { get; set; } = null!;
+
 
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)

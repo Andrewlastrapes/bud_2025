@@ -8,6 +8,9 @@ import { PaperProvider, DefaultTheme, Button } from 'react-native-paper';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
 import MaterialCommunityIcons from 'react-native-vector-icons/MaterialCommunityIcons';
 import axios from 'axios';
+import * as Notifications from 'expo-notifications';
+import * as Device from 'expo-device';
+import { Platform } from 'react-native';
 
 import { auth } from './firebaseConfig';
 import { onAuthStateChanged, signOut } from 'firebase/auth';
@@ -30,6 +33,37 @@ const API_BASE_URL = 'http://localhost:5150';
 // --- Navigators ---
 const Stack = createNativeStackNavigator();
 const Tab = createBottomTabNavigator();
+
+Notifications.setNotificationHandler({
+  handleNotification: async () => ({
+    shouldShowAlert: true,
+    shouldPlaySound: false,
+    shouldSetBadge: false,
+  }),
+});
+
+async function registerForPushNotificationsAsync() {
+  if (!Device.isDevice) {
+    console.log('Push notifications require a physical device/emulator.');
+    return null;
+  }
+
+  const { status: existingStatus } = await Notifications.getPermissionsAsync();
+  let finalStatus = existingStatus;
+  if (existingStatus !== 'granted') {
+    const { status } = await Notifications.requestPermissionsAsync();
+    finalStatus = status;
+  }
+  if (finalStatus !== 'granted') {
+    console.log('Notification permission not granted.');
+    return null;
+  }
+
+  const tokenData = await Notifications.getExpoPushTokenAsync();
+  return tokenData.data;
+}
+
+
 
 /**
  * Bottom tab navigator for the main app
@@ -217,6 +251,31 @@ export default function App() {
 
     return () => unsubscribe();
   }, []);
+
+  useEffect(() => {
+  const setupNotifications = async () => {
+    if (!fbUser) return;
+
+    try {
+      const expoPushToken = await registerForPushNotificationsAsync();
+      if (!expoPushToken) return;
+
+      const idToken = await fbUser.getIdToken();
+
+      await axios.post(
+        `${API_BASE_URL}/api/notifications/register-device`,
+        { expoPushToken, platform: Platform.OS },
+        { headers: { Authorization: `Bearer ${idToken}` } },
+      );
+
+      console.log('Push token registered:', expoPushToken);
+    } catch (e) {
+      console.error('Failed to register push notifications:', e);
+    }
+  };
+
+  setupNotifications();
+}, [fbUser]);
 
   return (
     <SafeAreaProvider>

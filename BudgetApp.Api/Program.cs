@@ -10,6 +10,8 @@ using FirebaseAdmin;
 using Google.Apis.Auth.OAuth2;
 using BudgetApp.Api.Services;
 using System.Linq;
+using FirebaseAdmin.Auth;
+
 
 // --- App Setup ---
 var builder = WebApplication.CreateBuilder(args);
@@ -39,6 +41,10 @@ builder.Services.AddDbContext<ApiDbContext>(options =>
 
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen();
+builder.Services.AddHttpClient();
+builder.Services.AddScoped<INotificationService, ExpoNotificationService>();
+
+
 
 builder.Services.AddScoped<ITransactionService, TransactionService>();
 builder.Services.AddSingleton<IDynamicBudgetEngine, DynamicBudgetEngine>();
@@ -718,8 +724,8 @@ app.MapGet("/api/transactions/deposits/pending", async (ApiDbContext dbContext, 
         // and where the user has not made a decision yet.
         var pendingDeposits = await dbContext.Transactions
             .Where(t => t.UserId == user.Id
-                        && t.SuggestedKind != null
-                        && t.UserDecision == null)
+            && t.SuggestedKind != TransactionSuggestedKind.Unknown
+            && t.UserDecision == TransactionUserDecision.Undecided)
             .OrderByDescending(t => t.Date)
             .ToListAsync();
 
@@ -735,11 +741,12 @@ app.MapGet("/api/transactions/deposits/pending", async (ApiDbContext dbContext, 
 
 
 
+// Used to update how a transaction (deposit or large expense) affects the dynamic balance
 app.MapPost("/api/transactions/{id}/decision", async (int id, UpdateTransactionDecisionRequest body, ApiDbContext dbContext, HttpContext httpContext) =>
 {
     try
     {
-        // Auth
+        // --- Auth ---
         string? idToken = httpContext.Request.Headers["Authorization"].FirstOrDefault()?.Split(" ").Last();
         if (string.IsNullOrEmpty(idToken)) return Results.Unauthorized();
 
@@ -747,7 +754,7 @@ app.MapPost("/api/transactions/{id}/decision", async (int id, UpdateTransactionD
         var user = await dbContext.Users.FirstOrDefaultAsync(u => u.FirebaseUuid == decodedToken.Uid);
         if (user == null) return Results.NotFound("User not found.");
 
-        // Find transaction for this user
+        // --- Look up transaction for this user ---
         var tx = await dbContext.Transactions.FirstOrDefaultAsync(t => t.Id == id && t.UserId == user.Id);
         if (tx == null) return Results.NotFound("Transaction not found.");
 
@@ -757,20 +764,144 @@ app.MapPost("/api/transactions/{id}/decision", async (int id, UpdateTransactionD
             return Results.BadRequest("Invalid decision.");
         }
 
-        // If user chooses "TreatAsIncome" and we haven't already counted it, add to dynamic
-        if (decision == TransactionUserDecision.TreatAsIncome && !tx.CountedAsIncome)
-        {
-            var balance = await dbContext.Balances.FirstOrDefaultAsync(b => b.UserId == user.Id);
-            if (balance != null)
-            {
-                balance.BalanceAmount += tx.Amount;   // Amount is magnitude
-                balance.UpdatedAt = DateTime.UtcNow;
-            }
+        // Single balance row per user
+        var balance = await dbContext.Balances.FirstOrDefaultAsync(b => b.UserId == user.Id);
 
-            tx.CountedAsIncome = true;
+        // Helper: is this a deposit? (We only set SuggestedKind on credits when syncing)
+        bool isDeposit =
+            tx.SuggestedKind == TransactionSuggestedKind.Paycheck ||
+            tx.SuggestedKind == TransactionSuggestedKind.Windfall ||
+            tx.SuggestedKind == TransactionSuggestedKind.InternalTransfer ||
+            tx.SuggestedKind == TransactionSuggestedKind.Refund;
+
+        // =========================
+        // 1) DEPOSIT DECISIONS
+        // =========================
+        if (isDeposit)
+        {
+            switch (decision)
+            {
+                case TransactionUserDecision.TreatAsIncome:
+                    // Only count once
+                    if (!tx.CountedAsIncome && balance != null)
+                    {
+                        balance.BalanceAmount += tx.Amount;
+                        balance.UpdatedAt = DateTime.UtcNow;
+                        tx.CountedAsIncome = true;
+                    }
+                    break;
+
+                case TransactionUserDecision.IgnoreForDynamic:
+                case TransactionUserDecision.DebtPayment:
+                case TransactionUserDecision.SavingsFunded:
+                    // If we had previously counted it as income and user changes their mind,
+                    // remove it from the dynamic balance.
+                    if (tx.CountedAsIncome && balance != null)
+                    {
+                        balance.BalanceAmount -= tx.Amount;
+                        balance.UpdatedAt = DateTime.UtcNow;
+                        tx.CountedAsIncome = false;
+                    }
+                    break;
+
+                // Large-expense decisions don't make sense on deposits; treat as no-op for now.
+                case TransactionUserDecision.TreatAsVariableSpend:
+                case TransactionUserDecision.LargeExpenseFromSavings:
+                case TransactionUserDecision.LargeExpenseToFixedCost:
+                    break;
+            }
+        }
+        // =========================
+        // 2) LARGE EXPENSE DECISIONS (BIG DEBITS)
+        // =========================
+        else if (tx.IsLargeExpenseCandidate)
+        {
+            switch (decision)
+            {
+                case TransactionUserDecision.TreatAsVariableSpend:
+                    // Do nothing to balance; the hit already happened when we synced.
+                    tx.IsLargeExpenseCandidate = false;
+                    tx.LargeExpenseHandled = true;
+                    break;
+
+                case TransactionUserDecision.LargeExpenseFromSavings:
+                    // Refund this period’s dynamic balance, but only once.
+                    if (!tx.LargeExpenseHandled && balance != null)
+                    {
+                        balance.BalanceAmount += tx.Amount;
+                        balance.UpdatedAt = DateTime.UtcNow;
+                    }
+
+                    tx.IsLargeExpenseCandidate = false;
+                    tx.LargeExpenseHandled = true;
+                    break;
+
+                case TransactionUserDecision.LargeExpenseToFixedCost:
+                    // 1) Refund this period
+                    if (!tx.LargeExpenseHandled && balance != null)
+                    {
+                        balance.BalanceAmount += tx.Amount;
+                        balance.UpdatedAt = DateTime.UtcNow;
+                    }
+
+                    // 2) Create a FixedCost for future periods
+                    //    If the client passed a specific installment amount, use it.
+                    //    Otherwise, fall back to a simple 4-period split.
+                    decimal installmentAmount;
+
+                    if (body.FixedCostAmount.HasValue && body.FixedCostAmount.Value > 0)
+                    {
+                        installmentAmount = body.FixedCostAmount.Value;
+                    }
+                    else
+                    {
+                        installmentAmount = Math.Round(tx.Amount / 4m, 2);
+                    }
+
+                    var fixedCostName = !string.IsNullOrWhiteSpace(body.FixedCostName)
+                        ? body.FixedCostName
+                        : $"Installment: {tx.MerchantName ?? tx.Name ?? "Large Purchase"}";
+
+                    var firstDueDate = (body.FirstDueDate ?? DateTime.UtcNow).Date;
+
+                    var newFixedCost = new FixedCost
+                    {
+                        UserId = user.Id,
+                        Name = fixedCostName,
+                        Amount = installmentAmount,
+                        Category = "Installment",
+                        Type = "large_expense",
+                        PlaidMerchantName = tx.MerchantName,
+                        PlaidAccountId = tx.AccountId,
+                        UserHasApproved = true,
+                        CreatedAt = DateTime.UtcNow,
+                        UpdatedAt = DateTime.UtcNow,
+                        NextDueDate = firstDueDate,
+                    };
+
+                    await dbContext.FixedCosts.AddAsync(newFixedCost);
+
+                    tx.IsLargeExpenseCandidate = false;
+                    tx.LargeExpenseHandled = true;
+                    break;
+
+                // Deposit-only decisions on a debit = no-op, just store the choice.
+                case TransactionUserDecision.TreatAsIncome:
+                case TransactionUserDecision.IgnoreForDynamic:
+                case TransactionUserDecision.DebtPayment:
+                case TransactionUserDecision.SavingsFunded:
+                    // no balance change
+                    break;
+            }
+        }
+        // Non-deposit, non-large-expense: we just record whatever they chose.
+        // (This should be rare, mostly defensive.)
+        else
+        {
+            // For now, we don't change the balance at all in this branch.
         }
 
-        // For other decisions (Ignore, DebtPayment, SavingsFunded), we just store the decision for now
+        // Persist the choice
         tx.UserDecision = decision;
         tx.UpdatedAt = DateTime.UtcNow;
 
@@ -780,7 +911,9 @@ app.MapPost("/api/transactions/{id}/decision", async (int id, UpdateTransactionD
         {
             message = "Decision saved.",
             decision = tx.UserDecision.ToString(),
-            countedAsIncome = tx.CountedAsIncome
+            countedAsIncome = tx.CountedAsIncome,
+            balance = balance?.BalanceAmount,
+            transactionId = tx.Id
         });
     }
     catch (Exception e)
@@ -790,6 +923,9 @@ app.MapPost("/api/transactions/{id}/decision", async (int id, UpdateTransactionD
 })
 .WithName("DecideOnTransaction")
 .WithOpenApi();
+
+public record RegisterDeviceRequest(string ExpoPushToken, string? Platform);
+
 
 // GET: /api/transactions/large-expenses
 app.MapGet("/api/transactions/large-expenses/pending", async (ApiDbContext dbContext, HttpContext httpContext) =>
@@ -926,6 +1062,60 @@ app.MapPost("/api/transactions/{id}/large-expense-decision",
 })
 .WithName("DecideOnLargeExpense")
 .WithOpenApi();
+
+app.MapPost("/api/notifications/register-device",
+    async (ApiDbContext dbContext, HttpContext httpContext, RegisterDeviceRequest request) =>
+    {
+        try
+        {
+            string? idToken = httpContext.Request.Headers["Authorization"]
+                .FirstOrDefault()
+                ?.Split(" ")
+                .Last();
+
+            if (string.IsNullOrEmpty(idToken)) return Results.Unauthorized();
+
+            var decodedToken = await FirebaseAuth.DefaultInstance.VerifyIdTokenAsync(idToken);
+            var user = await dbContext.Users.FirstOrDefaultAsync(u => u.FirebaseUuid == decodedToken.Uid);
+            if (user == null) return Results.NotFound("User not found.");
+
+            var existing = await dbContext.UserDevices
+                .FirstOrDefaultAsync(d =>
+                    d.UserId == user.Id &&
+                    d.ExpoPushToken == request.ExpoPushToken);
+
+            if (existing == null)
+            {
+                var device = new UserDevice
+                {
+                    UserId = user.Id,
+                    ExpoPushToken = request.ExpoPushToken,
+                    Platform = request.Platform,
+                    IsActive = true,
+                    CreatedAt = DateTime.UtcNow,
+                    UpdatedAt = DateTime.UtcNow
+                };
+                await dbContext.UserDevices.AddAsync(device);
+            }
+            else
+            {
+                existing.IsActive = true;
+                existing.Platform = request.Platform;
+                existing.UpdatedAt = DateTime.UtcNow;
+            }
+
+            await dbContext.SaveChangesAsync();
+
+            return Results.Ok(new { message = "Device registered for notifications." });
+        }
+        catch (Exception e)
+        {
+            return Results.Problem(e.Message);
+        }
+    })
+    .WithName("RegisterDeviceForNotifications")
+    .WithOpenApi();
+
 
 
 
