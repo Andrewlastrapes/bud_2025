@@ -92,7 +92,6 @@ export default function PaycheckSavingsScreen({ navigation }) {
                 payDay2: day2,
             }, config);
 
-            // Success! Navigate to the final display screen
             navigation.navigate('DynamicAmountFinal', {
                 finalAmount: response.data.dynamicBalance,
                 prorateFactor: response.data.prorateFactor

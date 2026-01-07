@@ -1,3 +1,5 @@
+// File: Services/NotificationService.cs
+
 using System.Net.Http;
 using System.Net.Http.Json;
 using BudgetApp.Api.Data;
@@ -43,16 +45,16 @@ public class ExpoNotificationService : INotificationService
         string body;
         string type;
 
-        // Deposit (we’re using SuggestedKind to detect likely paychecks)
+        // Deposit (paycheck-style)
         if (tx.SuggestedKind == TransactionSuggestedKind.Paycheck)
         {
             type = "deposit";
             title = "New paycheck detected";
             body =
                 $"Your Period Spend Limit is currently ${dynamicBalance:0.00}. " +
-                $"Tap to decide how to use this deposit.";
+                "Tap to decide how to use this deposit.";
         }
-        // Large expense path (Feature 3 behavior)
+        // Large expense path
         else if (tx.IsLargeExpenseCandidate && !tx.LargeExpenseHandled)
         {
             type = "large-expense";
@@ -62,15 +64,21 @@ public class ExpoNotificationService : INotificationService
                 $"Period Spend Limit is now ${dynamicBalance:0.00}. " +
                 "Tap to choose: pay from savings, convert to fixed cost, or treat as normal spend.";
         }
-        // Generic deduction – this is where we nudge “recurring?” behavior
+        // Generic spend – ask about recurring
         else
         {
             type = "spend";
             title = $"New charge: {tx.MerchantName ?? tx.Name}";
             body =
                 $"-${tx.Amount:0.00}. Period Spend Limit is now ${dynamicBalance:0.00}. " +
-                "Tap to review or mark as a recurring bill.";
+                "Tap to mark this as a recurring bill or review your spending.";
         }
+
+        // Flag “normal spend” notifications as eligible for the recurring flow
+        bool canMarkRecurring =
+            type == "spend" &&
+            !tx.IsLargeExpenseCandidate &&
+            tx.SuggestedKind == TransactionSuggestedKind.Unknown;
 
         var payloads = userDevices.Select(d => new
         {
@@ -82,7 +90,8 @@ public class ExpoNotificationService : INotificationService
             {
                 type,
                 transactionId = tx.Id,
-                dynamicBalance
+                dynamicBalance,
+                canMarkRecurring
             }
         });
 

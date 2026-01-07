@@ -178,7 +178,7 @@ export default function FixedCostsSetupScreen({ navigation }) {
             }
 
             // Success! Move to the next step.
-            navigation.navigate('PaycheckSavings');
+            navigation.navigate('DebtOnboarding');
 
         } catch (error) {
             console.error("Failed to save costs:", error);

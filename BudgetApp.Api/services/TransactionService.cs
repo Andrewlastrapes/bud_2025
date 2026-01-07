@@ -1,197 +1,194 @@
 using BudgetApp.Api.Data;
+using Microsoft.EntityFrameworkCore;
 using Going.Plaid;
 using Going.Plaid.Transactions;
-using Microsoft.EntityFrameworkCore;
-using Microsoft.Extensions.Configuration;
-using System;
-using System.Collections.Generic;
-using System.Linq;
-using System.Threading.Tasks;
 
-namespace BudgetApp.Api.Services;
-
-public interface ITransactionService
+namespace BudgetApp.Api.Services
 {
-    Task<TransactionsSyncResponse> SyncAndProcessTransactions(string itemId);
-}
-
-public class TransactionService : ITransactionService
-{
-    private readonly PlaidClient _plaidClient;
-    private readonly ApiDbContext _dbContext;
-    private readonly IConfiguration _config;
-    private readonly IDynamicBudgetEngine _budgetEngine;
-    private readonly INotificationService _notificationService;
-
-    public TransactionService(
-        ApiDbContext dbContext,
-        PlaidClient plaidClient,
-        IConfiguration config,
-        IDynamicBudgetEngine budgetEngine,
-        INotificationService notificationService)
+    public interface ITransactionService
     {
-        _dbContext = dbContext;
-        _plaidClient = plaidClient;
-        _config = config;
-        _budgetEngine = budgetEngine;
-        _notificationService = notificationService;
+        Task<TransactionsSyncResponse> SyncAndProcessTransactions(string itemId);
     }
 
-    public async Task<TransactionsSyncResponse> SyncAndProcessTransactions(string itemId)
+    public class TransactionService : ITransactionService
     {
-        try
+        private readonly PlaidClient _plaidClient;
+        private readonly ApiDbContext _dbContext;
+        private readonly IConfiguration _config;
+        private readonly IDynamicBudgetEngine _budgetEngine;
+        private readonly INotificationService _notificationService;
+
+        public TransactionService(
+            ApiDbContext dbContext,
+            PlaidClient plaidClient,
+            IConfiguration config,
+            IDynamicBudgetEngine budgetEngine,
+            INotificationService notificationService)
         {
-            // --- 1. FIND PLAID ITEM AND USER ---
-            var plaidItem = await _dbContext.PlaidItems
-                .FirstOrDefaultAsync(p => p.ItemId == itemId);
+            _dbContext = dbContext;
+            _plaidClient = plaidClient;
+            _config = config;
+            _budgetEngine = budgetEngine;
+            _notificationService = notificationService;
+        }
 
-            if (plaidItem == null)
-                throw new InvalidOperationException($"Plaid Item {itemId} not found.");
-
-            var user = await _dbContext.Users
-                .FirstOrDefaultAsync(u => u.Id == plaidItem.UserId);
-
-            if (user == null)
-                throw new UnauthorizedAccessException("User linked to this Item not found.");
-
-            var fixedCosts = await _dbContext.FixedCosts
-                .Where(fc => fc.UserId == user.Id)
-                .ToListAsync();
-
-            // --- 2. Call Plaid API ---
-            var request = new TransactionsSyncRequest
+        public async Task<TransactionsSyncResponse> SyncAndProcessTransactions(string itemId)
+        {
+            try
             {
-                AccessToken = plaidItem.AccessToken,
-                Cursor = plaidItem.Cursor,
-                Count = 100
-            };
+                // 1. Find Plaid item + user
+                var plaidItem = await _dbContext.PlaidItems
+                    .FirstOrDefaultAsync(p => p.ItemId == itemId);
 
-            var response = await _plaidClient.TransactionsSyncAsync(request);
+                if (plaidItem == null)
+                    throw new InvalidOperationException($"Plaid Item {itemId} not found.");
 
-            decimal variableSpendDelta = 0m;
-            var notificationCandidates = new List<Transaction>();
+                var user = await _dbContext.Users
+                    .FirstOrDefaultAsync(u => u.Id == plaidItem.UserId);
 
-            // --- 3. Process "Added" Transactions ---
-            foreach (var t in response.Added)
-            {
-                var exists = await _dbContext.Transactions
-                    .AnyAsync(x => x.PlaidTransactionId == t.TransactionId);
-                if (exists) continue;
+                if (user == null)
+                    throw new UnauthorizedAccessException("User linked to this Item not found.");
 
-                DateTime txDate = t.Date.GetValueOrDefault(DateOnly.FromDateTime(DateTime.UtcNow))
-                    .ToDateTime(TimeOnly.MinValue);
-                DateTime txDateUtc = DateTime.SpecifyKind(txDate, DateTimeKind.Utc);
-                string merchantName = t.MerchantName ?? t.Name;
+                var fixedCosts = await _dbContext.FixedCosts
+                    .Where(fc => fc.UserId == user.Id)
+                    .ToListAsync();
 
-                var rawAmount = t.Amount ?? 0m;
-                bool isCredit = rawAmount < 0m;  // Plaid: negative = inflow
-                decimal absAmount = Math.Abs(rawAmount);
-
-                var newTx = new Transaction
+                // 2. Call Plaid
+                var request = new TransactionsSyncRequest
                 {
-                    UserId = user.Id,
-                    PlaidTransactionId = t.TransactionId,
-                    AccountId = t.AccountId,
-                    Amount = absAmount,
-                    Date = txDateUtc,
-                    Name = t.Name,
-                    MerchantName = t.MerchantName,
-                    Pending = t.Pending ?? false,
-                    CreatedAt = DateTime.UtcNow,
-                    UpdatedAt = DateTime.UtcNow,
-                    IsLargeExpenseCandidate = false,
-                    LargeExpenseHandled = false,
-                    SuggestedKind = TransactionSuggestedKind.Unknown,
-                    UserDecision = TransactionUserDecision.Undecided
+                    AccessToken = plaidItem.AccessToken,
+                    Cursor = plaidItem.Cursor,
+                    Count = 100
                 };
 
-                if (isCredit)
+                var response = await _plaidClient.TransactionsSyncAsync(request);
+
+                decimal variableSpend = 0m;
+
+                // We’ll notify AFTER SaveChanges
+                var newPostedTransactions = new List<Transaction>();
+
+                // 3. Process "Added" transactions
+                foreach (var t in response.Added)
                 {
-                    // Deposit: classify, but DO NOT change balance yet
-                    var ctx = new DepositContext
+                    var exists = await _dbContext.Transactions
+                        .AnyAsync(x => x.PlaidTransactionId == t.TransactionId);
+                    if (exists) continue;
+
+                    DateTime txDate = t.Date
+                        .GetValueOrDefault(DateOnly.FromDateTime(DateTime.UtcNow))
+                        .ToDateTime(TimeOnly.MinValue);
+
+                    DateTime txDateUtc = DateTime.SpecifyKind(txDate, DateTimeKind.Utc);
+                    string merchantName = t.MerchantName ?? t.Name;
+
+                    var rawAmount = t.Amount ?? 0m;
+                    bool isCredit = rawAmount < 0m;  // Plaid: negative = inflow
+                    decimal absAmount = Math.Abs(rawAmount);
+
+                    var newTx = new Transaction
                     {
+                        UserId = user.Id,
+                        PlaidTransactionId = t.TransactionId,
+                        AccountId = t.AccountId,
                         Amount = absAmount,
                         Date = txDateUtc,
-                        MerchantName = merchantName,
-                        PayDay1 = user.PayDay1,
-                        PayDay2 = user.PayDay2,
-                        ExpectedPaycheckAmount = user.ExpectedPaycheckAmount
+#pragma warning disable CS0612
+                        Name = t.Name,
+#pragma warning restore CS0612
+                        MerchantName = t.MerchantName,
+                        Pending = t.Pending ?? false,
+                        CreatedAt = DateTime.UtcNow,
+                        UpdatedAt = DateTime.UtcNow,
+                        IsLargeExpenseCandidate = false,
+                        LargeExpenseHandled = false
                     };
 
-                    newTx.SuggestedKind = _budgetEngine.ClassifyDeposit(ctx);
-                }
-                else
-                {
-                    // Outflow: variable spend unless it matches a fixed cost merchant
-                    bool isFixed = fixedCosts.Any(fc =>
-                        !string.IsNullOrEmpty(fc.PlaidMerchantName) &&
-                        fc.PlaidMerchantName.Equals(merchantName, StringComparison.OrdinalIgnoreCase));
-
-                    if (!isFixed)
+                    if (isCredit)
                     {
-                        variableSpendDelta += absAmount;
-
-                        // Large expense detection (Feature 3)
-                        if (_budgetEngine.IsLargeExpense(absAmount, user.ExpectedPaycheckAmount))
+                        // Deposit: classify only
+                        var ctx = new DepositContext
                         {
-                            newTx.IsLargeExpenseCandidate = true;
-                            newTx.LargeExpenseHandled = false;
+                            Amount = absAmount,
+                            Date = txDateUtc,
+                            MerchantName = merchantName,
+                            PayDay1 = user.PayDay1,
+                            PayDay2 = user.PayDay2,
+                            ExpectedPaycheckAmount = user.ExpectedPaycheckAmount
+                        };
+
+                        newTx.SuggestedKind = _budgetEngine.ClassifyDeposit(ctx);
+                    }
+                    else
+                    {
+                        // Outflow – treat as variable spend unless it's a known fixed cost
+                        bool isFixed = fixedCosts.Any(fc =>
+                            !string.IsNullOrEmpty(fc.PlaidMerchantName) &&
+                            fc.PlaidMerchantName.Equals(
+                                merchantName,
+                                StringComparison.OrdinalIgnoreCase
+                            ));
+
+                        if (!isFixed)
+                        {
+                            variableSpend += absAmount;
+
+                            if (user.ExpectedPaycheckAmount > 0 &&
+                                _budgetEngine.IsLargeExpense(absAmount, user.ExpectedPaycheckAmount))
+                            {
+                                newTx.IsLargeExpenseCandidate = true;
+                                newTx.LargeExpenseHandled = false;
+                            }
                         }
+                    }
+
+                    await _dbContext.Transactions.AddAsync(newTx);
+
+                    // Only push for settled transactions
+                    if (!newTx.Pending)
+                    {
+                        newPostedTransactions.Add(newTx);
                     }
                 }
 
-                await _dbContext.Transactions.AddAsync(newTx);
-
-                // Decide whether this one should trigger a notification
-                bool shouldNotify =
-                    isCredit ||                             // deposits go through user decision flow
-                    newTx.IsLargeExpenseCandidate ||        // large expense flow
-                    (!isCredit && !string.IsNullOrEmpty(merchantName)); // generic spend / recurring prompt
-
-                if (shouldNotify)
-                {
-                    notificationCandidates.Add(newTx);
-                }
-            }
-
-            // --- 4. Update Balance ONLY with Variable Spend ---
-            Balance? balanceRecord = null;
-
-            if (variableSpendDelta > 0)
-            {
-                balanceRecord = await _dbContext.Balances
+                // 4. Update balance only with variable spend
+                var balanceRecord = await _dbContext.Balances
                     .FirstOrDefaultAsync(b => b.UserId == user.Id);
 
-                if (balanceRecord != null)
+                if (variableSpend > 0 && balanceRecord != null)
                 {
-                    balanceRecord.BalanceAmount -= variableSpendDelta;
+                    balanceRecord.BalanceAmount -= variableSpend;
                     balanceRecord.UpdatedAt = DateTime.UtcNow;
                 }
+
+                // 5. Update cursor + save
+                plaidItem.Cursor = response.NextCursor;
+                await _dbContext.SaveChangesAsync();
+
+                var currentDynamicBalance = balanceRecord?.BalanceAmount ?? 0m;
+
+                // 6. Fire notifications via ExpoNotificationService
+                foreach (var tx in newPostedTransactions)
+                {
+                    try
+                    {
+                        await _notificationService
+                            .SendNewTransactionNotification(tx, currentDynamicBalance);
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine(
+                            $"Failed to send notification for tx {tx.Id}: {ex.Message}"
+                        );
+                    }
+                }
+
+                return response;
             }
-            else
+            catch (Exception e)
             {
-                balanceRecord = await _dbContext.Balances
-                    .FirstOrDefaultAsync(b => b.UserId == user.Id);
+                throw new Exception("Error syncing and processing transactions.", e);
             }
-
-            // --- 5. Update Cursor and Save ---
-            plaidItem.Cursor = response.NextCursor;
-            await _dbContext.SaveChangesAsync();
-
-            var currentBalance = balanceRecord?.BalanceAmount ?? 0m;
-
-            // --- 6. Fire notifications (best effort) ---
-            foreach (var tx in notificationCandidates)
-            {
-                await _notificationService.SendNewTransactionNotification(tx, currentBalance);
-            }
-
-            return response;
-        }
-        catch (Exception e)
-        {
-            // Propagate the exception up to the public endpoint
-            throw new Exception("Error syncing and processing transactions.", e);
         }
     }
 }

@@ -2,7 +2,7 @@
 
 import React, { useState, useEffect } from 'react';
 import { View, ActivityIndicator, StyleSheet } from 'react-native';
-import { NavigationContainer } from '@react-navigation/native';
+import { createNavigationContainerRef, NavigationContainer } from '@react-navigation/native';
 import { createNativeStackNavigator } from '@react-navigation/native-stack';
 import { PaperProvider, DefaultTheme, Button } from 'react-native-paper';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
@@ -25,6 +25,8 @@ import OnboardingStack from './navigation/OnboardingStack';
 import DepositReviewScreen from './screens/DepositReviewScreen';
 import { createBottomTabNavigator } from '@react-navigation/bottom-tabs';
 import ReviewLargeExpensesScreen from './screens/ReviewLargeExpensesScreen';
+export const navigationRef = createNavigationContainerRef();
+
 
 
 // --- API Base URL ---
@@ -277,10 +279,58 @@ export default function App() {
   setupNotifications();
 }, [fbUser]);
 
+  useEffect(() => {
+    const sub = Notifications.addNotificationResponseReceivedListener(
+      async (response) => {
+        const data = response.notification.request.content.data || {};
+        const { type, transactionId, canMarkRecurring } = data;
+
+        if (!fbUser || !transactionId) return;
+
+        // For now, only handle the recurring question on "spend" notifications
+        if (type === 'spend' && canMarkRecurring) {
+          Alert.alert(
+            'Recurring charge?',
+            'Do you want to treat this as a recurring bill going forward?',
+            [
+              { text: 'No', style: 'cancel' },
+              {
+                text: 'Yes',
+                onPress: async () => {
+                  try {
+                    const idToken = await fbUser.getIdToken();
+                    await axios.post(
+                      `${API_BASE_URL}/api/transactions/${transactionId}/mark-recurring`,
+                      { firstDueDate: null }, // let backend guess for now
+                      { headers: { Authorization: `Bearer ${idToken}` } },
+                    );
+                    Alert.alert('Saved', 'This charge is now tracked as a recurring cost.');
+                  } catch (e) {
+                    console.error('Failed to mark recurring:', e);
+                    Alert.alert('Error', 'Could not save recurring cost.');
+                  }
+                },
+              },
+            ],
+          );
+        }
+
+        // In the future you can route:
+        // if (navigationRef.isReady()) {
+        //   navigationRef.navigate('Transactions');
+        // }
+      },
+    );
+
+    return () => {
+      sub.remove();
+    };
+  }, [fbUser]);
+
   return (
     <SafeAreaProvider>
       <PaperProvider theme={DefaultTheme}>
-        <NavigationContainer>
+        <NavigationContainer ref={navigationRef}>
           {isLoading ? (
             <LoadingScreen />
           ) : fbUser ? (

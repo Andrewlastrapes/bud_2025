@@ -38,6 +38,10 @@ public class User
     [Column("expected_paycheck_amount")]
     public decimal ExpectedPaycheckAmount { get; set; } = 0m;
 
+    [Column("debt_per_paycheck")]
+    public decimal? DebtPerPaycheck { get; set; }
+
+
 
     // ...
 
