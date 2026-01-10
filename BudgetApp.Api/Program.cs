@@ -2,6 +2,7 @@ using BudgetApp.Api.Data;
 using Going.Plaid;
 using Going.Plaid.Categories;
 using Going.Plaid.Entity;
+using Going.Plaid.Accounts;
 using Going.Plaid.Item;
 using Going.Plaid.Link;
 using Microsoft.EntityFrameworkCore;
@@ -10,6 +11,9 @@ using FirebaseAdmin;
 using Google.Apis.Auth.OAuth2;
 using BudgetApp.Api.Services;
 using System.Linq;
+using FirebaseAdmin.Auth;
+using System.Text;
+using System.Text.Json;
 
 // --- App Setup ---
 var builder = WebApplication.CreateBuilder(args);
@@ -39,8 +43,14 @@ builder.Services.AddDbContext<ApiDbContext>(options =>
 
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen();
+builder.Services.AddHttpClient();
+builder.Services.AddScoped<INotificationService, ExpoNotificationService>();
+
+
 
 builder.Services.AddScoped<ITransactionService, TransactionService>();
+builder.Services.AddSingleton<IDynamicBudgetEngine, DynamicBudgetEngine>();
+
 
 builder.Services.AddCors(options =>
 {
@@ -348,6 +358,8 @@ app.MapPost("/api/transactions/sync", async (ITransactionService transactionServ
 .WithName("SyncTransactions")
 .WithOpenApi();
 
+
+
 // GET: /api/transactions
 app.MapGet("/api/transactions", async (ApiDbContext dbContext, HttpContext httpContext) =>
 {
@@ -374,6 +386,9 @@ app.MapGet("/api/transactions", async (ApiDbContext dbContext, HttpContext httpC
 })
 .WithName("GetTransactions")
 .WithOpenApi();
+
+
+
 
 // GET: /api/fixed-costs
 app.MapGet("/api/fixed-costs", async (ApiDbContext dbContext, HttpContext httpContext) =>
@@ -620,7 +635,10 @@ app.MapPost("/api/budget/finalize", async (ApiDbContext dbContext, HttpContext h
             .ToListAsync();
 
         var totalRecurringCosts = fixedBillsThisPeriod.Sum(fc => fc.Amount)
-                             + savingsThisPeriod.Sum(fc => fc.Amount);
+                         + savingsThisPeriod.Sum(fc => fc.Amount);
+
+        decimal debtThisPeriod = request.DebtPerPaycheck ?? 0m;
+        totalRecurringCosts += debtThisPeriod;
 
         decimal effectivePaycheck = request.PaycheckAmount - totalRecurringCosts;
 
@@ -648,6 +666,9 @@ app.MapPost("/api/budget/finalize", async (ApiDbContext dbContext, HttpContext h
         user.OnboardingComplete = true;
         user.PayDay1 = request.PayDay1;
         user.PayDay2 = request.PayDay2;
+        user.ExpectedPaycheckAmount = request.PaycheckAmount;
+        user.DebtPerPaycheck = request.DebtPerPaycheck;
+
 
         await dbContext.SaveChangesAsync();
 
@@ -667,30 +688,667 @@ app.MapPost("/api/budget/finalize", async (ApiDbContext dbContext, HttpContext h
 .WithOpenApi();
 
 // POST: /api/plaid/webhook
-app.MapPost("/api/plaid/webhook", async (ITransactionService transactionService, PlaidWebhookRequest requestBody) =>
+// POST: /api/plaid/webhook
+app.MapPost("/api/plaid/webhook", async (
+    ITransactionService transactionService,
+    ApiDbContext dbContext,
+    IHttpClientFactory httpClientFactory,
+    PlaidWebhookRequest requestBody) =>
 {
-    if (requestBody.WebhookType == "TRANSACTIONS" &&
-        (requestBody.WebhookCode == "DEFAULT_UPDATE" ||
-         requestBody.WebhookCode == "TRANSACTIONS_REMOVED" ||
-         requestBody.WebhookCode == "INITIAL_UPDATE"))
+    // Only care about Transactions webhooks that indicate new/changed data
+    if (requestBody.WebhookType != "TRANSACTIONS" ||
+        (requestBody.WebhookCode != "DEFAULT_UPDATE" &&
+         requestBody.WebhookCode != "INITIAL_UPDATE" &&
+         requestBody.WebhookCode != "TRANSACTIONS_REMOVED"))
     {
-        try
-        {
-            var response = await transactionService.SyncAndProcessTransactions(requestBody.ItemId);
-
-            return Results.Ok(new { message = "Webhook processed and sync initiated.", added = response.Added.Count });
-        }
-        catch (Exception e)
-        {
-            Console.WriteLine($"WEBHOOK FAILED PROCESSING for Item {requestBody.ItemId}: {e.Message}");
-            return Results.Ok(new { message = "Processing failed internally, but response sent." });
-        }
+        Console.WriteLine($"Ignoring webhook: type={requestBody.WebhookType}, code={requestBody.WebhookCode}");
+        return Results.Ok(new { message = "Webhook received, no action needed for this type." });
     }
 
-    return Results.Ok(new { message = "Webhook received, action not required for this type." });
+    try
+    {
+        // 1) Sync & classify transactions (this updates dynamic balance + large expense flags)
+        var syncResponse = await transactionService.SyncAndProcessTransactions(requestBody.ItemId);
+
+        // 2) Find the Plaid item and user
+        var item = await dbContext.PlaidItems.FirstOrDefaultAsync(p => p.ItemId == requestBody.ItemId);
+        if (item == null)
+        {
+            Console.WriteLine($"Webhook: PlaidItem not found for itemId={requestBody.ItemId}");
+            return Results.Ok(new { message = "Item not found after sync." });
+        }
+
+        var user = await dbContext.Users.FirstOrDefaultAsync(u => u.Id == item.UserId);
+        if (user == null)
+        {
+            Console.WriteLine($"Webhook: user not found for itemId={requestBody.ItemId}, userId={item.UserId}");
+            return Results.Ok(new { message = "User not found; no notification sent." });
+        }
+
+        var balance = await dbContext.Balances.FirstOrDefaultAsync(b => b.UserId == user.Id);
+        var remaining = balance?.BalanceAmount ?? 0m;
+
+        // 3) Get all active devices for this user
+        var deviceTokens = await dbContext.UserDevices
+            .Where(d => d.UserId == user.Id && d.IsActive && d.ExpoPushToken != null)
+            .Select(d => d.ExpoPushToken!)
+            .ToListAsync();
+
+        if (deviceTokens.Any())
+        {
+            var client = httpClientFactory.CreateClient();
+
+            var messageBody =
+                $"Your period spend limit has been updated. Current remaining: {remaining:0.00}";
+
+            var payloads = deviceTokens.Select(token => new
+            {
+                to = token,
+                title = "Dynamic budget updated",
+                body = messageBody,
+                data = new
+                {
+                    type = "transactions_sync",
+                    hasNewTransactions = syncResponse.Added.Count > 0,
+                    dynamicBalance = remaining
+                }
+            }).ToArray();
+
+            var json = JsonSerializer.Serialize(payloads);
+            var request = new HttpRequestMessage(
+                HttpMethod.Post,
+                "https://exp.host/--/api/v2/push/send"
+            )
+            {
+                Content = new StringContent(json, Encoding.UTF8, "application/json")
+            };
+
+            var expoResponse = await client.SendAsync(request);
+            Console.WriteLine($"Expo push response: {expoResponse.StatusCode}");
+        }
+        else
+        {
+            Console.WriteLine($"Webhook: no active devices for userId={user.Id}, skipping push.");
+        }
+
+        return Results.Ok(new
+        {
+            message = "Webhook processed, sync done.",
+            added = syncResponse.Added.Count
+        });
+    }
+    catch (Exception e)
+    {
+        Console.WriteLine($"WEBHOOK FAILED PROCESSING for Item {requestBody.ItemId}: {e.Message}");
+        return Results.Ok(new { message = "Processing failed internally, but response sent." });
+    }
 })
 .WithName("PlaidWebhookReceiver")
 .WithOpenApi();
+
+
+// Used to update how a transaction (typically a deposit) affects the dynamic balance
+
+// GET: /api/transactions/deposits/pending
+app.MapGet("/api/transactions/deposits/pending", async (ApiDbContext dbContext, HttpContext httpContext) =>
+{
+    try
+    {
+        string? idToken = httpContext.Request.Headers["Authorization"].FirstOrDefault()?.Split(" ").Last();
+        if (string.IsNullOrEmpty(idToken)) return Results.Unauthorized();
+
+        var decodedToken = await FirebaseAdmin.Auth.FirebaseAuth.DefaultInstance.VerifyIdTokenAsync(idToken);
+        var user = await dbContext.Users.FirstOrDefaultAsync(u => u.FirebaseUuid == decodedToken.Uid);
+        if (user == null) return Results.NotFound("User not found.");
+
+        // "Deposit" = transaction where we set SuggestedKind (credits only),
+        // and where the user has not made a decision yet.
+        var pendingDeposits = await dbContext.Transactions
+            .Where(t => t.UserId == user.Id
+            && t.SuggestedKind != TransactionSuggestedKind.Unknown
+            && t.UserDecision == TransactionUserDecision.Undecided)
+            .OrderByDescending(t => t.Date)
+            .ToListAsync();
+
+        return Results.Ok(pendingDeposits);
+    }
+    catch (Exception e)
+    {
+        return Results.Problem(e.Message);
+    }
+})
+.WithName("GetPendingDeposits")
+.WithOpenApi();
+
+
+
+// Used to update how a transaction (deposit or large expense) affects the dynamic balance
+app.MapPost("/api/transactions/{id}/decision", async (int id, UpdateTransactionDecisionRequest body, ApiDbContext dbContext, HttpContext httpContext) =>
+{
+    try
+    {
+        // --- Auth ---
+        string? idToken = httpContext.Request.Headers["Authorization"].FirstOrDefault()?.Split(" ").Last();
+        if (string.IsNullOrEmpty(idToken)) return Results.Unauthorized();
+
+        var decodedToken = await FirebaseAdmin.Auth.FirebaseAuth.DefaultInstance.VerifyIdTokenAsync(idToken);
+        var user = await dbContext.Users.FirstOrDefaultAsync(u => u.FirebaseUuid == decodedToken.Uid);
+        if (user == null) return Results.NotFound("User not found.");
+
+        // --- Look up transaction for this user ---
+        var tx = await dbContext.Transactions.FirstOrDefaultAsync(t => t.Id == id && t.UserId == user.Id);
+        if (tx == null) return Results.NotFound("Transaction not found.");
+
+        var decision = body.Decision;
+        if (!Enum.IsDefined(typeof(TransactionUserDecision), decision))
+        {
+            return Results.BadRequest("Invalid decision.");
+        }
+
+        // Single balance row per user
+        var balance = await dbContext.Balances.FirstOrDefaultAsync(b => b.UserId == user.Id);
+
+        // Helper: is this a deposit? (We only set SuggestedKind on credits when syncing)
+        bool isDeposit =
+            tx.SuggestedKind == TransactionSuggestedKind.Paycheck ||
+            tx.SuggestedKind == TransactionSuggestedKind.Windfall ||
+            tx.SuggestedKind == TransactionSuggestedKind.InternalTransfer ||
+            tx.SuggestedKind == TransactionSuggestedKind.Refund;
+
+        // =========================
+        // 1) DEPOSIT DECISIONS
+        // =========================
+        if (isDeposit)
+        {
+            switch (decision)
+            {
+                case TransactionUserDecision.TreatAsIncome:
+                    // Only count once
+                    if (!tx.CountedAsIncome && balance != null)
+                    {
+                        balance.BalanceAmount += tx.Amount;
+                        balance.UpdatedAt = DateTime.UtcNow;
+                        tx.CountedAsIncome = true;
+                    }
+                    break;
+
+                case TransactionUserDecision.IgnoreForDynamic:
+                case TransactionUserDecision.DebtPayment:
+                case TransactionUserDecision.SavingsFunded:
+                    // If we had previously counted it as income and user changes their mind,
+                    // remove it from the dynamic balance.
+                    if (tx.CountedAsIncome && balance != null)
+                    {
+                        balance.BalanceAmount -= tx.Amount;
+                        balance.UpdatedAt = DateTime.UtcNow;
+                        tx.CountedAsIncome = false;
+                    }
+                    break;
+
+                // Large-expense decisions don't make sense on deposits; treat as no-op for now.
+                case TransactionUserDecision.TreatAsVariableSpend:
+                case TransactionUserDecision.LargeExpenseFromSavings:
+                case TransactionUserDecision.LargeExpenseToFixedCost:
+                    break;
+            }
+        }
+        // =========================
+        // 2) LARGE EXPENSE DECISIONS (BIG DEBITS)
+        // =========================
+        else if (tx.IsLargeExpenseCandidate)
+        {
+            switch (decision)
+            {
+                case TransactionUserDecision.TreatAsVariableSpend:
+                    // Do nothing to balance; the hit already happened when we synced.
+                    tx.IsLargeExpenseCandidate = false;
+                    tx.LargeExpenseHandled = true;
+                    break;
+
+                case TransactionUserDecision.LargeExpenseFromSavings:
+                    // Refund this period’s dynamic balance, but only once.
+                    if (!tx.LargeExpenseHandled && balance != null)
+                    {
+                        balance.BalanceAmount += tx.Amount;
+                        balance.UpdatedAt = DateTime.UtcNow;
+                    }
+
+                    tx.IsLargeExpenseCandidate = false;
+                    tx.LargeExpenseHandled = true;
+                    break;
+
+                case TransactionUserDecision.LargeExpenseToFixedCost:
+                    // 1) Refund this period
+                    if (!tx.LargeExpenseHandled && balance != null)
+                    {
+                        balance.BalanceAmount += tx.Amount;
+                        balance.UpdatedAt = DateTime.UtcNow;
+                    }
+
+                    // 2) Create a FixedCost for future periods
+                    //    If the client passed a specific installment amount, use it.
+                    //    Otherwise, fall back to a simple 4-period split.
+                    decimal installmentAmount;
+
+                    if (body.FixedCostAmount.HasValue && body.FixedCostAmount.Value > 0)
+                    {
+                        installmentAmount = body.FixedCostAmount.Value;
+                    }
+                    else
+                    {
+                        installmentAmount = Math.Round(tx.Amount / 4m, 2);
+                    }
+
+                    var fixedCostName = !string.IsNullOrWhiteSpace(body.FixedCostName)
+                        ? body.FixedCostName
+                        : $"Installment: {tx.MerchantName ?? tx.Name ?? "Large Purchase"}";
+
+                    var firstDueDate = (body.FirstDueDate ?? DateTime.UtcNow).Date;
+
+                    var newFixedCost = new FixedCost
+                    {
+                        UserId = user.Id,
+                        Name = fixedCostName,
+                        Amount = installmentAmount,
+                        Category = "Installment",
+                        Type = "large_expense",
+                        PlaidMerchantName = tx.MerchantName,
+                        PlaidAccountId = tx.AccountId,
+                        UserHasApproved = true,
+                        CreatedAt = DateTime.UtcNow,
+                        UpdatedAt = DateTime.UtcNow,
+                        NextDueDate = firstDueDate,
+                    };
+
+                    await dbContext.FixedCosts.AddAsync(newFixedCost);
+
+                    tx.IsLargeExpenseCandidate = false;
+                    tx.LargeExpenseHandled = true;
+                    break;
+
+                // Deposit-only decisions on a debit = no-op, just store the choice.
+                case TransactionUserDecision.TreatAsIncome:
+                case TransactionUserDecision.IgnoreForDynamic:
+                case TransactionUserDecision.DebtPayment:
+                case TransactionUserDecision.SavingsFunded:
+                    // no balance change
+                    break;
+            }
+        }
+        // Non-deposit, non-large-expense: we just record whatever they chose.
+        // (This should be rare, mostly defensive.)
+        else
+        {
+            // For now, we don't change the balance at all in this branch.
+        }
+
+        // Persist the choice
+        tx.UserDecision = decision;
+        tx.UpdatedAt = DateTime.UtcNow;
+
+        await dbContext.SaveChangesAsync();
+
+        return Results.Ok(new
+        {
+            message = "Decision saved.",
+            decision = tx.UserDecision.ToString(),
+            countedAsIncome = tx.CountedAsIncome,
+            balance = balance?.BalanceAmount,
+            transactionId = tx.Id
+        });
+    }
+    catch (Exception e)
+    {
+        return Results.Problem(e.Message);
+    }
+})
+.WithName("DecideOnTransaction")
+.WithOpenApi();
+
+
+
+// GET: /api/transactions/large-expenses
+app.MapGet("/api/transactions/large-expenses/pending", async (ApiDbContext dbContext, HttpContext httpContext) =>
+{
+    try
+    {
+        string? idToken = httpContext.Request.Headers["Authorization"].FirstOrDefault()?.Split(" ").Last();
+        if (string.IsNullOrEmpty(idToken)) return Results.Unauthorized();
+
+        var decodedToken = await FirebaseAdmin.Auth.FirebaseAuth.DefaultInstance.VerifyIdTokenAsync(idToken);
+        var user = await dbContext.Users.FirstOrDefaultAsync(u => u.FirebaseUuid == decodedToken.Uid);
+        if (user == null) return Results.NotFound("User not found.");
+
+        var txs = await dbContext.Transactions
+            .Where(t => t.UserId == user.Id && t.IsLargeExpenseCandidate && !t.LargeExpenseHandled)
+            .OrderByDescending(t => t.Date)
+            .ToListAsync();
+
+        return Results.Ok(txs);
+    }
+    catch (Exception e)
+    {
+        return Results.Problem(e.Message);
+    }
+})
+.WithName("GetLargeExpenses")
+.WithOpenApi();
+
+// POST: /api/transactions/{id}/large-expense-decision
+app.MapPost("/api/transactions/{id}/large-expense-decision",
+    async (int id, LargeExpenseDecisionRequest body, ApiDbContext dbContext, HttpContext httpContext) =>
+{
+    try
+    {
+        // Auth
+        string? idToken = httpContext.Request.Headers["Authorization"].FirstOrDefault()?.Split(" ").Last();
+        if (string.IsNullOrEmpty(idToken)) return Results.Unauthorized();
+
+        var decodedToken = await FirebaseAdmin.Auth.FirebaseAuth.DefaultInstance.VerifyIdTokenAsync(idToken);
+        var user = await dbContext.Users.FirstOrDefaultAsync(u => u.FirebaseUuid == decodedToken.Uid);
+        if (user == null) return Results.NotFound("User not found.");
+
+        var tx = await dbContext.Transactions.FirstOrDefaultAsync(t => t.Id == id && t.UserId == user.Id);
+        if (tx == null) return Results.NotFound("Transaction not found.");
+
+        if (tx.Amount <= 0)
+        {
+            return Results.BadRequest("Large-expense decisions only apply to outflow transactions.");
+        }
+
+        var balance = await dbContext.Balances.FirstOrDefaultAsync(b => b.UserId == user.Id);
+
+        switch (body.Option)
+        {
+            case LargeExpenseDecisionOption.TreatAsNormal:
+                tx.UserDecision = TransactionUserDecision.TreatAsVariableSpend;
+                break;
+
+            case LargeExpenseDecisionOption.FromSavings:
+                tx.UserDecision = TransactionUserDecision.LargeExpenseFromSavings;
+                if (balance != null)
+                {
+                    // Refund this amount to the current period spend limit
+                    balance.BalanceAmount += tx.Amount;
+                    balance.UpdatedAt = DateTime.UtcNow;
+                }
+                break;
+
+            case LargeExpenseDecisionOption.ConvertToFixedCost:
+                if (body.SplitOverPeriods is null or <= 0)
+                {
+                    return Results.BadRequest("SplitOverPeriods must be at least 1 for ConvertToFixedCost.");
+                }
+
+                tx.UserDecision = TransactionUserDecision.LargeExpenseToFixedCost;
+
+                if (balance != null)
+                {
+                    // We no longer want this full amount counted as current-period spend
+                    balance.BalanceAmount += tx.Amount;
+                    balance.UpdatedAt = DateTime.UtcNow;
+                }
+
+                int periods = body.SplitOverPeriods.Value;
+                decimal perPeriodAmount = Math.Round(tx.Amount / periods, 2);
+
+                // Very simple bi-weekly approximation for due dates.
+                var baseDate = tx.Date.Date;
+
+                for (int i = 1; i <= periods; i++)
+                {
+                    var dueDate = baseDate.AddDays(14 * i);
+
+                    var fixedCost = new FixedCost
+                    {
+                        UserId = user.Id,
+                        Name = $"Installment: {tx.MerchantName ?? tx.Name ?? "Large purchase"}",
+                        Amount = perPeriodAmount,
+                        Category = "Installment",
+                        Type = "large_expense_plan",
+                        PlaidMerchantName = tx.MerchantName,
+                        PlaidAccountId = tx.AccountId,
+                        UserHasApproved = true,
+                        CreatedAt = DateTime.UtcNow,
+                        UpdatedAt = DateTime.UtcNow,
+                        NextDueDate = dueDate
+                    };
+
+                    await dbContext.FixedCosts.AddAsync(fixedCost);
+                }
+                break;
+
+            default:
+                return Results.BadRequest("Unknown option.");
+        }
+
+        tx.IsLargeExpenseCandidate = false;
+        tx.LargeExpenseHandled = true;
+        tx.UpdatedAt = DateTime.UtcNow;
+
+        await dbContext.SaveChangesAsync();
+
+        return Results.Ok(new
+        {
+            message = "Large expense decision saved.",
+            option = body.Option.ToString(),
+            newBalance = balance?.BalanceAmount
+        });
+    }
+    catch (Exception e)
+    {
+        return Results.Problem(e.Message);
+    }
+})
+.WithName("DecideOnLargeExpense")
+.WithOpenApi();
+
+app.MapPost("/api/notifications/register-device",
+    async (ApiDbContext dbContext, HttpContext httpContext, RegisterDeviceRequest request) =>
+    {
+        try
+        {
+            string? idToken = httpContext.Request.Headers["Authorization"]
+                .FirstOrDefault()
+                ?.Split(" ")
+                .Last();
+
+            if (string.IsNullOrEmpty(idToken)) return Results.Unauthorized();
+
+            var decodedToken = await FirebaseAuth.DefaultInstance.VerifyIdTokenAsync(idToken);
+            var user = await dbContext.Users.FirstOrDefaultAsync(u => u.FirebaseUuid == decodedToken.Uid);
+            if (user == null) return Results.NotFound("User not found.");
+
+            var existing = await dbContext.UserDevices
+                .FirstOrDefaultAsync(d =>
+                    d.UserId == user.Id &&
+                    d.ExpoPushToken == request.ExpoPushToken);
+
+            if (existing == null)
+            {
+                var device = new UserDevice
+                {
+                    UserId = user.Id,
+                    ExpoPushToken = request.ExpoPushToken,
+                    Platform = request.Platform,
+                    IsActive = true,
+                    CreatedAt = DateTime.UtcNow,
+                    UpdatedAt = DateTime.UtcNow
+                };
+                await dbContext.UserDevices.AddAsync(device);
+            }
+            else
+            {
+                existing.IsActive = true;
+                existing.Platform = request.Platform;
+                existing.UpdatedAt = DateTime.UtcNow;
+            }
+
+            await dbContext.SaveChangesAsync();
+
+            return Results.Ok(new { message = "Device registered for notifications." });
+        }
+        catch (Exception e)
+        {
+            return Results.Problem(e.Message);
+        }
+    })
+    .WithName("RegisterDeviceForNotifications")
+    .WithOpenApi();
+
+
+// POST: /api/transactions/{id}/mark-recurring
+app.MapPost("/api/transactions/{id}/mark-recurring",
+    async (int id,
+           MarkRecurringFromTransactionRequest request,
+           ApiDbContext dbContext,
+           HttpContext httpContext) =>
+{
+    try
+    {
+        // --- Auth ---
+        string? idToken = httpContext.Request.Headers["Authorization"]
+            .FirstOrDefault()
+            ?.Split(" ")
+            .Last();
+
+        if (string.IsNullOrEmpty(idToken)) return Results.Unauthorized();
+
+        var decodedToken = await FirebaseAuth.DefaultInstance.VerifyIdTokenAsync(idToken);
+        var user = await dbContext.Users
+            .FirstOrDefaultAsync(u => u.FirebaseUuid == decodedToken.Uid);
+        if (user == null) return Results.NotFound("User not found.");
+
+        // --- Transaction lookup ---
+        var tx = await dbContext.Transactions
+            .FirstOrDefaultAsync(t => t.Id == id && t.UserId == user.Id);
+
+        if (tx == null) return Results.NotFound("Transaction not found.");
+
+        // We only support marking outflows as recurring
+        if (tx.Amount <= 0m)
+        {
+            return Results.BadRequest("Only outflow transactions can be marked as recurring.");
+        }
+
+        // --- Build FixedCost from this transaction ---
+        var fixedCostName = tx.MerchantName ?? tx.Name ?? "Recurring charge";
+
+        // Naive guess: next due date = one month after transaction date,
+        // unless the client passed something explicit.
+        var firstDue = (request.FirstDueDate ?? tx.Date).Date.AddMonths(1);
+
+        var fixedCost = new FixedCost
+        {
+            UserId = user.Id,
+            Name = fixedCostName,
+            Amount = tx.Amount,
+            Category = "Recurring",          // you can tweak categories later
+            Type = "from_transaction",      // so we know where it came from
+            PlaidMerchantName = tx.MerchantName,
+            PlaidAccountId = tx.AccountId,
+            UserHasApproved = true,
+            CreatedAt = DateTime.UtcNow,
+            UpdatedAt = DateTime.UtcNow,
+            NextDueDate = firstDue
+        };
+
+        await dbContext.FixedCosts.AddAsync(fixedCost);
+        await dbContext.SaveChangesAsync();
+
+        return Results.Ok(new
+        {
+            message = "Transaction marked as recurring.",
+            fixedCostId = fixedCost.Id,
+            fixedCost.Name,
+            fixedCost.Amount,
+            fixedCost.NextDueDate
+        });
+    }
+    catch (Exception e)
+    {
+        return Results.Problem(e.Message);
+    }
+})
+.WithName("MarkTransactionAsRecurring")
+.WithOpenApi();
+
+// GET: /api/debt/snapshot
+app.MapGet("/api/debt/snapshot", async (ApiDbContext dbContext, PlaidClient plaidClient, HttpContext httpContext) =>
+{
+    try
+    {
+        string? idToken = httpContext.Request.Headers["Authorization"]
+            .FirstOrDefault()
+            ?.Split(" ")
+            .Last();
+        if (string.IsNullOrEmpty(idToken)) return Results.Unauthorized();
+
+        var decoded = await FirebaseAdmin.Auth.FirebaseAuth
+            .DefaultInstance
+            .VerifyIdTokenAsync(idToken);
+
+        var user = await dbContext.Users
+            .FirstOrDefaultAsync(u => u.FirebaseUuid == decoded.Uid);
+
+        if (user == null) return Results.NotFound("User not found.");
+
+        var items = await dbContext.PlaidItems
+            .Where(p => p.UserId == user.Id)
+            .ToListAsync();
+
+        var accounts = new List<DebtSnapshotAccountDto>();
+        decimal totalDebt = 0m;
+
+        foreach (var item in items)
+        {
+            var req = new AccountsGetRequest
+            {
+                AccessToken = item.AccessToken
+            };
+
+            var resp = await plaidClient.AccountsGetAsync(req);
+
+            foreach (var acct in resp.Accounts)
+            {
+                // Only care about credit accounts for “debt”
+                if (acct.Type != AccountType.Credit) continue;
+
+                var bal = acct.Balances.Current ?? 0m;
+                if (bal <= 0) continue; // no debt on this card
+
+                accounts.Add(new DebtSnapshotAccountDto
+                {
+                    InstitutionName = item.InstitutionName ?? "Unknown institution",
+                    AccountName = acct.Name ?? acct.OfficialName ?? "Credit account",
+                    Mask = acct.Mask,
+                    CurrentBalance = bal
+                });
+
+                totalDebt += bal;
+            }
+        }
+
+        var result = new DebtSnapshotResponse
+        {
+            TotalDebt = totalDebt,
+            Accounts = accounts
+        };
+
+        return Results.Ok(result);
+    }
+    catch (Exception e)
+    {
+        return Results.Problem(e.Message);
+    }
+})
+.WithName("GetDebtSnapshot")
+.WithOpenApi();
+
+
+
+
+
 
 // --- RUN THE APP ---
 app.Run();
@@ -698,10 +1356,12 @@ app.Run();
 // --- TYPE DECLARATIONS (if you still keep them here) ---
 
 // Used for POST /api/users/register
-public record UserRegistrationRequest(string Name, string Email, string FirebaseUuid);
 
-// Used for POST /api/plaid/create_link_token
-public record CreateLinkTokenRequest(string FirebaseUserId);
+public record MarkRecurringFromTransactionRequest(
+    DateTime? FirstDueDate  // optional override; can be null for now
+);
 
-// Used for POST /api/plaid/exchange_public_token
-public record ExchangeTokenRequest(string PublicToken, string FirebaseUuid);
+
+
+public record RegisterDeviceRequest(string ExpoPushToken, string? Platform);
+

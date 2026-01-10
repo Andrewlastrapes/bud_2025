@@ -2,13 +2,15 @@
 
 import React, { useState, useEffect } from 'react';
 import { View, ActivityIndicator, StyleSheet } from 'react-native';
-import { NavigationContainer } from '@react-navigation/native';
-import { createBottomTabNavigator } from '@react-navigation/bottom-tabs';
+import { createNavigationContainerRef, NavigationContainer } from '@react-navigation/native';
 import { createNativeStackNavigator } from '@react-navigation/native-stack';
 import { PaperProvider, DefaultTheme, Button } from 'react-native-paper';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
 import MaterialCommunityIcons from 'react-native-vector-icons/MaterialCommunityIcons';
 import axios from 'axios';
+import * as Notifications from 'expo-notifications';
+import * as Device from 'expo-device';
+import { Platform } from 'react-native';
 
 import { auth } from './firebaseConfig';
 import { onAuthStateChanged, signOut } from 'firebase/auth';
@@ -20,6 +22,12 @@ import SettingsScreen from './screens/SettingsScreen';
 import LoginScreen from './screens/LoginScreen';
 import FixedCostsScreen from './screens/FixedCostsScreen';
 import OnboardingStack from './navigation/OnboardingStack';
+import DepositReviewScreen from './screens/DepositReviewScreen';
+import { createBottomTabNavigator } from '@react-navigation/bottom-tabs';
+import ReviewLargeExpensesScreen from './screens/ReviewLargeExpensesScreen';
+export const navigationRef = createNavigationContainerRef();
+
+
 
 // --- API Base URL ---
 const API_BASE_URL = 'http://localhost:5150';
@@ -27,6 +35,37 @@ const API_BASE_URL = 'http://localhost:5150';
 // --- Navigators ---
 const Stack = createNativeStackNavigator();
 const Tab = createBottomTabNavigator();
+
+Notifications.setNotificationHandler({
+  handleNotification: async () => ({
+    shouldShowAlert: true,
+    shouldPlaySound: false,
+    shouldSetBadge: false,
+  }),
+});
+
+async function registerForPushNotificationsAsync() {
+  if (!Device.isDevice) {
+    console.log('Push notifications require a physical device/emulator.');
+    return null;
+  }
+
+  const { status: existingStatus } = await Notifications.getPermissionsAsync();
+  let finalStatus = existingStatus;
+  if (existingStatus !== 'granted') {
+    const { status } = await Notifications.requestPermissionsAsync();
+    finalStatus = status;
+  }
+  if (finalStatus !== 'granted') {
+    console.log('Notification permission not granted.');
+    return null;
+  }
+
+  const tokenData = await Notifications.getExpoPushTokenAsync();
+  return tokenData.data;
+}
+
+
 
 /**
  * Bottom tab navigator for the main app
@@ -172,6 +211,21 @@ function MainContentNavigator({ fbUser }) {
         }}
       />
 
+      <Stack.Screen
+        name="DepositReview"
+        component={DepositReviewScreen}
+        options={{
+          headerShown: true,
+          title: 'Review Deposits',
+        }}
+      />
+      <Stack.Screen
+        name="ReviewLargeExpenses"
+        component={ReviewLargeExpensesScreen}
+        options={{ title: 'Review Large Expenses' }}
+/>
+
+
       {/* Onboarding flow – only present while onboarding is incomplete */}
       {!dbUser?.onboardingComplete && (
         <Stack.Screen
@@ -200,10 +254,83 @@ export default function App() {
     return () => unsubscribe();
   }, []);
 
+  useEffect(() => {
+  const setupNotifications = async () => {
+    if (!fbUser) return;
+
+    try {
+      const expoPushToken = await registerForPushNotificationsAsync();
+      if (!expoPushToken) return;
+
+      const idToken = await fbUser.getIdToken();
+
+      await axios.post(
+        `${API_BASE_URL}/api/notifications/register-device`,
+        { expoPushToken, platform: Platform.OS },
+        { headers: { Authorization: `Bearer ${idToken}` } },
+      );
+
+      console.log('Push token registered:', expoPushToken);
+    } catch (e) {
+      console.error('Failed to register push notifications:', e);
+    }
+  };
+
+  setupNotifications();
+}, [fbUser]);
+
+  useEffect(() => {
+    const sub = Notifications.addNotificationResponseReceivedListener(
+      async (response) => {
+        const data = response.notification.request.content.data || {};
+        const { type, transactionId, canMarkRecurring } = data;
+
+        if (!fbUser || !transactionId) return;
+
+        // For now, only handle the recurring question on "spend" notifications
+        if (type === 'spend' && canMarkRecurring) {
+          Alert.alert(
+            'Recurring charge?',
+            'Do you want to treat this as a recurring bill going forward?',
+            [
+              { text: 'No', style: 'cancel' },
+              {
+                text: 'Yes',
+                onPress: async () => {
+                  try {
+                    const idToken = await fbUser.getIdToken();
+                    await axios.post(
+                      `${API_BASE_URL}/api/transactions/${transactionId}/mark-recurring`,
+                      { firstDueDate: null }, // let backend guess for now
+                      { headers: { Authorization: `Bearer ${idToken}` } },
+                    );
+                    Alert.alert('Saved', 'This charge is now tracked as a recurring cost.');
+                  } catch (e) {
+                    console.error('Failed to mark recurring:', e);
+                    Alert.alert('Error', 'Could not save recurring cost.');
+                  }
+                },
+              },
+            ],
+          );
+        }
+
+        // In the future you can route:
+        // if (navigationRef.isReady()) {
+        //   navigationRef.navigate('Transactions');
+        // }
+      },
+    );
+
+    return () => {
+      sub.remove();
+    };
+  }, [fbUser]);
+
   return (
     <SafeAreaProvider>
       <PaperProvider theme={DefaultTheme}>
-        <NavigationContainer>
+        <NavigationContainer ref={navigationRef}>
           {isLoading ? (
             <LoadingScreen />
           ) : fbUser ? (

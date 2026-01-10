@@ -9,6 +9,7 @@ import WelcomeScreen from '../screens/onboarding/WelcomeScreen';
 import PlaidConnectScreen from '../screens/onboarding/PlaidConnectScreen';
 import FixedCostsSetupScreen from '../screens/onboarding/FixedCostsSetupScreen';
 import PaycheckSavingsScreen from '../screens/onboarding/PaycheckSavingsScreen';
+import DebtOnboardingScreen from '../screens/onboarding/DebtOnboardingScreen';
 import DynamicAmountFinalScreen from '../screens/onboarding/DynamicAmountFinalScreen';
 
 const Stack = createNativeStackNavigator();
@@ -52,6 +53,11 @@ export default function OnboardingStack() {
                 name="FixedCostsSetup"
                 component={FixedCostsSetupScreen}
                 options={{ title: '2. Fixed Costs' }}
+            />
+            <Stack.Screen
+                name="DebtOnboarding"
+                component={DebtOnboardingScreen}
+                options={{ title: 'Credit card debt' }}
             />
             <Stack.Screen
                 name="PaycheckSavings"

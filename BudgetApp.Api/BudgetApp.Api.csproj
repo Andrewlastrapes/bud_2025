@@ -19,6 +19,13 @@
     <PackageReference Include="Npgsql.EntityFrameworkCore.PostgreSQL" Version="9.0.4" />
     <PackageReference Include="Refit" Version="8.0.0" />
     <PackageReference Include="Swashbuckle.AspNetCore" Version="6.4.0" />
+    <PackageReference Include="System.IdentityModel.Tokens.Jwt" Version="8.15.0" />
+  </ItemGroup>
+
+  <!-- EXCLUDE TEST SOURCES FROM THE MAIN API PROJECT -->
+  <ItemGroup>
+    <Compile Remove="BudgetApp.Api.Tests\**\*.cs" />
+    <Compile Remove="Tests\**\*.cs" />
   </ItemGroup>
 
 </Project>
