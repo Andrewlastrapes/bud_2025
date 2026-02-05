@@ -3,6 +3,7 @@
 # =========
 FROM mcr.microsoft.com/dotnet/aspnet:8.0 AS base
 WORKDIR /app
+
 # App Runner expects 8080 by default
 EXPOSE 8080
 ENV ASPNETCORE_URLS=http://0.0.0.0:8080
@@ -13,13 +14,16 @@ ENV ASPNETCORE_URLS=http://0.0.0.0:8080
 FROM mcr.microsoft.com/dotnet/sdk:8.0 AS build
 WORKDIR /src
 
-# Copy csproj first for better layer caching
+# 1) Copy the csproj for layer caching
 COPY BudgetApp.Api/BudgetApp.Api.csproj BudgetApp.Api/
+
+# 2) Restore dependencies
 RUN dotnet restore BudgetApp.Api/BudgetApp.Api.csproj
 
-# Copy the rest of the source
+# 3) Copy the rest of the source
 COPY . .
 
+# 4) Publish the app
 WORKDIR /src/BudgetApp.Api
 RUN dotnet publish "BudgetApp.Api.csproj" -c Release -o /app/publish /p:UseAppHost=false
 
@@ -29,9 +33,11 @@ RUN dotnet publish "BudgetApp.Api.csproj" -c Release -o /app/publish /p:UseAppHo
 FROM base AS final
 WORKDIR /app
 
-# If you keep firebase-service-account.json at repo root (gitignored),
-# copy it into the container. Adjust path if you keep it elsewhere.
+# 5) Copy the firebase service account JSON to where Program.cs expects it
+#    Program.cs uses: GoogleCredential.FromFile("firebase-service-account.json")
 COPY ./BudgetApp.Api/firebase-service-account.json ./firebase-service-account.json
 
+# 6) Copy the published app from the build stage
 COPY --from=build /app/publish .
+
 ENTRYPOINT ["dotnet", "BudgetApp.Api.dll"]

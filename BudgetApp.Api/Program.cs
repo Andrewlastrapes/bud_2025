@@ -18,10 +18,19 @@ using System.Text.Json;
 // --- App Setup ---
 var builder = WebApplication.CreateBuilder(args);
 
-FirebaseApp.Create(new AppOptions()
+var firebasePath = "firebase-service-account.json";
+if (File.Exists(firebasePath))
 {
-    Credential = GoogleCredential.FromFile("firebase-service-account.json")
-});
+    FirebaseApp.Create(new AppOptions
+    {
+        Credential = GoogleCredential.FromFile(firebasePath)
+    });
+}
+else
+{
+    Console.WriteLine($"Firebase service account file not found at: {Path.GetFullPath(firebasePath)}");
+}
+
 
 // --- SERVICE CONFIGURATION ---
 var plaidConfig = builder.Configuration.GetSection("Plaid");
@@ -65,6 +74,10 @@ builder.Services.AddCors(options =>
 
 // --- APP BUILD & MIDDLEWARE ---
 var app = builder.Build();
+
+
+app.MapGet("/health", () => Results.Ok("ok"));
+
 
 if (app.Environment.IsDevelopment())
 {
