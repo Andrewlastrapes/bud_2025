@@ -20,9 +20,10 @@ var builder = WebApplication.CreateBuilder(args);
 
 
 Console.WriteLine("BOOT: BudgetApp.Api process starting");
-Console.WriteLine($"BOOT: ASPNETCORE_ENVIRONMENT={Environment.GetEnvironmentVariable("ASPNETCORE_ENVIRONMENT")}");
-Console.WriteLine($"BOOT: ASPNETCORE_URLS={Environment.GetEnvironmentVariable("ASPNETCORE_URLS")}");
-Console.WriteLine($"BOOT: HTTP_PORTS={Environment.GetEnvironmentVariable("HTTP_PORTS")}");
+Console.WriteLine($"BOOT: ASPNETCORE_ENVIRONMENT={System.Environment.GetEnvironmentVariable("ASPNETCORE_ENVIRONMENT")}");
+Console.WriteLine($"BOOT: ASPNETCORE_URLS={System.Environment.GetEnvironmentVariable("ASPNETCORE_URLS")}");
+Console.WriteLine($"BOOT: HTTP_PORTS={System.Environment.GetEnvironmentVariable("HTTP_PORTS")}");
+
 
 Console.WriteLine($"BOOT: has DefaultConnection={(builder.Configuration.GetConnectionString("DefaultConnection") is not null)}");
 
