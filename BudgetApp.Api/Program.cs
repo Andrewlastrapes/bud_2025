@@ -18,17 +18,39 @@ using System.Text.Json;
 // --- App Setup ---
 var builder = WebApplication.CreateBuilder(args);
 
-var firebasePath = "firebase-service-account.json";
-if (File.Exists(firebasePath))
+
+Console.WriteLine("BOOT: BudgetApp.Api process starting");
+Console.WriteLine($"BOOT: ASPNETCORE_ENVIRONMENT={Environment.GetEnvironmentVariable("ASPNETCORE_ENVIRONMENT")}");
+Console.WriteLine($"BOOT: ASPNETCORE_URLS={Environment.GetEnvironmentVariable("ASPNETCORE_URLS")}");
+Console.WriteLine($"BOOT: HTTP_PORTS={Environment.GetEnvironmentVariable("HTTP_PORTS")}");
+
+Console.WriteLine($"BOOT: has DefaultConnection={(builder.Configuration.GetConnectionString("DefaultConnection") is not null)}");
+
+
+
+try
 {
-    FirebaseApp.Create(new AppOptions
+    var firebasePath = "firebase-service-account.json";
+    Console.WriteLine($"BOOT: firebasePath={Path.GetFullPath(firebasePath)} exists={File.Exists(firebasePath)}");
+
+    if (File.Exists(firebasePath))
     {
-        Credential = GoogleCredential.FromFile(firebasePath)
-    });
+        FirebaseApp.Create(new AppOptions
+        {
+            Credential = GoogleCredential.FromFile(firebasePath)
+        });
+        Console.WriteLine("BOOT: Firebase initialized");
+    }
+    else
+    {
+        Console.WriteLine("BOOT: Firebase skipped (missing file)");
+    }
 }
-else
+catch (Exception ex)
 {
-    Console.WriteLine($"Firebase service account file not found at: {Path.GetFullPath(firebasePath)}");
+    Console.WriteLine("BOOT: Firebase init FAILED:");
+    Console.WriteLine(ex.ToString());
+    // Do NOT crash the app — keep it running so health check can pass
 }
 
 
