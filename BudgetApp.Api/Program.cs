@@ -18,6 +18,20 @@ using System.Text.Json;
 // --- App Setup ---
 var builder = WebApplication.CreateBuilder(args);
 
+var port =
+    (System.Environment.GetEnvironmentVariable("PORT") ?? "")
+        .Split(',', StringSplitOptions.RemoveEmptyEntries)
+        .FirstOrDefault()
+    ?? (System.Environment.GetEnvironmentVariable("HTTP_PORTS") ?? "")
+        .Split(',', StringSplitOptions.RemoveEmptyEntries)
+        .FirstOrDefault()
+    ?? "8080";
+
+port = port.Trim();
+System.Environment.SetEnvironmentVariable("ASPNETCORE_URLS", $"http://0.0.0.0:{port}");
+
+
+
 
 Console.WriteLine("BOOT: BudgetApp.Api process starting");
 Console.WriteLine($"BOOT: ASPNETCORE_ENVIRONMENT={System.Environment.GetEnvironmentVariable("ASPNETCORE_ENVIRONMENT")}");
@@ -70,6 +84,15 @@ builder.Services.AddSingleton(new PlaidClient(
 ));
 
 var connectionString = builder.Configuration.GetConnectionString("DefaultConnection");
+
+
+if (string.IsNullOrWhiteSpace(connectionString))
+{
+    Console.WriteLine("BOOT: Missing ConnectionStrings:DefaultConnection");
+    throw new Exception("Missing ConnectionStrings:DefaultConnection");
+}
+
+
 builder.Services.AddDbContext<ApiDbContext>(options =>
     options.UseNpgsql(connectionString));
 
@@ -108,7 +131,10 @@ if (app.Environment.IsDevelopment())
     app.UseSwaggerUI();
 }
 
-app.UseHttpsRedirection();
+app.UseWhen(ctx => !ctx.Request.Path.StartsWithSegments("/health"), b =>
+{
+    b.UseHttpsRedirection();
+});
 app.UseCors(MyAllowSpecificOrigins);
 
 // --- API ENDPOINTS ---
