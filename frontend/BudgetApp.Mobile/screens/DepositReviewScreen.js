@@ -14,7 +14,8 @@ import axios from 'axios';
 import { auth } from '../firebaseConfig';
 import { useIsFocused } from '@react-navigation/native';
 
-const API_BASE_URL = 'http://localhost:5150';
+import { API_BASE_URL } from '@/config/api';
+;
 
 // These numeric values MUST match your C# enum TransactionUserDecision
 // public enum TransactionUserDecision { Unknown = 0, TreatAsIncome = 1, Ignore = 2, DebtPayment = 3, SavingsFunded = 4 }

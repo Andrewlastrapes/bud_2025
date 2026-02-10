@@ -5,7 +5,8 @@ import { Text, Card, ActivityIndicator, Button, TextInput } from 'react-native-p
 import axios from 'axios';
 import { auth } from '../../firebaseConfig';
 
-const API_BASE_URL = 'http://localhost:5150';
+import { API_BASE_URL } from '@/config/api';
+;
 
 export default function DebtOnboardingScreen({ navigation, route }) {
   const [snapshot, setSnapshot] = useState(null);

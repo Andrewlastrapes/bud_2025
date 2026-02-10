@@ -6,7 +6,8 @@ import axios from 'axios';
 import { auth } from '../firebaseConfig';
 import { useIsFocused } from '@react-navigation/native';
 
-const API_BASE_URL = 'http://localhost:5150';
+import { API_BASE_URL } from '@/config/api';
+;
 
 export default function TransactionsScreen() {
     const [transactions, setTransactions] = useState([]);

@@ -6,7 +6,8 @@ import axios from 'axios';
 import { usePlaidLink } from 'react-plaid-link';
 import { auth } from '../../firebaseConfig';
 
-const API_BASE_URL = 'http://localhost:5150';
+import { API_BASE_URL } from '@/config/api';
+;
 
 // --- Helper to get headers for API calls ---
 const getAuthHeader = async () => {

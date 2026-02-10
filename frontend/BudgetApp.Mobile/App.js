@@ -30,7 +30,8 @@ export const navigationRef = createNavigationContainerRef();
 
 
 // --- API Base URL ---
-const API_BASE_URL = 'http://localhost:5150';
+import { API_BASE_URL } from '@/config/api';
+;
 
 // --- Navigators ---
 const Stack = createNativeStackNavigator();
