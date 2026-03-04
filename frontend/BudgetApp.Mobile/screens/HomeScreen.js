@@ -6,7 +6,7 @@ import axios from 'axios';
 import { auth } from '../firebaseConfig';
 import { useIsFocused } from '@react-navigation/native';
 
-import { API_BASE_URL } from '@/config/api';
+import { API_BASE_URL } from '../config/api';
 ;
 
 export default function HomeScreen({ navigation }) {

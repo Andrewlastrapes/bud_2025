@@ -7,7 +7,7 @@ import { usePlaidLink } from 'react-plaid-link';
 import { auth } from '../firebaseConfig';
 import { useIsFocused } from '@react-navigation/native'; // Import this hook
 
-import { API_BASE_URL } from '@/config/api';
+import { API_BASE_URL } from '../config/api';
 ;
 
 export default function SettingsScreen() {

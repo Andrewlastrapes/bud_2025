@@ -5,7 +5,7 @@ import { SafeAreaView } from 'react-native-safe-area-context';
 import axios from 'axios';
 import { auth } from '../../firebaseConfig';
 
-import { API_BASE_URL } from '@/config/api';
+import { API_BASE_URL } from '../../config/api';
 ;
 
 export default function PaycheckSavingsScreen({ navigation }) {

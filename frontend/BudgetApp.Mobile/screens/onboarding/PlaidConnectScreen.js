@@ -6,7 +6,7 @@ import axios from 'axios';
 import { usePlaidLink } from 'react-plaid-link';
 import { auth } from '../../firebaseConfig';
 
-import { API_BASE_URL } from '@/config/api';
+import { API_BASE_URL } from '../../config/api';
 ;
 
 // --- Helper to get headers for API calls ---

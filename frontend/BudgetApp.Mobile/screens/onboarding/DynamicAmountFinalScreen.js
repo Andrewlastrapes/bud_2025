@@ -9,7 +9,7 @@ import { StackActions } from '@react-navigation/native';
 
 import { auth } from '../../firebaseConfig';
 
-import { API_BASE_URL } from '@/config/api';
+import { API_BASE_URL } from '../../config/api';
 ;
 
 export default function DynamicAmountFinalScreen({ navigation, route }) {
