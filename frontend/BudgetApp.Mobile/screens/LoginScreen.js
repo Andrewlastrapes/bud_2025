@@ -64,6 +64,11 @@ export default function LoginScreen() {
         <SafeAreaView style={styles.container}>
             <Text style={styles.title}>Welcome</Text>
 
+            <Text>Project: {auth.app.options.projectId}</Text>
+            <Text>App ID: {auth.app.options.appId}</Text>
+            <Text>API URL: {process.env.EXPO_PUBLIC_API_URL}</Text>
+            <Text selectable>{error}</Text>
+
             <TextInput
                 label="Email"
                 value={email}
