@@ -18,6 +18,13 @@ export const firebaseConfig = {
   appId: process.env.EXPO_PUBLIC_FIREBASE_APP_ID,
 };
 
+console.log('FIREBASE DEBUG config:', {
+  apiKey: firebaseConfig.apiKey?.slice(0, 8) + '...',
+  authDomain: firebaseConfig.authDomain,
+  projectId: firebaseConfig.projectId,
+  appId: firebaseConfig.appId,
+});
+
 const app = initializeApp(firebaseConfig);
 
 let auth;
@@ -29,5 +36,11 @@ if (Platform.OS === 'web') {
     persistence: getReactNativePersistence(AsyncStorage),
   });
 }
+
+console.log('FIREBASE DEBUG initialized app options:', {
+  projectId: app.options.projectId,
+  authDomain: app.options.authDomain,
+  appId: app.options.appId,
+});
 
 export { app, auth };
