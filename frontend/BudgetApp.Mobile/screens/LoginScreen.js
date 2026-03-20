@@ -34,8 +34,7 @@ export default function LoginScreen() {
             const firebaseUser = userCredential.user;
 
             // Register user in your database with the Firebase ID
-            const response = await fetch('http://localhost:5150/api/users/register', {
-                method: 'POST',
+            const response = await fetch(`${process.env.EXPO_PUBLIC_API_URL}/api/users/register`, {                method: 'POST',
                 headers: {
                     'Content-Type': 'application/json',
                 },
