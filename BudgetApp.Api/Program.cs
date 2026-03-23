@@ -20,13 +20,13 @@ using Npgsql;
 var builder = WebApplication.CreateBuilder(args);
 
 // Simplified port configuration for AWS App Runner
-var port = Environment.GetEnvironmentVariable("PORT") ?? "8080";
+var port = System.Environment.GetEnvironmentVariable("PORT") ?? "8080";
 Console.WriteLine($"BOOT: Using port {port}");
 
 // Only set ASPNETCORE_URLS if not already set (Dockerfile may have set it)
-if (string.IsNullOrEmpty(Environment.GetEnvironmentVariable("ASPNETCORE_URLS")))
+if (string.IsNullOrEmpty(System.Environment.GetEnvironmentVariable("ASPNETCORE_URLS")))
 {
-    Environment.SetEnvironmentVariable("ASPNETCORE_URLS", $"http://0.0.0.0:{port}");
+    System.Environment.SetEnvironmentVariable("ASPNETCORE_URLS", $"http://0.0.0.0:{port}");
 }
 
 
@@ -49,7 +49,7 @@ try
     else
     {
         // Try to initialize from environment variable (for production)
-        var serviceAccountJson = Environment.GetEnvironmentVariable("FIREBASE_SERVICE_ACCOUNT_JSON");
+        var serviceAccountJson = System.Environment.GetEnvironmentVariable("FIREBASE_SERVICE_ACCOUNT_JSON");
         if (!string.IsNullOrEmpty(serviceAccountJson))
         {
             FirebaseApp.Create(new AppOptions
