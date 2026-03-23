@@ -14,6 +14,7 @@ using System.Linq;
 using FirebaseAdmin.Auth;
 using System.Text;
 using System.Text.Json;
+using Npgsql;
 
 // --- App Setup ---
 var builder = WebApplication.CreateBuilder(args);
@@ -85,12 +86,18 @@ builder.Services.AddSingleton(new PlaidClient(
 
 var connectionString = builder.Configuration.GetConnectionString("DefaultConnection");
 
-
 if (string.IsNullOrWhiteSpace(connectionString))
 {
     Console.WriteLine("BOOT: Missing ConnectionStrings:DefaultConnection");
     throw new Exception("Missing ConnectionStrings:DefaultConnection");
 }
+
+var csb = new NpgsqlConnectionStringBuilder(connectionString);
+Console.WriteLine($"BOOT: DB Host={csb.Host}");
+Console.WriteLine($"BOOT: DB Port={csb.Port}");
+Console.WriteLine($"BOOT: DB Name={csb.Database}");
+Console.WriteLine($"BOOT: DB User={csb.Username}");
+
 
 
 builder.Services.AddDbContext<ApiDbContext>(options =>
