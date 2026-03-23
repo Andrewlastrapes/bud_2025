@@ -19,17 +19,15 @@ using Npgsql;
 // --- App Setup ---
 var builder = WebApplication.CreateBuilder(args);
 
-var port =
-    (System.Environment.GetEnvironmentVariable("PORT") ?? "")
-        .Split(',', StringSplitOptions.RemoveEmptyEntries)
-        .FirstOrDefault()
-    ?? (System.Environment.GetEnvironmentVariable("HTTP_PORTS") ?? "")
-        .Split(',', StringSplitOptions.RemoveEmptyEntries)
-        .FirstOrDefault()
-    ?? "8080";
+// Simplified port configuration for AWS App Runner
+var port = Environment.GetEnvironmentVariable("PORT") ?? "8080";
+Console.WriteLine($"BOOT: Using port {port}");
 
-port = port.Trim();
-System.Environment.SetEnvironmentVariable("ASPNETCORE_URLS", $"http://0.0.0.0:{port}");
+// Only set ASPNETCORE_URLS if not already set (Dockerfile may have set it)
+if (string.IsNullOrEmpty(Environment.GetEnvironmentVariable("ASPNETCORE_URLS")))
+{
+    Environment.SetEnvironmentVariable("ASPNETCORE_URLS", $"http://0.0.0.0:{port}");
+}
 
 
 
@@ -46,11 +44,25 @@ try
         {
             Credential = GoogleCredential.FromFile(firebasePath)
         });
-        Console.WriteLine("BOOT: Firebase initialized");
+        Console.WriteLine("BOOT: Firebase initialized from file");
     }
     else
     {
-        Console.WriteLine("BOOT: Firebase skipped (missing file)");
+        // Try to initialize from environment variable (for production)
+        var serviceAccountJson = Environment.GetEnvironmentVariable("FIREBASE_SERVICE_ACCOUNT_JSON");
+        if (!string.IsNullOrEmpty(serviceAccountJson))
+        {
+            FirebaseApp.Create(new AppOptions
+            {
+                Credential = GoogleCredential.FromJson(serviceAccountJson)
+            });
+            Console.WriteLine("BOOT: Firebase initialized from environment variable");
+        }
+        else
+        {
+            Console.WriteLine("BOOT: Firebase skipped (no file or environment variable found)");
+            Console.WriteLine("BOOT: WARNING - Firebase authentication will not work without proper configuration");
+        }
     }
 }
 catch (Exception ex)
@@ -58,6 +70,8 @@ catch (Exception ex)
     Console.WriteLine("BOOT: Firebase init FAILED:");
     Console.WriteLine(ex.ToString());
     // Do NOT crash the app — keep it running so health check can pass
+    // But log the error clearly for debugging
+    Console.WriteLine("BOOT: WARNING - Application will continue but Firebase features may not work");
 }
 
 
@@ -81,7 +95,11 @@ Console.WriteLine("BOOT: startup begin");
 var connectionString = builder.Configuration.GetConnectionString("DefaultConnection");
 Console.WriteLine($"BOOT: has DefaultConnection={!string.IsNullOrWhiteSpace(connectionString)}");
 
-
+if (string.IsNullOrWhiteSpace(connectionString))
+{
+    Console.WriteLine("BOOT: Missing ConnectionStrings:DefaultConnection - Application cannot start");
+    throw new InvalidOperationException("Database connection string 'DefaultConnection' is required but not found in configuration. Please ensure the connection string is properly configured in appsettings or environment variables.");
+}
 
 try
 {
@@ -94,20 +112,11 @@ try
 catch (Exception ex)
 {
     Console.WriteLine($"BOOT: connection string parse failed: {ex}");
+    throw new InvalidOperationException($"Invalid database connection string format: {ex.Message}");
 }
 
-
-
-
-if (string.IsNullOrWhiteSpace(connectionString))
-{
-    Console.WriteLine("BOOT: Missing ConnectionStrings:DefaultConnection");
-}
-else
-{
-    builder.Services.AddDbContext<ApiDbContext>(options =>
-        options.UseNpgsql(connectionString));
-}
+builder.Services.AddDbContext<ApiDbContext>(options =>
+    options.UseNpgsql(connectionString));
 
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen();
@@ -136,7 +145,20 @@ var app = builder.Build();
 
 
 
-app.MapGet("/health", () => Results.Ok("ok"));
+app.MapGet("/health", async (ApiDbContext dbContext) =>
+{
+    try
+    {
+        // Test database connectivity
+        await dbContext.Database.CanConnectAsync();
+        return Results.Ok(new { status = "healthy", timestamp = DateTime.UtcNow });
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"Health check failed: {ex.Message}");
+        return Results.Problem(detail: "Database connectivity failed", statusCode: 503);
+    }
+});
 
 
 if (app.Environment.IsDevelopment())
