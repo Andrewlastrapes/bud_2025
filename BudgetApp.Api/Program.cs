@@ -34,7 +34,6 @@ System.Environment.SetEnvironmentVariable("ASPNETCORE_URLS", $"http://0.0.0.0:{p
 
 
 
-Console.WriteLine($"BOOT: has DefaultConnection={(builder.Configuration.GetConnectionString("DefaultConnection") is not null)}");
 
 try
 {
