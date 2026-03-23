@@ -81,9 +81,11 @@ Console.WriteLine("BOOT: startup begin");
 var connectionString = builder.Configuration.GetConnectionString("DefaultConnection");
 Console.WriteLine($"BOOT: has DefaultConnection={!string.IsNullOrWhiteSpace(connectionString)}");
 
+
+
 try
 {
-    var csb = new Npgsql.NpgsqlConnectionStringBuilder(connectionString);
+    var csb = new NpgsqlConnectionStringBuilder(connectionString);
     Console.WriteLine($"BOOT: DB Host={csb.Host}");
     Console.WriteLine($"BOOT: DB Port={csb.Port}");
     Console.WriteLine($"BOOT: DB Name={csb.Database}");
@@ -95,8 +97,17 @@ catch (Exception ex)
 }
 
 
-builder.Services.AddDbContext<ApiDbContext>(options =>
-    options.UseNpgsql(connectionString));
+
+
+if (string.IsNullOrWhiteSpace(connectionString))
+{
+    Console.WriteLine("BOOT: Missing ConnectionStrings:DefaultConnection");
+}
+else
+{
+    builder.Services.AddDbContext<ApiDbContext>(options =>
+        options.UseNpgsql(connectionString));
+}
 
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen();
