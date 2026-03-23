@@ -123,20 +123,6 @@ builder.Services.AddCors(options =>
 // --- APP BUILD & MIDDLEWARE ---
 var app = builder.Build();
 
-try
-{
-    using var scope = app.Services.CreateScope();
-    var db = scope.ServiceProvider.GetRequiredService<ApiDbContext>();
-
-    Console.WriteLine($"BOOT: EF provider={db.Database.ProviderName}");
-
-    var canConnect = db.Database.CanConnect();
-    Console.WriteLine($"BOOT: DB CanConnect={canConnect}");
-}
-catch (Exception ex)
-{
-    Console.WriteLine($"BOOT: DB connectivity check failed: {ex}");
-}
 
 
 app.MapGet("/health", () => Results.Ok("ok"));
