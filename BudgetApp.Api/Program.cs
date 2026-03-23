@@ -84,13 +84,15 @@ builder.Services.AddSingleton(new PlaidClient(
     environment: plaidEnv
 ));
 
-var connectionString = builder.Configuration.GetConnectionString("DefaultConnection");
 
+Console.WriteLine("BOOT: startup begin");
+
+var connectionString = builder.Configuration.GetConnectionString("DefaultConnection");
 Console.WriteLine($"BOOT: has DefaultConnection={!string.IsNullOrWhiteSpace(connectionString)}");
 
 try
 {
-    var csb = new NpgsqlConnectionStringBuilder(connectionString);
+    var csb = new Npgsql.NpgsqlConnectionStringBuilder(connectionString);
     Console.WriteLine($"BOOT: DB Host={csb.Host}");
     Console.WriteLine($"BOOT: DB Port={csb.Port}");
     Console.WriteLine($"BOOT: DB Name={csb.Database}");
@@ -98,10 +100,8 @@ try
 }
 catch (Exception ex)
 {
-    Console.WriteLine($"BOOT: Failed to parse connection string with NpgsqlConnectionStringBuilder: {ex.Message}");
-    Console.WriteLine("BOOT: Connection string may be URL-style or otherwise non-key/value format.");
+    Console.WriteLine($"BOOT: connection string parse failed: {ex}");
 }
-
 
 
 builder.Services.AddDbContext<ApiDbContext>(options =>
@@ -131,6 +131,21 @@ builder.Services.AddCors(options =>
 
 // --- APP BUILD & MIDDLEWARE ---
 var app = builder.Build();
+
+try
+{
+    using var scope = app.Services.CreateScope();
+    var db = scope.ServiceProvider.GetRequiredService<ApiDbContext>();
+
+    Console.WriteLine($"BOOT: EF provider={db.Database.ProviderName}");
+
+    var canConnect = db.Database.CanConnect();
+    Console.WriteLine($"BOOT: DB CanConnect={canConnect}");
+}
+catch (Exception ex)
+{
+    Console.WriteLine($"BOOT: DB connectivity check failed: {ex}");
+}
 
 
 app.MapGet("/health", () => Results.Ok("ok"));
