@@ -86,17 +86,21 @@ builder.Services.AddSingleton(new PlaidClient(
 
 var connectionString = builder.Configuration.GetConnectionString("DefaultConnection");
 
-if (string.IsNullOrWhiteSpace(connectionString))
-{
-    Console.WriteLine("BOOT: Missing ConnectionStrings:DefaultConnection");
-    throw new Exception("Missing ConnectionStrings:DefaultConnection");
-}
+Console.WriteLine($"BOOT: has DefaultConnection={!string.IsNullOrWhiteSpace(connectionString)}");
 
-var csb = new NpgsqlConnectionStringBuilder(connectionString);
-Console.WriteLine($"BOOT: DB Host={csb.Host}");
-Console.WriteLine($"BOOT: DB Port={csb.Port}");
-Console.WriteLine($"BOOT: DB Name={csb.Database}");
-Console.WriteLine($"BOOT: DB User={csb.Username}");
+try
+{
+    var csb = new NpgsqlConnectionStringBuilder(connectionString);
+    Console.WriteLine($"BOOT: DB Host={csb.Host}");
+    Console.WriteLine($"BOOT: DB Port={csb.Port}");
+    Console.WriteLine($"BOOT: DB Name={csb.Database}");
+    Console.WriteLine($"BOOT: DB User={csb.Username}");
+}
+catch (Exception ex)
+{
+    Console.WriteLine($"BOOT: Failed to parse connection string with NpgsqlConnectionStringBuilder: {ex.Message}");
+    Console.WriteLine("BOOT: Connection string may be URL-style or otherwise non-key/value format.");
+}
 
 
 
