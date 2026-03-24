@@ -141,8 +141,9 @@ builder.Services.AddCors(options =>
 });
 
 // --- APP BUILD & MIDDLEWARE ---
+Console.WriteLine("BOOT: before builder.Build()");
 var app = builder.Build();
-
+Console.WriteLine("BOOT: after builder.Build()");
 
 
 app.MapGet("/health", async (ApiDbContext dbContext) =>
@@ -1445,6 +1446,23 @@ app.MapGet("/api/debt/snapshot", async (ApiDbContext dbContext, PlaidClient plai
 
 
 
+
+app.Lifetime.ApplicationStarted.Register(() =>
+{
+    Console.WriteLine("BOOT: ApplicationStarted fired");
+});
+
+app.Lifetime.ApplicationStopping.Register(() =>
+{
+    Console.WriteLine("BOOT: ApplicationStopping fired");
+});
+
+app.Lifetime.ApplicationStopped.Register(() =>
+{
+    Console.WriteLine("BOOT: ApplicationStopped fired");
+});
+
+Console.WriteLine("BOOT: before app.Run()");
 
 
 
