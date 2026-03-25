@@ -183,3 +183,7 @@ aws ecr get-login-password --region us-east-2 | docker login --username AWS --pa
     Confirm target health:
     EC2 → Target Groups → budgetapp-api-tg → Targets
     Should show Healthy
+
+
+
+    health check = curl -i http://budgetapp-api-alb-2027755110.us-east-2.elb.amazonaws.com/health

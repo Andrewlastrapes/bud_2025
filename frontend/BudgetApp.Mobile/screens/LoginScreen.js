@@ -1,250 +1,213 @@
-import React, { useState, useEffect, useRef } from 'react';
-import {
-  View,
-  Text,
-  TextInput,
-  TouchableOpacity,
-  StyleSheet,
-  Alert,
-  KeyboardAvoidingView,
-  Platform,
-  ScrollView,
-} from 'react-native';
-import { signInWithEmailAndPassword, createUserWithEmailAndPassword } from 'firebase/auth';
+import React, { useState, useEffect } from 'react';
+import { View, ScrollView, StyleSheet, Platform } from 'react-native';
+import { SafeAreaView } from 'react-native-safe-area-context';
+import { Text, TextInput, Button, ActivityIndicator } from 'react-native-paper';
 import { auth } from '../firebaseConfig';
-import axios from 'axios';
-import { API_BASE_URL } from '../config/api';
+import {
+  createUserWithEmailAndPassword,
+  signInWithEmailAndPassword,
+} from 'firebase/auth';
 import { subscribeToLogs } from '../config/debugLog';
 
 export default function LoginScreen() {
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
-  const [name, setName] = useState('');
-  const [isRegistering, setIsRegistering] = useState(false);
+  const [isLoading, setIsLoading] = useState(false);
+  const [error, setError] = useState(null);
   const [logs, setLogs] = useState([]);
-  const [showDebug, setShowDebug] = useState(false);
-  const logScrollRef = useRef(null);
 
   useEffect(() => {
-    const unsub = subscribeToLogs((entries) => {
-      setLogs(entries);
-    });
+    const unsub = subscribeToLogs((entries) => setLogs(entries));
     return unsub;
   }, []);
 
-  // Auto-scroll to bottom when new logs arrive
-  useEffect(() => {
-    if (showDebug && logScrollRef.current) {
-      logScrollRef.current.scrollToEnd({ animated: false });
-    }
-  }, [logs, showDebug]);
-
-  const handleLogin = async () => {
+  const handleSignIn = async () => {
+    setIsLoading(true);
+    setError(null);
     try {
-      console.log(`[Login] Attempting sign-in for ${email}`);
+      console.log(`[Login] signIn: ${email}`);
       await signInWithEmailAndPassword(auth, email, password);
-      console.log('[Login] signInWithEmailAndPassword resolved — waiting for onAuthStateChanged');
+      console.log('[Login] signIn OK — waiting for onAuthStateChanged');
     } catch (e) {
-      console.error('[Login] Sign-in error:', e.message);
-      Alert.alert('Login Error', e.message);
+      console.error('[Login] signIn error:', e.message);
+      setError(e.message);
     }
+    setIsLoading(false);
   };
 
-  const handleRegister = async () => {
+  const handleSignUp = async () => {
+    setIsLoading(true);
+    setError(null);
+
+    let fbUser = null;
+
     try {
-      console.log(`[Register] Creating account for ${email}`);
-      const { user } = await createUserWithEmailAndPassword(auth, email, password);
-      const idToken = await user.getIdToken();
-      console.log('[Register] Firebase user created, posting to API...');
-      await axios.post(
-        `${API_BASE_URL}/api/users/register`,
-        { email, name },
-        { headers: { Authorization: `Bearer ${idToken}` } }
-      );
-      console.log('[Register] API registration complete');
-    } catch (e) {
-      console.error('[Register] Error:', e.message);
-      Alert.alert('Register Error', e.message);
-    }
-  };
+      // 1. Create Firebase user — this fires onAuthStateChanged, but
+      //    MainContentNavigator will retry fetching the profile while
+      //    we simultaneously register in the backend below.
+      console.log('[Register] Step 1: createUserWithEmailAndPassword...');
+      const cred = await createUserWithEmailAndPassword(auth, email, password);
+      fbUser = cred.user;
+      console.log(`[Register] Step 1 OK uid=${fbUser.uid}`);
 
-  const logColor = (level) => {
-    if (level === 'error') return '#ff6b6b';
-    if (level === 'warn') return '#ffd93d';
-    return '#a8ff78';
+      // 2. Get ID token to pass as Bearer
+      console.log('[Register] Step 2: getIdToken...');
+      const idToken = await fbUser.getIdToken();
+      console.log(`[Register] Step 2 OK token length=${idToken.length}`);
+
+      // 3. Register in backend — UID is derived from the bearer token server-side
+      //    Body only needs { email, name }
+      const apiUrl = process.env.EXPO_PUBLIC_API_URL;
+      const registerUrl = `${apiUrl}/api/users/register`;
+      console.log(`[Register] Step 3: POST ${registerUrl}`);
+      console.log(`[Register]   headers: Authorization=Bearer [${idToken.length} chars]`);
+      console.log(`[Register]   body: { email: "${email}", name: "${email.split('@')[0]}" }`);
+
+      let response;
+      try {
+        response = await fetch(registerUrl, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${idToken}`,
+          },
+          body: JSON.stringify({
+            email,
+            name: email.split('@')[0],
+          }),
+        });
+      } catch (netErr) {
+        // Network-level failure (no internet, DNS, TLS, ATS block, etc.)
+        console.error(`[Register] Step 3 NETWORK ERROR: ${netErr.message}`);
+        console.error(`[Register]   URL was: ${registerUrl}`);
+        console.error(`[Register]   Platform: ${Platform.OS}`);
+        throw netErr;
+      }
+
+      const responseText = await response.text();
+      console.log(`[Register] Step 3 HTTP ${response.status}: ${responseText.slice(0, 300)}`);
+
+      if (!response.ok) {
+        throw new Error(`Backend registration failed ${response.status}: ${responseText}`);
+      }
+
+      console.log('[Register] Done — onAuthStateChanged + profile fetch should handle navigation');
+    } catch (e) {
+      console.error(`[Register] FAILED: ${e.message}`);
+      setError(e.message);
+
+      // Rollback Firebase user if backend failed
+      if (fbUser) {
+        try {
+          console.log('[Register] Rollback: deleting Firebase user...');
+          await fbUser.delete();
+          console.log('[Register] Rollback OK — user deleted, staying on Login');
+        } catch (rb) {
+          console.error(`[Register] Rollback failed: ${rb.message}`);
+        }
+      }
+    }
+
+    setIsLoading(false);
   };
 
   return (
-    <KeyboardAvoidingView
-      style={styles.container}
-      behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
-    >
-      <ScrollView contentContainerStyle={styles.inner}>
-        <Text style={styles.title}>💰 BudgetApp</Text>
+    <SafeAreaView style={styles.container}>
+      <ScrollView contentContainerStyle={styles.scroll} keyboardShouldPersistTaps="handled">
+        <Text style={styles.title}>Welcome</Text>
 
-        {isRegistering && (
-          <TextInput
-            style={styles.input}
-            placeholder="Name"
-            value={name}
-            onChangeText={setName}
-          />
-        )}
+        <Text style={styles.meta}>Firebase: {auth.app.options.projectId}</Text>
+        <Text style={styles.meta}>API: {process.env.EXPO_PUBLIC_API_URL || '⚠️ NOT SET'}</Text>
+        <Text style={styles.meta}>Platform: {Platform.OS}</Text>
 
         <TextInput
-          style={styles.input}
-          placeholder="Email"
+          label="Email"
           value={email}
           onChangeText={setEmail}
-          keyboardType="email-address"
           autoCapitalize="none"
-        />
-
-        <TextInput
+          keyboardType="email-address"
           style={styles.input}
-          placeholder="Password"
+        />
+        <TextInput
+          label="Password"
           value={password}
           onChangeText={setPassword}
           secureTextEntry
+          style={styles.input}
         />
 
-        <TouchableOpacity
-          style={styles.button}
-          onPress={isRegistering ? handleRegister : handleLogin}
-        >
-          <Text style={styles.buttonText}>
-            {isRegistering ? 'Register' : 'Login'}
-          </Text>
-        </TouchableOpacity>
-
-        <TouchableOpacity onPress={() => setIsRegistering(!isRegistering)}>
-          <Text style={styles.toggle}>
-            {isRegistering
-              ? 'Already have an account? Login'
-              : "Don't have an account? Register"}
-          </Text>
-        </TouchableOpacity>
-
-        {/* ── Debug Log Panel ── */}
-        <TouchableOpacity
-          style={styles.debugToggle}
-          onPress={() => setShowDebug((v) => !v)}
-        >
-          <Text style={styles.debugToggleText}>
-            {showDebug ? '▲ Hide Debug Logs' : '▼ Show Debug Logs'}{' '}
-            ({logs.length})
-          </Text>
-        </TouchableOpacity>
-
-        {showDebug && (
-          <View style={styles.debugPanel}>
-            <ScrollView
-              ref={logScrollRef}
-              style={styles.debugScroll}
-              onContentSizeChange={() =>
-                logScrollRef.current?.scrollToEnd({ animated: false })
-              }
-            >
-              {logs.length === 0 ? (
-                <Text style={styles.debugEmpty}>No logs yet.</Text>
-              ) : (
-                logs.map((entry, i) => (
-                  <Text
-                    key={i}
-                    style={[styles.debugEntry, { color: logColor(entry.level) }]}
-                  >
-                    <Text style={styles.debugTime}>{entry.time} </Text>
-                    <Text style={styles.debugLevel}>[{entry.level.toUpperCase()}] </Text>
-                    {entry.msg}
-                  </Text>
-                ))
-              )}
-            </ScrollView>
-          </View>
+        {isLoading ? (
+          <ActivityIndicator style={{ marginTop: 20 }} />
+        ) : (
+          <>
+            <Button mode="contained" onPress={handleSignIn} style={styles.button}>
+              Login
+            </Button>
+            <Button mode="outlined" onPress={handleSignUp} style={styles.button}>
+              Sign Up
+            </Button>
+          </>
         )}
+
+        {error ? (
+          <Text style={styles.error} selectable>
+            {error}
+          </Text>
+        ) : null}
+
+        {/* ── Debug Log — always visible, no nesting ── */}
+        <View style={styles.logBox}>
+          <Text style={styles.logTitle}>DEBUG LOG ({logs.length} entries)</Text>
+          {logs.length === 0 ? (
+            <Text style={styles.logLine}>— no logs yet —</Text>
+          ) : (
+            logs.map((entry, i) => (
+              <Text
+                key={i}
+                selectable
+                style={[
+                  styles.logLine,
+                  entry.level === 'error' && styles.logError,
+                  entry.level === 'warn' && styles.logWarn,
+                ]}
+              >
+                {entry.time} {entry.msg}
+              </Text>
+            ))
+          )}
+        </View>
       </ScrollView>
-    </KeyboardAvoidingView>
+    </SafeAreaView>
   );
 }
 
 const styles = StyleSheet.create({
-  container: {
-    flex: 1,
-    backgroundColor: '#f5f5f5',
+  container: { flex: 1 },
+  scroll: { padding: 20, paddingTop: 40 },
+  title: { fontSize: 24, fontWeight: 'bold', textAlign: 'center', marginBottom: 12 },
+  meta: { fontSize: 11, color: '#666', marginBottom: 2 },
+  input: { marginBottom: 10, marginTop: 8 },
+  button: { marginTop: 10 },
+  error: { marginTop: 10, color: 'red', textAlign: 'center' },
+  logBox: {
+    marginTop: 24,
+    padding: 10,
+    backgroundColor: '#1e1e1e',
+    borderRadius: 8,
   },
-  inner: {
-    flexGrow: 1,
-    justifyContent: 'center',
-    padding: 24,
-  },
-  title: {
-    fontSize: 32,
+  logTitle: {
+    color: '#888',
     fontWeight: 'bold',
-    textAlign: 'center',
-    marginBottom: 32,
-  },
-  input: {
-    backgroundColor: '#fff',
-    borderWidth: 1,
-    borderColor: '#ddd',
-    borderRadius: 8,
-    padding: 12,
-    marginBottom: 16,
-    fontSize: 16,
-  },
-  button: {
-    backgroundColor: '#6200ee',
-    borderRadius: 8,
-    padding: 14,
-    alignItems: 'center',
-    marginBottom: 16,
-  },
-  buttonText: {
-    color: '#fff',
-    fontSize: 16,
-    fontWeight: 'bold',
-  },
-  toggle: {
-    textAlign: 'center',
-    color: '#6200ee',
-    fontSize: 14,
-    marginBottom: 24,
-  },
-  // Debug panel
-  debugToggle: {
-    alignItems: 'center',
-    paddingVertical: 8,
-    marginBottom: 4,
-  },
-  debugToggleText: {
-    color: '#999',
-    fontSize: 12,
-    fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace',
-  },
-  debugPanel: {
-    backgroundColor: '#111',
-    borderRadius: 8,
-    padding: 8,
-    maxHeight: 280,
-  },
-  debugScroll: {
-    flex: 1,
-  },
-  debugEmpty: {
-    color: '#555',
     fontSize: 11,
+    marginBottom: 6,
     fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace',
   },
-  debugEntry: {
+  logLine: {
+    color: '#d4f5a5',
     fontSize: 10,
     fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace',
     marginBottom: 2,
-    flexWrap: 'wrap',
   },
-  debugTime: {
-    color: '#666',
-  },
-  debugLevel: {
-    fontWeight: 'bold',
-  },
+  logError: { color: '#ff6b6b' },
+  logWarn: { color: '#ffd93d' },
 });
