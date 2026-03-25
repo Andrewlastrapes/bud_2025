@@ -188,8 +188,15 @@ function MainContentNavigator({ fbUser }) {
     return <LoadingScreen />;
   }
 
-  const initialRouteName =
-    dbUser && !dbUser.onboardingComplete ? 'OnboardingFlow' : 'App';
+  if (!dbUser) {
+    // Profile fetch failed after all retries — log clearly and fall back to onboarding
+    // so the user isn't silently dropped into the main app without a profile.
+    console.error('[MainContent] dbUser is null after retries — cannot determine onboarding status');
+  }
+
+  const onboardingComplete = dbUser?.onboardingComplete ?? false;
+  const initialRouteName = onboardingComplete ? 'App' : 'OnboardingFlow';
+  console.log(`[MainContent] onboardingComplete=${onboardingComplete} → initialRouteName=${initialRouteName}`);
 
   return (
     <Stack.Navigator

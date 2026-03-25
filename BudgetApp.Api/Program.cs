@@ -187,21 +187,54 @@ app.UseCors(MyAllowSpecificOrigins);
 // --- API ENDPOINTS ---
 
 // POST: /api/users/register
-app.MapPost("/api/users/register", async (ApiDbContext dbContext, UserRegistrationRequest requestBody) =>
+// Requires Bearer token. Derives Firebase UID from token. Body: { email, name }
+app.MapPost("/api/users/register", async (ApiDbContext dbContext, HttpContext httpContext, UserRegistrationRequest requestBody) =>
 {
     try
     {
-        var existingUser = await dbContext.Users.FirstOrDefaultAsync(u => u.Email == requestBody.Email);
+        // --- Verify Firebase token and derive UID ---
+        string? idToken = httpContext.Request.Headers["Authorization"]
+            .FirstOrDefault()
+            ?.Split(" ")
+            .Last();
+
+        if (string.IsNullOrEmpty(idToken))
+            return Results.Unauthorized();
+
+        FirebaseToken decodedToken;
+        try
+        {
+            decodedToken = await FirebaseAuth.DefaultInstance.VerifyIdTokenAsync(idToken);
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Register: Firebase token verification failed: {ex.Message}");
+            return Results.Unauthorized();
+        }
+
+        var firebaseUid = decodedToken.Uid;
+        Console.WriteLine($"Register: uid={firebaseUid} email={requestBody.Email}");
+
+        // --- Idempotent: return existing user if already registered ---
+        var existingUser = await dbContext.Users.FirstOrDefaultAsync(u => u.FirebaseUuid == firebaseUid);
         if (existingUser != null)
         {
-            return Results.Conflict(new { message = "User with this email already exists." });
+            Console.WriteLine($"Register: user already exists id={existingUser.Id}");
+            return Results.Ok(new
+            {
+                message = "User already registered",
+                userId = existingUser.Id,
+                name = existingUser.Name,
+                email = existingUser.Email
+            });
         }
 
         var newUser = new User
         {
             Name = requestBody.Name,
             Email = requestBody.Email,
-            FirebaseUuid = requestBody.FirebaseUuid ?? Guid.NewGuid().ToString(),
+            FirebaseUuid = firebaseUid,
+            OnboardingComplete = false,
             CreatedAt = DateTime.UtcNow,
             UpdatedAt = DateTime.UtcNow
         };
@@ -209,6 +242,7 @@ app.MapPost("/api/users/register", async (ApiDbContext dbContext, UserRegistrati
         await dbContext.Users.AddAsync(newUser);
         await dbContext.SaveChangesAsync();
 
+        Console.WriteLine($"Register: created user id={newUser.Id}");
         return Results.Ok(new
         {
             message = "User registered successfully",
@@ -219,6 +253,7 @@ app.MapPost("/api/users/register", async (ApiDbContext dbContext, UserRegistrati
     }
     catch (Exception e)
     {
+        Console.WriteLine($"Register: exception {e.Message}");
         return Results.Problem($"Registration failed: {e.Message}");
     }
 })
