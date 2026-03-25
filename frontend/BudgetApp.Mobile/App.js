@@ -1,4 +1,6 @@
 // File: App.js
+// NOTE: debugLog must be imported FIRST so console is patched before anything else runs
+import './config/debugLog';
 
 import React, { useState, useEffect } from 'react';
 import { View, ActivityIndicator, StyleSheet } from 'react-native';
@@ -247,7 +249,13 @@ export default function App() {
   const [isLoading, setIsLoading] = useState(true);
 
   useEffect(() => {
+    console.log('[Auth] onAuthStateChanged listener attached');
     const unsubscribe = onAuthStateChanged(auth, async (user) => {
+      if (user) {
+        console.log(`[Auth] User resolved: uid=${user.uid} email=${user.email}`);
+      } else {
+        console.log('[Auth] No user — showing Login screen');
+      }
       setFbUser(user);
       setIsLoading(false);
     });

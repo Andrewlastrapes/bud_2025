@@ -1,227 +1,250 @@
-import React, { useState } from 'react';
-import { View, ScrollView, StyleSheet } from 'react-native';
-import { SafeAreaView } from 'react-native-safe-area-context';
-import { Text, TextInput, Button, ActivityIndicator } from 'react-native-paper';
-import { auth } from '../firebaseConfig';
+import React, { useState, useEffect, useRef } from 'react';
 import {
-    createUserWithEmailAndPassword,
-    signInWithEmailAndPassword,
-    signOut,
-} from 'firebase/auth';
+  View,
+  Text,
+  TextInput,
+  TouchableOpacity,
+  StyleSheet,
+  Alert,
+  KeyboardAvoidingView,
+  Platform,
+  ScrollView,
+} from 'react-native';
+import { signInWithEmailAndPassword, createUserWithEmailAndPassword } from 'firebase/auth';
+import { auth } from '../firebaseConfig';
+import axios from 'axios';
+import { API_BASE_URL } from '../config/api';
+import { subscribeToLogs } from '../config/debugLog';
 
 export default function LoginScreen() {
-    const [email, setEmail] = useState('');
-    const [password, setPassword] = useState('');
-    const [isLoading, setIsLoading] = useState(false);
-    const [error, setError] = useState(null);
-    const [debugLogs, setDebugLogs] = useState([]);
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
+  const [name, setName] = useState('');
+  const [isRegistering, setIsRegistering] = useState(false);
+  const [logs, setLogs] = useState([]);
+  const [showDebug, setShowDebug] = useState(false);
+  const logScrollRef = useRef(null);
 
-    const addLog = (msg) => {
-        console.log('[DEBUG]', msg);
-        setDebugLogs((prev) => [...prev, `${new Date().toISOString().slice(11, 23)} — ${msg}`]);
-    };
+  useEffect(() => {
+    const unsub = subscribeToLogs((entries) => {
+      setLogs(entries);
+    });
+    return unsub;
+  }, []);
 
-    const clearLogs = () => setDebugLogs([]);
+  // Auto-scroll to bottom when new logs arrive
+  useEffect(() => {
+    if (showDebug && logScrollRef.current) {
+      logScrollRef.current.scrollToEnd({ animated: false });
+    }
+  }, [logs, showDebug]);
 
-    const handleSignIn = async () => {
-        setIsLoading(true);
-        setError(null);
-        try {
-            await signInWithEmailAndPassword(auth, email, password);
-        } catch (e) {
-            setError(e.message);
-        }
-        setIsLoading(false);
-    };
+  const handleLogin = async () => {
+    try {
+      console.log(`[Login] Attempting sign-in for ${email}`);
+      await signInWithEmailAndPassword(auth, email, password);
+      console.log('[Login] signInWithEmailAndPassword resolved — waiting for onAuthStateChanged');
+    } catch (e) {
+      console.error('[Login] Sign-in error:', e.message);
+      Alert.alert('Login Error', e.message);
+    }
+  };
 
-    const handleSignUp = async () => {
-        setIsLoading(true);
-        setError(null);
-        clearLogs();
+  const handleRegister = async () => {
+    try {
+      console.log(`[Register] Creating account for ${email}`);
+      const { user } = await createUserWithEmailAndPassword(auth, email, password);
+      const idToken = await user.getIdToken();
+      console.log('[Register] Firebase user created, posting to API...');
+      await axios.post(
+        `${API_BASE_URL}/api/users/register`,
+        { email, name },
+        { headers: { Authorization: `Bearer ${idToken}` } }
+      );
+      console.log('[Register] API registration complete');
+    } catch (e) {
+      console.error('[Register] Error:', e.message);
+      Alert.alert('Register Error', e.message);
+    }
+  };
 
-        let firebaseCreated = false;
-        let firebaseEmail = null;
-        let firebaseUid = null;
+  const logColor = (level) => {
+    if (level === 'error') return '#ff6b6b';
+    if (level === 'warn') return '#ffd93d';
+    return '#a8ff78';
+  };
 
-        try {
-            // Step 1: Create Firebase user
-            addLog('Step 1: Creating Firebase user...');
-            const userCredential = await createUserWithEmailAndPassword(auth, email, password);
-            firebaseCreated = true;
-            firebaseEmail = userCredential.user.email;
-            firebaseUid = userCredential.user.uid;
-            addLog(`Step 1 OK: uid=${firebaseUid}`);
+  return (
+    <KeyboardAvoidingView
+      style={styles.container}
+      behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
+    >
+      <ScrollView contentContainerStyle={styles.inner}>
+        <Text style={styles.title}>💰 BudgetApp</Text>
 
-            // Step 2: Sign out immediately so onAuthStateChanged does NOT navigate
-            //         the user forward until DB registration is also confirmed.
-            addLog('Step 2: Signing out to block premature navigation...');
-            await signOut(auth);
-            addLog('Step 2 OK: signed out');
+        {isRegistering && (
+          <TextInput
+            style={styles.input}
+            placeholder="Name"
+            value={name}
+            onChangeText={setName}
+          />
+        )}
 
-            // Step 3: Register user in the backend DB
-            const registerUrl = `${process.env.EXPO_PUBLIC_API_URL}/api/users/register`;
-            addLog(`Step 3: POST ${registerUrl}`);
-            addLog(`  body: name=${firebaseEmail?.split('@')[0]}, email=${firebaseEmail}, uid=${firebaseUid}`);
+        <TextInput
+          style={styles.input}
+          placeholder="Email"
+          value={email}
+          onChangeText={setEmail}
+          keyboardType="email-address"
+          autoCapitalize="none"
+        />
 
-            const response = await fetch(
-                registerUrl,
-                {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        name: firebaseEmail?.split('@')[0] || 'User',
-                        email: firebaseEmail,
-                        firebaseUuid: firebaseUid,
-                    }),
-                },
-            );
+        <TextInput
+          style={styles.input}
+          placeholder="Password"
+          value={password}
+          onChangeText={setPassword}
+          secureTextEntry
+        />
 
-            addLog(`Step 3 response: status=${response.status} ok=${response.ok}`);
-            const responseText = await response.text();
-            addLog(`Step 3 body: ${responseText.slice(0, 300)}`);
+        <TouchableOpacity
+          style={styles.button}
+          onPress={isRegistering ? handleRegister : handleLogin}
+        >
+          <Text style={styles.buttonText}>
+            {isRegistering ? 'Register' : 'Login'}
+          </Text>
+        </TouchableOpacity>
 
-            if (!response.ok) {
-                throw new Error(
-                    `Backend registration failed: ${response.status} ${responseText}`,
-                );
-            }
+        <TouchableOpacity onPress={() => setIsRegistering(!isRegistering)}>
+          <Text style={styles.toggle}>
+            {isRegistering
+              ? 'Already have an account? Login'
+              : "Don't have an account? Register"}
+          </Text>
+        </TouchableOpacity>
 
-            addLog('Step 3 OK: user registered in DB');
+        {/* ── Debug Log Panel ── */}
+        <TouchableOpacity
+          style={styles.debugToggle}
+          onPress={() => setShowDebug((v) => !v)}
+        >
+          <Text style={styles.debugToggleText}>
+            {showDebug ? '▲ Hide Debug Logs' : '▼ Show Debug Logs'}{' '}
+            ({logs.length})
+          </Text>
+        </TouchableOpacity>
 
-            // Step 4: Both steps succeeded — sign back in to trigger navigation to onboarding.
-            // ⚠️  NAVIGATION DISABLED FOR DEBUG — uncomment the line below when ready.
-            addLog('Step 4: Navigation disabled for debug. Registration complete.');
-            // await signInWithEmailAndPassword(auth, email, password);
-
-        } catch (e) {
-            addLog(`ERROR: ${e.message}`);
-            console.error('Registration error:', e);
-            setError(e.message);
-
-            // Rollback: delete the Firebase user if it was created but DB registration failed.
-            if (firebaseCreated) {
-                try {
-                    addLog('Rollback: re-signing in to delete Firebase user...');
-                    const cred = await signInWithEmailAndPassword(auth, email, password);
-                    await cred.user.delete();
-                    addLog('Rollback OK: Firebase user deleted');
-                    // onAuthStateChanged fires null after delete, keeping user on login screen.
-                } catch (rollbackError) {
-                    addLog(`Rollback FAILED: ${rollbackError.message}`);
-                    console.error('Failed to delete Firebase user during rollback:', rollbackError);
-                }
-            }
-        }
-
-        setIsLoading(false);
-    };
-
-    return (
-        <SafeAreaView style={styles.container}>
-            <ScrollView contentContainerStyle={styles.scroll} keyboardShouldPersistTaps="handled">
-                <Text style={styles.title}>Welcome</Text>
-
-                {/* ── Config debug info ── */}
-                <Text style={styles.debugLabel}>Firebase project: {auth.app.options.projectId}</Text>
-                <Text style={styles.debugLabel}>App ID: {auth.app.options.appId}</Text>
-                <Text style={styles.debugLabel}>API URL: {process.env.EXPO_PUBLIC_API_URL || '⚠️  NOT SET'}</Text>
-
-                <TextInput
-                    label="Email"
-                    value={email}
-                    onChangeText={setEmail}
-                    autoCapitalize="none"
-                    style={styles.input}
-                />
-                <TextInput
-                    label="Password"
-                    value={password}
-                    onChangeText={setPassword}
-                    secureTextEntry
-                    style={styles.input}
-                />
-
-                {isLoading ? (
-                    <ActivityIndicator style={{ marginTop: 20 }} />
-                ) : (
-                    <>
-                        <Button mode="contained" onPress={handleSignIn} style={styles.button}>
-                            Login
-                        </Button>
-                        <Button mode="outlined" onPress={handleSignUp} style={styles.button}>
-                            Sign Up (debug)
-                        </Button>
-                        {debugLogs.length > 0 && (
-                            <Button mode="text" onPress={clearLogs} style={styles.button}>
-                                Clear Logs
-                            </Button>
-                        )}
-                    </>
-                )}
-
-                {error && <Text style={styles.error} selectable>{error}</Text>}
-
-                {/* ── Step-by-step debug log ── */}
-                {debugLogs.length > 0 && (
-                    <View style={styles.logBox}>
-                        <Text style={styles.logTitle}>Debug Log</Text>
-                        {debugLogs.map((line, i) => (
-                            <Text key={i} style={styles.logLine} selectable>{line}</Text>
-                        ))}
-                    </View>
-                )}
+        {showDebug && (
+          <View style={styles.debugPanel}>
+            <ScrollView
+              ref={logScrollRef}
+              style={styles.debugScroll}
+              onContentSizeChange={() =>
+                logScrollRef.current?.scrollToEnd({ animated: false })
+              }
+            >
+              {logs.length === 0 ? (
+                <Text style={styles.debugEmpty}>No logs yet.</Text>
+              ) : (
+                logs.map((entry, i) => (
+                  <Text
+                    key={i}
+                    style={[styles.debugEntry, { color: logColor(entry.level) }]}
+                  >
+                    <Text style={styles.debugTime}>{entry.time} </Text>
+                    <Text style={styles.debugLevel}>[{entry.level.toUpperCase()}] </Text>
+                    {entry.msg}
+                  </Text>
+                ))
+              )}
             </ScrollView>
-        </SafeAreaView>
-    );
+          </View>
+        )}
+      </ScrollView>
+    </KeyboardAvoidingView>
+  );
 }
 
 const styles = StyleSheet.create({
-    container: {
-        flex: 1,
-    },
-    scroll: {
-        padding: 20,
-        paddingTop: 40,
-    },
-    title: {
-        fontSize: 24,
-        fontWeight: 'bold',
-        textAlign: 'center',
-        marginBottom: 16,
-    },
-    debugLabel: {
-        fontSize: 11,
-        color: '#666',
-        marginBottom: 2,
-    },
-    input: {
-        marginBottom: 10,
-        marginTop: 8,
-    },
-    button: {
-        marginTop: 10,
-    },
-    error: {
-        marginTop: 10,
-        color: 'red',
-        textAlign: 'center',
-    },
-    logBox: {
-        marginTop: 20,
-        padding: 12,
-        backgroundColor: '#1e1e1e',
-        borderRadius: 8,
-    },
-    logTitle: {
-        color: '#aaa',
-        fontWeight: 'bold',
-        marginBottom: 6,
-        fontSize: 12,
-    },
-    logLine: {
-        color: '#d4f5a5',
-        fontFamily: 'monospace',
-        fontSize: 11,
-        marginBottom: 3,
-    },
+  container: {
+    flex: 1,
+    backgroundColor: '#f5f5f5',
+  },
+  inner: {
+    flexGrow: 1,
+    justifyContent: 'center',
+    padding: 24,
+  },
+  title: {
+    fontSize: 32,
+    fontWeight: 'bold',
+    textAlign: 'center',
+    marginBottom: 32,
+  },
+  input: {
+    backgroundColor: '#fff',
+    borderWidth: 1,
+    borderColor: '#ddd',
+    borderRadius: 8,
+    padding: 12,
+    marginBottom: 16,
+    fontSize: 16,
+  },
+  button: {
+    backgroundColor: '#6200ee',
+    borderRadius: 8,
+    padding: 14,
+    alignItems: 'center',
+    marginBottom: 16,
+  },
+  buttonText: {
+    color: '#fff',
+    fontSize: 16,
+    fontWeight: 'bold',
+  },
+  toggle: {
+    textAlign: 'center',
+    color: '#6200ee',
+    fontSize: 14,
+    marginBottom: 24,
+  },
+  // Debug panel
+  debugToggle: {
+    alignItems: 'center',
+    paddingVertical: 8,
+    marginBottom: 4,
+  },
+  debugToggleText: {
+    color: '#999',
+    fontSize: 12,
+    fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace',
+  },
+  debugPanel: {
+    backgroundColor: '#111',
+    borderRadius: 8,
+    padding: 8,
+    maxHeight: 280,
+  },
+  debugScroll: {
+    flex: 1,
+  },
+  debugEmpty: {
+    color: '#555',
+    fontSize: 11,
+    fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace',
+  },
+  debugEntry: {
+    fontSize: 10,
+    fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace',
+    marginBottom: 2,
+    flexWrap: 'wrap',
+  },
+  debugTime: {
+    color: '#666',
+  },
+  debugLevel: {
+    fontWeight: 'bold',
+  },
 });
