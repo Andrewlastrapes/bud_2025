@@ -5,7 +5,8 @@ import { Text, TextInput, Button, ActivityIndicator } from 'react-native-paper';
 import { auth } from '../firebaseConfig';
 import {
     createUserWithEmailAndPassword,
-    signInWithEmailAndPassword
+    signInWithEmailAndPassword,
+    signOut,
 } from 'firebase/auth';
 
 export default function LoginScreen() {
@@ -13,6 +14,7 @@ export default function LoginScreen() {
     const [password, setPassword] = useState('');
     const [isLoading, setIsLoading] = useState(false);
     const [error, setError] = useState(null);
+    const [debugMessage, setDebugMessage] = useState('');
 
     const handleSignIn = async () => {
         setIsLoading(true);
@@ -25,58 +27,91 @@ export default function LoginScreen() {
         setIsLoading(false);
     };
 
-   const handleSignUp = async () => {
-    setIsLoading(true);
-    setError(null);
+    const handleSignUp = async () => {
+        setIsLoading(true);
+        setError(null);
 
-    let firebaseUser = null;
+        let firebaseCreated = false;
+        let firebaseEmail = null;
+        let firebaseUid = null;
 
-    try {
-        // 1. Create Firebase user
-        const userCredential = await createUserWithEmailAndPassword(auth, email, password);
-        firebaseUser = userCredential.user;
+        try {
+            // Step 1: Create Firebase user
+            setDebugMessage('Creating Firebase user...');
 
-        console.log('Firebase user created:', firebaseUser.uid);
+            const userCredential = await createUserWithEmailAndPassword(auth, email, password);
+            firebaseCreated = true;
+            firebaseEmail = userCredential.user.email;
+            firebaseUid = userCredential.user.uid;
 
-        // 2. Register user in your backend DB
-        const response = await fetch(`${process.env.EXPO_PUBLIC_API_URL}/api/users/register`, {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-            },
-            body: JSON.stringify({
-                name: firebaseUser.email?.split('@')[0] || 'User',
-                email: firebaseUser.email,
-                firebaseUuid: firebaseUser.uid
-            })
-        });
+            setDebugMessage(`Firebase created: ${firebaseUid}`);
 
-        const responseText = await response.text();
 
-        if (!response.ok) {
-            throw new Error(`Backend registration failed: ${response.status} ${responseText}`);
-        }
+            // Step 2: Sign out immediately so onAuthStateChanged does NOT navigate
+            //         the user forward until DB registration is also confirmed.
+            await signOut(auth);
+            setDebugMessage('Signed out after Firebase create, before backend register');
 
-        console.log('User registered successfully:', responseText);
+            const registerUrl = `${process.env.EXPO_PUBLIC_API_URL}/api/users/register`;
+            setDebugMessage(`Calling backend: ${registerUrl}`);
 
-    } catch (e) {
-        console.error('Registration error:', e);
-        setError(e.message);
+            // Step 3: Register user in the backend DB
+            const response = await fetch(
+                `${process.env.EXPO_PUBLIC_API_URL}/api/users/register`,
+                {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        name: firebaseEmail?.split('@')[0] || 'User',
+                        email: firebaseEmail,
+                        firebaseUuid: firebaseUid,
+                    }),
+                },
+            );
 
-        // 🔥 CRITICAL: rollback Firebase user if DB failed
-        if (firebaseUser) {
-            try {
-                console.log('Deleting Firebase user due to failure...');
-                await firebaseUser.delete();
-                console.log('Firebase user deleted');
-            } catch (deleteError) {
-                console.error('Failed to delete Firebase user:', deleteError);
+            const responseText = await response.text();
+            setDebugMessage(`Backend responded: ${response.status} ${responseText}`);
+
+            if (!response.ok) {
+                throw new Error(
+                    `Backend registration failed: ${response.status} ${responseText}`,
+                );
+            }
+     
+
+            // Step 4: Both steps succeeded — sign back in to trigger navigation to onboarding.
+            //         App.js onAuthStateChanged will fire, fetch the user profile
+            //         (onboardingComplete: false), and route to OnboardingFlow.
+            setDebugMessage('Backend registration succeeded. Signing back in...');
+            await signInWithEmailAndPassword(auth, email, password);
+
+            setDebugMessage('Signup complete.');
+            console.log('User registered in DB successfully:', responseText);
+        } catch (e) {
+            console.error('Registration error:', e);
+            setError(e.message);
+
+            // Rollback: delete the Firebase user if it was created but DB registration failed.
+            if (firebaseCreated) {
+                try {
+                    console.log('Rolling back — deleting Firebase user...');
+                                    setDebugMessage('Signup failed. Rolling back Firebase user...');
+
+                    // Re-sign in so we have a current user reference for deletion.
+                    const cred = await signInWithEmailAndPassword(auth, email, password);
+                    await cred.user.delete();
+                    console.log('Firebase user deleted during rollback');
+                    // onAuthStateChanged fires null after delete, keeping user on login screen.
+                } catch (rollbackError) {
+                    console.error('Failed to delete Firebase user during rollback:', rollbackError);
+                                    setDebugMessage(`Rollback failed: ${rollbackMessage}`);
+
+                }
             }
         }
-    }
 
-    setIsLoading(false);
-};
+        setIsLoading(false);
+    };
 
     return (
         <SafeAreaView style={styles.container}>
@@ -85,6 +120,8 @@ export default function LoginScreen() {
             <Text>Project: {auth.app.options.projectId}</Text>
             <Text>App ID: {auth.app.options.appId}</Text>
             <Text>API URL: {process.env.EXPO_PUBLIC_API_URL}</Text>
+            <Text selectable>Debug: {debugMessage}</Text>
+
             <Text selectable>{error}</Text>
 
             <TextInput

@@ -138,3 +138,48 @@ Database = psql "postgresql://andrewlastrapes:DiKOl3Na3yzI9atfoKm9FW1bMNz0ITS5@d
 SELECT * FROM "Users" LIMIT 5;
 SELECT * FROM "Balances" LIMIT 5;
 SELECT * FROM "PlaidItems" LIMIT 5;
+
+
+
+Backend deploy:
+
+1.
+
+aws sts get-caller-identity
+aws ecr get-login-password --region us-east-2 | docker login --username AWS --password-stdin 531608153868.dkr.ecr.us-east-2.amazonaws.com
+
+
+ 2. 
+  docker buildx build \
+    --platform linux/amd64 \
+    -t 531608153868.dkr.ecr.us-east-2.amazonaws.com/budgetapp-api:2026-3-24-8 \
+    --push \
+    .
+
+  3.     Create New Task Definition Revision
+
+    Go to ECS → Task Definitions → budgetapp-api
+    Click Create new revision
+
+    Update the image to:
+
+    531608153868.dkr.ecr.us-east-2.amazonaws.com/budgetapp-api:<TAG>
+    Verify:
+    ASPNETCORE_URLS = http://0.0.0.0:8080
+    Port mapping = 8080:8080
+    Click Create
+      
+   4.    Update ECS Service
+
+    Go to ECS → Clusters → budget-api-prod-cluster → Services
+    Select budgetapp-api-service
+    Click Update service
+    Choose the new task definition revision
+    Enable Force new deployment (if shown)
+    Deploy
+
+  5. Verify Deployment
+    Check Tasks → Logs for startup output
+    Confirm target health:
+    EC2 → Target Groups → budgetapp-api-tg → Targets
+    Should show Healthy
