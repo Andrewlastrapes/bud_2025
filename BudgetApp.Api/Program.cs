@@ -145,11 +145,15 @@ Console.WriteLine("BOOT: before builder.Build()");
 var app = builder.Build();
 Console.WriteLine("BOOT: after builder.Build()");
 
-using (var scope = app.Services.CreateScope())
+
+
+if (!app.Environment.IsDevelopment())
 {
+    using var scope = app.Services.CreateScope();
     var db = scope.ServiceProvider.GetRequiredService<ApiDbContext>();
     db.Database.Migrate();
 }
+
 
 
 app.MapGet("/health", async (ApiDbContext dbContext) =>

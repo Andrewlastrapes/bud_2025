@@ -257,6 +257,12 @@ export default function App() {
 
   useEffect(() => {
   const setupNotifications = async () => {
+
+     if (Platform.OS === 'web') {
+      console.log('Skipping push notification registration on web');
+      return;
+    }
+    
     if (!fbUser) return;
 
     try {
