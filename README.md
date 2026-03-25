@@ -130,3 +130,11 @@ npx eas-cli build -p ios --profile production
 
 // Submit to TestFlight
 npx eas-cli submit -p ios --profile production
+
+
+Database = psql "postgresql://andrewlastrapes:DiKOl3Na3yzI9atfoKm9FW1bMNz0ITS5@dpg-d5j589tactks73fn406g-a.virginia-postgres.render.com/budget_4l60?sslmode=require"
+
+\dt
+SELECT * FROM "Users" LIMIT 5;
+SELECT * FROM "Balances" LIMIT 5;
+SELECT * FROM "PlaidItems" LIMIT 5;
