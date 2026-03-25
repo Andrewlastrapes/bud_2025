@@ -25,39 +25,58 @@ export default function LoginScreen() {
         setIsLoading(false);
     };
 
-    const handleSignUp = async () => {
-        setIsLoading(true);
-        setError(null);
-        try {
-            // Create user in Firebase Authentication
-            const userCredential = await createUserWithEmailAndPassword(auth, email, password);
-            const firebaseUser = userCredential.user;
+   const handleSignUp = async () => {
+    setIsLoading(true);
+    setError(null);
 
-            // Register user in your database with the Firebase ID
-            const response = await fetch(`${process.env.EXPO_PUBLIC_API_URL}/api/users/register`, {                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                },
-                body: JSON.stringify({
-                    name: firebaseUser.email?.split('@')[0] || 'User', // Use email prefix as name
-                    email: firebaseUser.email,
-                    firebaseUuid: firebaseUser.uid
-                })
-            });
+    let firebaseUser = null;
 
-            if (!response.ok) {
-                throw new Error('Failed to register user in database');
-            }
+    try {
+        // 1. Create Firebase user
+        const userCredential = await createUserWithEmailAndPassword(auth, email, password);
+        firebaseUser = userCredential.user;
 
-            const userData = await response.json();
-            console.log('User registered successfully:', userData);
+        console.log('Firebase user created:', firebaseUser.uid);
 
-        } catch (e) {
-            setError(e.message);
-            console.error('Registration error:', e);
+        // 2. Register user in your backend DB
+        const response = await fetch(`${process.env.EXPO_PUBLIC_API_URL}/api/users/register`, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+                name: firebaseUser.email?.split('@')[0] || 'User',
+                email: firebaseUser.email,
+                firebaseUuid: firebaseUser.uid
+            })
+        });
+
+        const responseText = await response.text();
+
+        if (!response.ok) {
+            throw new Error(`Backend registration failed: ${response.status} ${responseText}`);
         }
-        setIsLoading(false);
-    };
+
+        console.log('User registered successfully:', responseText);
+
+    } catch (e) {
+        console.error('Registration error:', e);
+        setError(e.message);
+
+        // 🔥 CRITICAL: rollback Firebase user if DB failed
+        if (firebaseUser) {
+            try {
+                console.log('Deleting Firebase user due to failure...');
+                await firebaseUser.delete();
+                console.log('Firebase user deleted');
+            } catch (deleteError) {
+                console.error('Failed to delete Firebase user:', deleteError);
+            }
+        }
+    }
+
+    setIsLoading(false);
+};
 
     return (
         <SafeAreaView style={styles.container}>
