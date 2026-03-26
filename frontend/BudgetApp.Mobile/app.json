@@ -39,6 +39,14 @@
     "web": {
       "favicon": "./assets/favicon.png"
     },
+    "plugins": [
+      [
+        "react-native-plaid-link-sdk",
+        {
+          "enableDangerouslyAutoSubmitPhoneNumber": false
+        }
+      ]
+    ],
     "extra": {
       "eas": {
         "projectId": "8bad0aeb-cd6f-44ea-a055-995af183c708"
