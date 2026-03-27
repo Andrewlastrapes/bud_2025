@@ -32,15 +32,36 @@ function NativePlaidContent({
   navigation,
   error,
 }) {
-  const { usePlaidLink } = require('react-native-plaid-link-sdk');
+  const plaid = require('react-native-plaid-link-sdk');
 
-  const config = {
+console.log('[PlaidConnect] plaid keys:', Object.keys(plaid));
+console.log('[PlaidConnect] create type:', typeof plaid.create);
+console.log('[PlaidConnect] open type:', typeof plaid.open);
+console.log('[PlaidConnect] LinkIOSPresentationStyle:', plaid.LinkIOSPresentationStyle);
+console.log('[PlaidConnect] iOSPresentationStyle:', plaid.iOSPresentationStyle);
+
+
+const { create, open } = plaid;
+
+
+React.useEffect(() => {
+  if (!linkToken) return;
+
+  create({
     token: linkToken,
-    onSuccess: onPlaidSuccess,
-    onExit: onPlaidExit,
-  };
+  });
+}, [linkToken]);
 
-  const { open, ready } = usePlaidLink(config);
+const handleOpenPlaid = async () => {
+  try {
+    await open({
+      onSuccess: onPlaidSuccess,
+      onExit: onPlaidExit,
+    });
+  } catch (e) {
+    console.error('[PlaidConnect] open failed raw:', e);
+  }
+};
 
   const PostConnectContent = () => (
     <View style={styles.postConnectBox}>
@@ -60,11 +81,10 @@ function NativePlaidContent({
       ) : linkToken ? (
         <Button
           mode="contained"
-          onPress={open}
-          disabled={!ready}
+          onPress={handleOpenPlaid}
           style={styles.postConnectButton}
         >
-          {ready ? 'Open Plaid Link' : 'Preparing Plaid...'}
+          Open Plaid Link
         </Button>
       ) : (
         <Button
@@ -90,14 +110,13 @@ function NativePlaidContent({
     <>
       <View style={styles.instructionBox}>
         <RNText style={styles.mainInstruction}>
-          Please connect all credit cards, debit cards, and your primary checking
-          account.
+          Please connect all credit cards, debit cards, and your primary checking account.
         </RNText>
 
         <RNText style={styles.warningInstruction}>
-          ⚠️ It is essential to connect every account you use to spend money. If
-          you skip an account, your Dynamic Budget will be inaccurate because we
-          will miss those charges going forward.
+          ⚠️ It is essential to connect every account you use to spend money. If you
+          skip an account, your Dynamic Budget will be inaccurate because we will miss
+          those charges going forward.
         </RNText>
       </View>
 
@@ -109,11 +128,10 @@ function NativePlaidContent({
       ) : linkToken ? (
         <Button
           mode="contained"
-          onPress={open}
-          disabled={!ready}
+          onPress={handleOpenPlaid}
           style={styles.button}
         >
-          {ready ? 'Open Plaid Link' : 'Preparing Plaid...'}
+          Open Plaid Link
         </Button>
       ) : (
         <Button
@@ -148,11 +166,7 @@ function NativePlaidContent({
           </Text>
         )}
 
-        {numAccountsConnected > 0 ? (
-          <PostConnectContent />
-        ) : (
-          <PreConnectContent />
-        )}
+        {numAccountsConnected > 0 ? <PostConnectContent /> : <PreConnectContent />}
       </View>
 
       <Button
