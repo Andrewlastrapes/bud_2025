@@ -1,201 +1,179 @@
 # bud_2025
 Backend Deployment (BudgetApp API)
-Architecture Overview
 
-Backend: .NET 8 Web API
+## Architecture Overview
 
-Containerization: Docker
+- **Backend:** .NET 8 Web API
+- **Containerization:** Docker
+- **Image Registry:** AWS ECR
+- **Hosting:** AWS ECS Fargate
+- **Database:** Render Postgres
+- **Config:** ECS Task Definition environment variables
 
-Image Registry: AWS ECR
+**Flow:**
 
-Hosting: AWS App Runner
-
-Database: Render Postgres
-
-Config: App Runner environment variables
-
-Flow:
-
-Code → Docker Image → ECR → App Runner → Live API
+```
+Code → Docker Image → ECR → ECS Fargate → Live API
                            ↓
                       Render Postgres
-1. Prerequisites
+```
 
-Docker Desktop running
+---
 
-AWS CLI configured (aws configure)
+## 1. Prerequisites
 
-ECR repo exists:
+- Docker Desktop running
+- AWS CLI configured (`aws configure`)
+- ECR repo exists: `<AWS_ACCOUNT_ID>.dkr.ecr.us-east-2.amazonaws.com/budgetapp-api`
+- ECS cluster and Fargate service already created and pointing to ECR
 
-531608153868.dkr.ecr.us-east-2.amazonaws.com/budgetapp-api
+---
 
-App Runner service already created and pointing to ECR
-
-2. Build & Push Docker Image
+## 2. Build & Push Docker Image
 
 From repo root (or wherever your Dockerfile is):
 
-docker build -t budgetapp-api:2026-03-23-1 .
-docker tag budgetapp-api:2026-03-23-1 531608153868.dkr.ecr.us-east-2.amazonaws.com/budgetapp-api:2026-03-23-1
-Authenticate with ECR (if needed)
+```bash
+docker build -t budgetapp-api:<TAG> .
+docker tag budgetapp-api:<TAG> <AWS_ACCOUNT_ID>.dkr.ecr.us-east-2.amazonaws.com/budgetapp-api:<TAG>
+```
+
+Authenticate with ECR (if needed):
+
+```bash
 aws ecr get-login-password --region us-east-2 \
-| docker login --username AWS --password-stdin 531608153868.dkr.ecr.us-east-2.amazonaws.com
-Push image
-docker push 531608153868.dkr.ecr.us-east-2.amazonaws.com/budgetapp-api:2026-03-23-1
-3. Deploy to App Runner
+| docker login --username AWS --password-stdin <AWS_ACCOUNT_ID>.dkr.ecr.us-east-2.amazonaws.com
+```
+
+Push image:
+
+```bash
+docker push <AWS_ACCOUNT_ID>.dkr.ecr.us-east-2.amazonaws.com/budgetapp-api:<TAG>
+```
+
+---
+
+## 3. Deploy to ECS Fargate
 
 In AWS Console:
 
-Go to App Runner
+1. Go to **ECS → Task Definitions → budgetapp-api**
+2. Click **Create new revision**
+3. Update the image URI to: `<AWS_ACCOUNT_ID>.dkr.ecr.us-east-2.amazonaws.com/budgetapp-api:<TAG>`
+4. Verify port mapping: `8080:8080`
+5. Click **Create**
 
-Select your service
+Then:
 
-Click Edit & Deploy
+1. Go to **ECS → Clusters → your-cluster → Services**
+2. Select your Fargate service
+3. Click **Update service**
+4. Choose the new task definition revision
+5. Enable **Force new deployment**
+6. Click **Update**
 
-Update image tag → 2026-03-23-1
+⚠️ **Important:**
+- ECS Fargate does not deploy from Git
+- It only deploys what exists in ECR
+- Pushing code alone does nothing
 
-Deploy
+---
 
-⚠️ Important:
+## 4. Environment Variables
 
-App Runner does not deploy from Git
+Configured in the ECS Task Definition:
 
-It only deploys what exists in ECR
+| Variable | Description |
+|---|---|
+| `ConnectionStrings__DefaultConnection` | Postgres connection string |
+| `Plaid__ClientId` | Plaid client ID |
+| `Plaid__Secret` | Plaid secret |
+| `ASPNETCORE_URLS` | `http://0.0.0.0:8080` |
 
-Pushing code alone does nothing
+`ConnectionStrings__DefaultConnection` maps to:
 
-4. Environment Variables
-
-Configured in App Runner:
-
-Required
-ConnectionStrings__DefaultConnection=postgres connection string
-
-This maps to:
-
+```csharp
 builder.Configuration.GetConnectionString("DefaultConnection")
-5. Database (Render Postgres)
+```
 
-Hosted on Render
+---
 
-Access via:
+## 5. Database (Render Postgres)
 
-render psql <database-id>
-Important
+Hosted on Render. Tables are NOT auto-created unless you do it explicitly.
 
-Tables are NOT auto-created unless you do it explicitly
+**Option A (recommended)** — Run migrations on startup:
 
-You must either:
-
-Option A (recommended)
-
-Run migrations on startup:
-
+```csharp
 using (var scope = app.Services.CreateScope())
 {
     var db = scope.ServiceProvider.GetRequiredService<ApiDbContext>();
     db.Database.Migrate();
 }
-Option B
+```
 
-Run manually:
+**Option B** — Run manually:
 
+```bash
 dotnet ef database update
-6. Health Check
+```
 
-App Runner expects:
+---
 
-Port: 8080
+## 6. Health Check
 
-Health endpoint: /health (or / or /swagger depending on config)
+ECS expects:
 
-If this fails:
+- **Port:** `8080`
+- **Health endpoint:** `/health`
 
-deployment fails
+If the health check fails, the task will be killed and replaced.
 
-service never becomes live
+---
 
-7. Debugging Deployment
-Check logs in App Runner
+## 7. Debugging Deployment
+
+Check logs in **ECS → Clusters → your-cluster → Tasks → Logs**.
 
 Look for:
 
+```
 BOOT: DB Host=...
 BOOT: DB Name=...
 BOOT: DB CanConnect=true/false
+```
 
-Add this in Program.cs to debug:
+Add this in `Program.cs` to debug:
 
+```csharp
 var csb = new NpgsqlConnectionStringBuilder(connectionString);
 Console.WriteLine($"BOOT: DB Host={csb.Host}");
 Console.WriteLine($"BOOT: DB Name={csb.Database}");
-8. Common Issues
-❌ "My changes aren’t deployed"
+```
 
-You didn’t push a new Docker image.
+---
 
-❌ No tables in database
+## 8. Common Issues
 
-You never ran migrations.
+| Error | Cause |
+|---|---|
+| "My changes aren't deployed" | You didn't push a new Docker image |
+| No tables in database | Migrations never ran |
+| Health check failed | Wrong port, app not starting, or endpoint missing |
+| Wrong database | Incorrect `ConnectionStrings__DefaultConnection` in task definition |
+| Docker build fails | Docker daemon not running |
 
-❌ Health check failed
+---
 
-wrong port
-
-app not starting
-
-endpoint missing
-
-❌ Wrong database
-
-incorrect ConnectionStrings__DefaultConnection
-
-not verified via logs
-
-❌ Docker build fails
-
-Docker daemon not running.
-
-9. Recommended Improvements
-
-Stop using latest tag → always use versioned tags
-
-Add migration step on startup
-
-Add /health endpoint explicitly
-
-Log DB connection info on startup
-
-Use CI/CD to automate build → push → deploy
-
-10. Deployment Checklist
+## 9. Deployment Checklist
 
 Before every deploy:
 
- Docker Desktop running
-
- Image built with new tag
-
- Image pushed to ECR
-
- App Runner updated to new tag
-
- Logs confirm new version running
-
- DB connection verified
-
- Health check passing
-
-Blunt Reality
-
-Right now your biggest issues have been:
-
-Thinking Git push deploys backend (it doesn’t)
-
-Database schema never created
-
-Environment confusion between local vs prod
-
-Frontend calling localhost in production
-
-Fix those and the system stabilizes fast.
+- [ ] Docker Desktop running
+- [ ] Image built with new versioned tag
+- [ ] Image pushed to ECR
+- [ ] New ECS task definition revision created with updated image tag
+- [ ] ECS service updated with force new deployment
+- [ ] Logs confirm new version running
+- [ ] DB connection verified
+- [ ] Health check passing

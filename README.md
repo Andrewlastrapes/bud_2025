@@ -11,7 +11,7 @@ Mobile App (Expo / React Native)
 
 ⬇ Firebase ID token (Authorization: Bearer …)
 
-Backend API (.NET / ASP.NET Minimal API) — hosted on AWS App Runner
+Backend API (.NET / ASP.NET Minimal API) — hosted on AWS ECS Fargate
 - Verifies Firebase ID tokens (Firebase Admin)
 - Plaid API integration (Going.Plaid)
 - Sends push notifications via Expo push service
@@ -50,7 +50,7 @@ PostgreSQL — hosted on Render
 - Going.Plaid (.NET library): https://github.com/viceroypenguin/Going.Plaid
 
 ### Infrastructure
-- AWS App Runner: https://aws.amazon.com/apprunner/
+- AWS ECS Fargate: https://aws.amazon.com/fargate/
 - Render Postgres: https://render.com/docs/databases
 
 ---
@@ -109,7 +109,7 @@ In EAS, set these as environment variables (Production/Preview/etc):
 - `EXPO_PUBLIC_MEASUREMENT_ID` (if used)
 
 ### Backend
-Configured via environment variables / App Runner configuration:
+Configured via ECS Task Definition environment variables:
 
 - `ConnectionStrings:DefaultConnection`
 - `Plaid:ClientId`
@@ -132,7 +132,7 @@ npx eas-cli build -p ios --profile production
 npx eas-cli submit -p ios --profile production
 
 
-Database = psql "postgresql://andrewlastrapes:DiKOl3Na3yzI9atfoKm9FW1bMNz0ITS5@dpg-d5j589tactks73fn406g-a.virginia-postgres.render.com/budget_4l60?sslmode=require"
+Database = psql "postgresql://<DB_USER>:<DB_PASSWORD>@<DB_HOST>/<DB_NAME>?sslmode=require"
 
 \dt
 SELECT * FROM "Users" LIMIT 5;
@@ -143,47 +143,37 @@ SELECT * FROM "PlaidItems" LIMIT 5;
 
 Backend deploy:
 
-1.
+1. Authenticate with ECR and push image
 
+```bash
 aws sts get-caller-identity
-aws ecr get-login-password --region us-east-2 | docker login --username AWS --password-stdin 531608153868.dkr.ecr.us-east-2.amazonaws.com
+aws ecr get-login-password --region us-east-2 | docker login --username AWS --password-stdin <AWS_ACCOUNT_ID>.dkr.ecr.us-east-2.amazonaws.com
 
+docker buildx build \
+  --platform linux/amd64 \
+  -t <AWS_ACCOUNT_ID>.dkr.ecr.us-east-2.amazonaws.com/budgetapp-api:<TAG> \
+  --push \
+  .
+```
 
- 2. 
-  docker buildx build \
-    --platform linux/amd64 \
-    -t 531608153868.dkr.ecr.us-east-2.amazonaws.com/budgetapp-api:2026-3-24-8 \
-    --push \
-    .
+2. Create New Task Definition Revision
 
-  3.     Create New Task Definition Revision
+   - Go to **ECS → Task Definitions → budgetapp-api**
+   - Click **Create new revision**
+   - Update the image to: `<AWS_ACCOUNT_ID>.dkr.ecr.us-east-2.amazonaws.com/budgetapp-api:<TAG>`
+   - Verify: `ASPNETCORE_URLS = http://0.0.0.0:8080`, port mapping `8080:8080`
+   - Click **Create**
 
-    Go to ECS → Task Definitions → budgetapp-api
-    Click Create new revision
+3. Update ECS Fargate Service
 
-    Update the image to:
+   - Go to **ECS → Clusters → your-cluster → Services**
+   - Select your Fargate service → **Update service**
+   - Choose the new task definition revision
+   - Enable **Force new deployment**
+   - Click **Update**
 
-    531608153868.dkr.ecr.us-east-2.amazonaws.com/budgetapp-api:<TAG>
-    Verify:
-    ASPNETCORE_URLS = http://0.0.0.0:8080
-    Port mapping = 8080:8080
-    Click Create
-      
-   4.    Update ECS Service
+4. Verify Deployment
 
-    Go to ECS → Clusters → budget-api-prod-cluster → Services
-    Select budgetapp-api-service
-    Click Update service
-    Choose the new task definition revision
-    Enable Force new deployment (if shown)
-    Deploy
-
-  5. Verify Deployment
-    Check Tasks → Logs for startup output
-    Confirm target health:
-    EC2 → Target Groups → budgetapp-api-tg → Targets
-    Should show Healthy
-
-
-
-    health check = curl -i http://budgetapp-api-alb-2027755110.us-east-2.elb.amazonaws.com/health
+   - Check **Tasks → Logs** for startup output
+   - Confirm target health in **EC2 → Target Groups → budgetapp-api-tg → Targets** (should show Healthy)
+   - Health check: `curl -i http://<ALB_ENDPOINT>/health`
