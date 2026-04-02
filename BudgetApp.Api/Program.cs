@@ -35,45 +35,44 @@ if (string.IsNullOrEmpty(System.Environment.GetEnvironmentVariable("ASPNETCORE_U
 
 try
 {
-    var firebasePath = "firebase-service-account.json";
-    Console.WriteLine($"BOOT: firebasePath={Path.GetFullPath(firebasePath)} exists={File.Exists(firebasePath)}");
+    var serviceAccountJson = Environment.GetEnvironmentVariable("FIREBASE_SERVICE_ACCOUNT_JSON");
 
-    if (File.Exists(firebasePath))
+    if (!string.IsNullOrEmpty(serviceAccountJson))
     {
+        FirebaseApp.Create(new AppOptions
+        {
+            Credential = GoogleCredential.FromJson(serviceAccountJson)
+        });
+
+        Console.WriteLine("BOOT: Firebase initialized from ENV");
+    }
+    else if (builder.Environment.IsDevelopment())
+    {
+        var firebasePath = "firebase-service-account.json";
+
+        if (!File.Exists(firebasePath))
+        {
+            throw new Exception("Missing firebase-service-account.json in development");
+        }
+
         FirebaseApp.Create(new AppOptions
         {
             Credential = GoogleCredential.FromFile(firebasePath)
         });
-        Console.WriteLine("BOOT: Firebase initialized from file");
+
+        Console.WriteLine("BOOT: Firebase initialized from file (dev)");
     }
     else
     {
-        // Try to initialize from environment variable (for production)
-        var serviceAccountJson = System.Environment.GetEnvironmentVariable("FIREBASE_SERVICE_ACCOUNT_JSON");
-        if (!string.IsNullOrEmpty(serviceAccountJson))
-        {
-            FirebaseApp.Create(new AppOptions
-            {
-                Credential = GoogleCredential.FromJson(serviceAccountJson)
-            });
-            Console.WriteLine("BOOT: Firebase initialized from environment variable");
-        }
-        else
-        {
-            Console.WriteLine("BOOT: Firebase skipped (no file or environment variable found)");
-            Console.WriteLine("BOOT: WARNING - Firebase authentication will not work without proper configuration");
-        }
+        throw new Exception("FIREBASE_SERVICE_ACCOUNT_JSON is required in production");
     }
 }
 catch (Exception ex)
 {
     Console.WriteLine("BOOT: Firebase init FAILED:");
     Console.WriteLine(ex.ToString());
-    // Do NOT crash the app — keep it running so health check can pass
-    // But log the error clearly for debugging
-    Console.WriteLine("BOOT: WARNING - Application will continue but Firebase features may not work");
+    throw; // ✅ ALWAYS crash
 }
-
 
 // --- SERVICE CONFIGURATION ---
 var plaidConfig = builder.Configuration.GetSection("Plaid");
