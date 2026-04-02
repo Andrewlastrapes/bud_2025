@@ -8,6 +8,7 @@ on:
 env:
   AWS_REGION: us-east-2
   ECR_REPOSITORY: budgetapp-api
+  ECR_REGISTRY: 531608153868.dkr.ecr.us-east-2.amazonaws.com
   ECS_SERVICE: budgetapp-api-service
   ECS_CLUSTER: budget-api-prod-cluster
   CONTAINER_NAME: budgetapp-api
@@ -35,8 +36,8 @@ jobs:
           IMAGE_TAG=${{ github.sha }}
           docker buildx build \
             --platform linux/amd64 \
-            -t ${{ env.ECR_REPOSITORY }}:$IMAGE_TAG \
-            -t ${{ env.ECR_REPOSITORY }}:latest \
+            -t ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:$IMAGE_TAG \
+            -t ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:latest \
             --push \
             .
 
