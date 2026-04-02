@@ -300,6 +300,7 @@ app.MapPost("/api/plaid/create_link_token", async (PlaidClient plaidClient, ICon
         User = user,
         Products = products,
         Webhook = config["Plaid:WebhookUrl"]
+        RedirectUri = "https://plaid-redirect.dynamicbudgetapp.com"
     };
 
     try
