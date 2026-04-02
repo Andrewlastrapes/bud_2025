@@ -2,7 +2,10 @@
  * debugLog.js
  * Intercepts console.log/warn/error globally and stores entries
  * so any screen can subscribe and display them for debugging.
+ * Also forwards errors/warnings to Sentry when initialized.
  */
+
+import * as Sentry from '@sentry/react-native';
 
 const MAX_LOGS = 80;
 const _logs = [];
@@ -45,13 +48,42 @@ console.log = (...args) => {
   _origLog(...args);
   _addLog('log', args);
 };
+
 console.warn = (...args) => {
   _origWarn(...args);
   _addLog('warn', args);
+  // Forward warnings to Sentry as breadcrumbs for context
+  try {
+    Sentry.addBreadcrumb({
+      category: 'console',
+      level: 'warning',
+      message: args
+        .map((a) => (typeof a === 'string' ? a : JSON.stringify(a)))
+        .join(' '),
+    });
+  } catch (_) {
+    // Sentry not yet initialized — safe to ignore
+  }
 };
+
 console.error = (...args) => {
   _origError(...args);
   _addLog('error', args);
+  // Forward errors to Sentry as captured messages
+  try {
+    const msg = args
+      .map((a) => (typeof a === 'string' ? a : JSON.stringify(a)))
+      .join(' ');
+    // If the first arg is an Error instance, use captureException for a full stack trace
+    const firstArg = args[0];
+    if (firstArg instanceof Error) {
+      Sentry.captureException(firstArg);
+    } else {
+      Sentry.captureMessage(msg, 'error');
+    }
+  } catch (_) {
+    // Sentry not yet initialized — safe to ignore
+  }
 };
 
 // ---- Public API ----

@@ -1,5 +1,17 @@
 // File: App.js
-// NOTE: debugLog must be imported FIRST so console is patched before anything else runs
+// NOTE: Sentry must be initialized FIRST, before any other imports render components.
+import * as Sentry from '@sentry/react-native';
+
+Sentry.init({
+  dsn: process.env.EXPO_PUBLIC_SENTRY_DSN,
+  tracesSampleRate: 1.0,
+  // Captures unhandled JS exceptions and promise rejections automatically.
+  enableNative: true,
+  // In development you may want to set debug: true to see Sentry logs in console.
+  debug: false,
+});
+
+// debugLog patches console — must come after Sentry.init so Sentry is ready
 import './config/debugLog';
 
 import React, { useState, useEffect } from 'react';
@@ -32,8 +44,7 @@ export const navigationRef = createNavigationContainerRef();
 
 
 // --- API Base URL ---
-import { API_BASE_URL } from './config/api'
-;
+import { API_BASE_URL } from './config/api';
 
 // --- Navigators ---
 const Stack = createNativeStackNavigator();
@@ -233,7 +244,7 @@ function MainContentNavigator({ fbUser }) {
         name="ReviewLargeExpenses"
         component={ReviewLargeExpensesScreen}
         options={{ title: 'Review Large Expenses' }}
-/>
+      />
 
 
       {/* Onboarding flow – only present while onboarding is incomplete */}
@@ -251,7 +262,7 @@ function MainContentNavigator({ fbUser }) {
 /**
  * Root app: gatekeeper on Firebase auth
  */
-export default function App() {
+function App() {
   const [fbUser, setFbUser] = useState(null);
   const [isLoading, setIsLoading] = useState(true);
 
@@ -260,8 +271,11 @@ export default function App() {
     const unsubscribe = onAuthStateChanged(auth, async (user) => {
       if (user) {
         console.log(`[Auth] User resolved: uid=${user.uid} email=${user.email}`);
+        // Tag Sentry events with the authenticated user
+        Sentry.setUser({ id: user.uid, email: user.email });
       } else {
         console.log('[Auth] No user — showing Login screen');
+        Sentry.setUser(null);
       }
       setFbUser(user);
       setIsLoading(false);
@@ -352,7 +366,22 @@ export default function App() {
   return (
     <SafeAreaProvider>
       <PaperProvider theme={DefaultTheme}>
-        <NavigationContainer ref={navigationRef}>
+        <NavigationContainer
+          ref={navigationRef}
+          onStateChange={(state) => {
+            // Add a Sentry breadcrumb on every navigation state change so
+            // crash reports include a trail of which screens the user visited.
+            if (!state) return;
+            const activeRoute = getActiveRouteName(state);
+            if (activeRoute) {
+              Sentry.addBreadcrumb({
+                category: 'navigation',
+                message: `Navigated to ${activeRoute}`,
+                level: 'info',
+              });
+            }
+          }}
+        >
           {isLoading ? (
             <LoadingScreen />
           ) : fbUser ? (
@@ -372,6 +401,16 @@ export default function App() {
   );
 }
 
+/**
+ * Recursively resolves the currently active route name from navigation state.
+ */
+function getActiveRouteName(state) {
+  if (!state || state.index == null) return null;
+  const route = state.routes[state.index];
+  if (route.state) return getActiveRouteName(route.state);
+  return route.name;
+}
+
 const styles = StyleSheet.create({
   loadingContainer: {
     flex: 1,
@@ -379,3 +418,6 @@ const styles = StyleSheet.create({
     alignItems: 'center',
   },
 });
+
+// Wrap with Sentry to capture unhandled JS errors at the root component level
+export default Sentry.wrap(App);
