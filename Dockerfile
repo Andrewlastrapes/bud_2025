@@ -33,9 +33,6 @@ RUN dotnet publish "BudgetApp.Api.csproj" -c Release -o /app/publish /p:UseAppHo
 FROM base AS final
 WORKDIR /app
 
-# 5) Copy the firebase service account JSON to where Program.cs expects it
-#    Program.cs uses: GoogleCredential.FromFile("firebase-service-account.json")
-COPY ./BudgetApp.Api/firebase-service-account.json ./firebase-service-account.json
 
 # 6) Copy the published app from the build stage
 COPY --from=build /app/publish .
