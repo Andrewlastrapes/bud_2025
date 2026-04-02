@@ -35,10 +35,15 @@ if (string.IsNullOrEmpty(System.Environment.GetEnvironmentVariable("ASPNETCORE_U
 
 try
 {
-    var serviceAccountJson = Environment.GetEnvironmentVariable("FIREBASE_SERVICE_ACCOUNT_JSON");
+    var serviceAccountJson = System.Environment.GetEnvironmentVariable("FIREBASE_SERVICE_ACCOUNT_JSON");
+
+    Console.WriteLine($"BOOT: FIREBASE JSON present: {!string.IsNullOrEmpty(serviceAccountJson)}");
+    Console.WriteLine($"BOOT: FIREBASE JSON length: {serviceAccountJson?.Length}");
 
     if (!string.IsNullOrEmpty(serviceAccountJson))
     {
+        Console.WriteLine("BOOT: Initializing Firebase from ENV...");
+
         FirebaseApp.Create(new AppOptions
         {
             Credential = GoogleCredential.FromJson(serviceAccountJson)
@@ -49,6 +54,9 @@ try
     else if (builder.Environment.IsDevelopment())
     {
         var firebasePath = "firebase-service-account.json";
+
+        Console.WriteLine($"BOOT: Dev mode. Checking file at: {firebasePath}");
+        Console.WriteLine($"BOOT: File exists: {File.Exists(firebasePath)}");
 
         if (!File.Exists(firebasePath))
         {
@@ -64,6 +72,7 @@ try
     }
     else
     {
+        Console.WriteLine("BOOT: ❌ No Firebase ENV var in production");
         throw new Exception("FIREBASE_SERVICE_ACCOUNT_JSON is required in production");
     }
 }
