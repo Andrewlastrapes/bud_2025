@@ -435,6 +435,7 @@ app.MapGet("/api/plaid/accounts", async (ApiDbContext dbContext, HttpContext htt
     catch (Exception e)
     {
         SentrySdk.CaptureException(e);
+        SentrySdk.CaptureException("Hellllo")
         return Results.Problem(e.Message);
     }
 })
