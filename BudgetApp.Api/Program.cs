@@ -17,17 +17,7 @@ using System.Text.Json;
 using Npgsql;
 using Sentry;
 
-// ─── Sentry: initialize immediately so boot-time errors are captured ───────────
-SentrySdk.Init(options =>
-{
-    // Reads Sentry:Dsn from appsettings / env var SENTRY_DSN automatically
-    options.Dsn = System.Environment.GetEnvironmentVariable("SENTRY_DSN")
-                  ?? string.Empty;
-    options.TracesSampleRate = 1.0;
-    options.MaxBreadcrumbs = 200;
-    options.IsGlobalModeEnabled = true; // required for non-web top-level init
-    options.Debug = false;
-});
+
 
 // --- App Setup ---
 var builder = WebApplication.CreateBuilder(args);
@@ -50,10 +40,12 @@ builder.WebHost.UseSentry(options =>
     options.Dsn = System.Environment.GetEnvironmentVariable("SENTRY_DSN")
                   ?? builder.Configuration["Sentry:Dsn"]
                   ?? string.Empty;
-    options.TracesSampleRate = 1.0;
+    options.TracesSampleRate = 0.1–0.3;
     options.MaxBreadcrumbs = 200;
     options.Debug = false;
 });
+
+Console.WriteLine($"SENTRY_DSN present: {!string.IsNullOrEmpty(Environment.GetEnvironmentVariable("SENTRY_DSN"))}");
 
 try
 {
