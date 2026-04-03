@@ -15,13 +15,26 @@ using FirebaseAdmin.Auth;
 using System.Text;
 using System.Text.Json;
 using Npgsql;
+using Sentry;
+
+// ─── Sentry: initialize immediately so boot-time errors are captured ───────────
+SentrySdk.Init(options =>
+{
+    // Reads Sentry:Dsn from appsettings / env var SENTRY_DSN automatically
+    options.Dsn = System.Environment.GetEnvironmentVariable("SENTRY_DSN")
+                  ?? string.Empty;
+    options.TracesSampleRate = 1.0;
+    options.MaxBreadcrumbs = 200;
+    options.IsGlobalModeEnabled = true; // required for non-web top-level init
+    options.Debug = false;
+});
 
 // --- App Setup ---
 var builder = WebApplication.CreateBuilder(args);
 
 // Simplified port configuration for AWS App Runner
 var port = System.Environment.GetEnvironmentVariable("PORT") ?? "8080";
-Console.WriteLine($"BOOT: Using port {port}");
+SentrySdk.AddBreadcrumb($"BOOT: Using port {port}", level: BreadcrumbLevel.Info);
 
 // Only set ASPNETCORE_URLS if not already set (Dockerfile may have set it)
 if (string.IsNullOrEmpty(System.Environment.GetEnvironmentVariable("ASPNETCORE_URLS")))
@@ -29,34 +42,45 @@ if (string.IsNullOrEmpty(System.Environment.GetEnvironmentVariable("ASPNETCORE_U
     System.Environment.SetEnvironmentVariable("ASPNETCORE_URLS", $"http://0.0.0.0:{port}");
 }
 
-
-
-
+// ─── Sentry ASP.NET Core integration ─────────────────────────────────────────
+// This hooks into the request pipeline, automatically capturing unhandled
+// exceptions and forwarding ILogger.LogError / LogWarning to Sentry.
+builder.WebHost.UseSentry(options =>
+{
+    options.Dsn = System.Environment.GetEnvironmentVariable("SENTRY_DSN")
+                  ?? builder.Configuration["Sentry:Dsn"]
+                  ?? string.Empty;
+    options.TracesSampleRate = 1.0;
+    options.MaxBreadcrumbs = 200;
+    options.Debug = false;
+});
 
 try
 {
     var serviceAccountJson = System.Environment.GetEnvironmentVariable("FIREBASE_SERVICE_ACCOUNT_JSON");
 
-    Console.WriteLine($"BOOT: FIREBASE JSON present: {!string.IsNullOrEmpty(serviceAccountJson)}");
-    Console.WriteLine($"BOOT: FIREBASE JSON length: {serviceAccountJson?.Length}");
+    SentrySdk.AddBreadcrumb(
+        $"BOOT: FIREBASE JSON present: {!string.IsNullOrEmpty(serviceAccountJson)}",
+        level: BreadcrumbLevel.Info);
 
     if (!string.IsNullOrEmpty(serviceAccountJson))
     {
-        Console.WriteLine("BOOT: Initializing Firebase from ENV...");
+        SentrySdk.AddBreadcrumb("BOOT: Initializing Firebase from ENV...", level: BreadcrumbLevel.Info);
 
         FirebaseApp.Create(new AppOptions
         {
             Credential = GoogleCredential.FromJson(serviceAccountJson)
         });
 
-        Console.WriteLine("BOOT: Firebase initialized from ENV");
+        SentrySdk.AddBreadcrumb("BOOT: Firebase initialized from ENV", level: BreadcrumbLevel.Info);
     }
     else if (builder.Environment.IsDevelopment())
     {
         var firebasePath = "firebase-service-account.json";
 
-        Console.WriteLine($"BOOT: Dev mode. Checking file at: {firebasePath}");
-        Console.WriteLine($"BOOT: File exists: {File.Exists(firebasePath)}");
+        SentrySdk.AddBreadcrumb(
+            $"BOOT: Dev mode. Checking file at: {firebasePath} — exists: {File.Exists(firebasePath)}",
+            level: BreadcrumbLevel.Info);
 
         if (!File.Exists(firebasePath))
         {
@@ -68,19 +92,17 @@ try
             Credential = GoogleCredential.FromFile(firebasePath)
         });
 
-        Console.WriteLine("BOOT: Firebase initialized from file (dev)");
+        SentrySdk.AddBreadcrumb("BOOT: Firebase initialized from file (dev)", level: BreadcrumbLevel.Info);
     }
     else
     {
-        Console.WriteLine("BOOT: ❌ No Firebase ENV var in production");
         throw new Exception("FIREBASE_SERVICE_ACCOUNT_JSON is required in production");
     }
 }
 catch (Exception ex)
 {
-    Console.WriteLine("BOOT: Firebase init FAILED:");
-    Console.WriteLine(ex.ToString());
-    throw; // ✅ ALWAYS crash
+    SentrySdk.CaptureException(ex);
+    throw; // always crash on Firebase init failure
 }
 
 // --- SERVICE CONFIGURATION ---
@@ -98,28 +120,31 @@ builder.Services.AddSingleton(new PlaidClient(
 ));
 
 
-Console.WriteLine("BOOT: startup begin");
+SentrySdk.AddBreadcrumb("BOOT: startup begin", level: BreadcrumbLevel.Info);
 
 var connectionString = builder.Configuration.GetConnectionString("DefaultConnection");
-Console.WriteLine($"BOOT: has DefaultConnection={!string.IsNullOrWhiteSpace(connectionString)}");
+SentrySdk.AddBreadcrumb(
+    $"BOOT: has DefaultConnection={!string.IsNullOrWhiteSpace(connectionString)}",
+    level: BreadcrumbLevel.Info);
 
 if (string.IsNullOrWhiteSpace(connectionString))
 {
-    Console.WriteLine("BOOT: Missing ConnectionStrings:DefaultConnection - Application cannot start");
-    throw new InvalidOperationException("Database connection string 'DefaultConnection' is required but not found in configuration. Please ensure the connection string is properly configured in appsettings or environment variables.");
+    var ex = new InvalidOperationException(
+        "Database connection string 'DefaultConnection' is required but not found in configuration.");
+    SentrySdk.CaptureException(ex);
+    throw ex;
 }
 
 try
 {
     var csb = new NpgsqlConnectionStringBuilder(connectionString);
-    Console.WriteLine($"BOOT: DB Host={csb.Host}");
-    Console.WriteLine($"BOOT: DB Port={csb.Port}");
-    Console.WriteLine($"BOOT: DB Name={csb.Database}");
-    Console.WriteLine($"BOOT: DB User={csb.Username}");
+    SentrySdk.AddBreadcrumb(
+        $"BOOT: DB Host={csb.Host} Port={csb.Port} Name={csb.Database} User={csb.Username}",
+        level: BreadcrumbLevel.Info);
 }
 catch (Exception ex)
 {
-    Console.WriteLine($"BOOT: connection string parse failed: {ex}");
+    SentrySdk.CaptureException(ex);
     throw new InvalidOperationException($"Invalid database connection string format: {ex.Message}");
 }
 
@@ -149,9 +174,9 @@ builder.Services.AddCors(options =>
 });
 
 // --- APP BUILD & MIDDLEWARE ---
-Console.WriteLine("BOOT: before builder.Build()");
+SentrySdk.AddBreadcrumb("BOOT: before builder.Build()", level: BreadcrumbLevel.Info);
 var app = builder.Build();
-Console.WriteLine("BOOT: after builder.Build()");
+SentrySdk.AddBreadcrumb("BOOT: after builder.Build()", level: BreadcrumbLevel.Info);
 
 
 
@@ -174,7 +199,7 @@ app.MapGet("/health", async (ApiDbContext dbContext) =>
     }
     catch (Exception ex)
     {
-        Console.WriteLine($"Health check failed: {ex.Message}");
+        SentrySdk.CaptureException(ex);
         return Results.Problem(detail: "Database connectivity failed", statusCode: 503);
     }
 });
@@ -216,18 +241,22 @@ app.MapPost("/api/users/register", async (ApiDbContext dbContext, HttpContext ht
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"Register: Firebase token verification failed: {ex.Message}");
+            SentrySdk.CaptureException(ex);
             return Results.Unauthorized();
         }
 
         var firebaseUid = decodedToken.Uid;
-        Console.WriteLine($"Register: uid={firebaseUid} email={requestBody.Email}");
+        SentrySdk.AddBreadcrumb(
+            $"Register: uid={firebaseUid} email={requestBody.Email}",
+            level: BreadcrumbLevel.Info);
 
         // --- Idempotent: return existing user if already registered ---
         var existingUser = await dbContext.Users.FirstOrDefaultAsync(u => u.FirebaseUuid == firebaseUid);
         if (existingUser != null)
         {
-            Console.WriteLine($"Register: user already exists id={existingUser.Id}");
+            SentrySdk.AddBreadcrumb(
+                $"Register: user already exists id={existingUser.Id}",
+                level: BreadcrumbLevel.Info);
             return Results.Ok(new
             {
                 message = "User already registered",
@@ -250,7 +279,9 @@ app.MapPost("/api/users/register", async (ApiDbContext dbContext, HttpContext ht
         await dbContext.Users.AddAsync(newUser);
         await dbContext.SaveChangesAsync();
 
-        Console.WriteLine($"Register: created user id={newUser.Id}");
+        SentrySdk.AddBreadcrumb(
+            $"Register: created user id={newUser.Id}",
+            level: BreadcrumbLevel.Info);
         return Results.Ok(new
         {
             message = "User registered successfully",
@@ -261,7 +292,7 @@ app.MapPost("/api/users/register", async (ApiDbContext dbContext, HttpContext ht
     }
     catch (Exception e)
     {
-        Console.WriteLine($"Register: exception {e.Message}");
+        SentrySdk.CaptureException(e);
         return Results.Problem($"Registration failed: {e.Message}");
     }
 })
@@ -279,6 +310,7 @@ app.MapGet("/api/plaid/categories", async (PlaidClient plaidClient) =>
     }
     catch (ApiException e)
     {
+        SentrySdk.CaptureException(e);
         return Results.Problem(e.Content);
     }
 })
@@ -318,7 +350,7 @@ app.MapPost("/api/plaid/create_link_token", async (PlaidClient plaidClient, ICon
     }
     catch (ApiException e)
     {
-        Console.WriteLine($"Plaid API Error: {e.Content}");
+        SentrySdk.CaptureException(e);
         return Results.Problem($"Plaid API Error: {e.Content}");
     }
 })
@@ -360,6 +392,7 @@ app.MapPost("/api/plaid/exchange_public_token",
         }
         catch (ApiException e)
         {
+            SentrySdk.CaptureException(e);
             return Results.Problem(e.Content);
         }
     })
@@ -401,6 +434,7 @@ app.MapGet("/api/plaid/accounts", async (ApiDbContext dbContext, HttpContext htt
     }
     catch (Exception e)
     {
+        SentrySdk.CaptureException(e);
         return Results.Problem(e.Message);
     }
 })
@@ -427,6 +461,7 @@ app.MapGet("/api/balance", async (ApiDbContext dbContext, HttpContext httpContex
     }
     catch (Exception e)
     {
+        SentrySdk.CaptureException(e);
         return Results.Problem(e.Message);
     }
 })
@@ -472,6 +507,7 @@ app.MapPost("/api/balance", async (ApiDbContext dbContext, HttpContext httpConte
     }
     catch (Exception e)
     {
+        SentrySdk.CaptureException(e);
         return Results.Problem(e.Message);
     }
 })
@@ -504,9 +540,21 @@ app.MapPost("/api/transactions/sync", async (ITransactionService transactionServ
             hasMore = response.HasMore
         });
     }
-    catch (UnauthorizedAccessException) { return Results.Unauthorized(); }
-    catch (InvalidOperationException e) { return Results.Problem(e.Message); }
-    catch (Exception e) { return Results.Problem(e.Message); }
+    catch (UnauthorizedAccessException e)
+    {
+        SentrySdk.CaptureException(e);
+        return Results.Unauthorized();
+    }
+    catch (InvalidOperationException e)
+    {
+        SentrySdk.CaptureException(e);
+        return Results.Problem(e.Message);
+    }
+    catch (Exception e)
+    {
+        SentrySdk.CaptureException(e);
+        return Results.Problem(e.Message);
+    }
 })
 .WithName("SyncTransactions")
 .WithOpenApi();
@@ -534,6 +582,7 @@ app.MapGet("/api/transactions", async (ApiDbContext dbContext, HttpContext httpC
     }
     catch (Exception e)
     {
+        SentrySdk.CaptureException(e);
         return Results.Problem(e.Message);
     }
 })
@@ -564,6 +613,7 @@ app.MapGet("/api/fixed-costs", async (ApiDbContext dbContext, HttpContext httpCo
     }
     catch (Exception e)
     {
+        SentrySdk.CaptureException(e);
         return Results.Problem(e.Message);
     }
 })
@@ -604,6 +654,7 @@ app.MapPost("/api/fixed-costs", async (ApiDbContext dbContext, HttpContext httpC
     }
     catch (Exception e)
     {
+        SentrySdk.CaptureException(e);
         return Results.Problem(e.Message);
     }
 })
@@ -635,6 +686,7 @@ app.MapDelete("/api/fixed-costs/{id}", async (ApiDbContext dbContext, HttpContex
     }
     catch (Exception e)
     {
+        SentrySdk.CaptureException(e);
         return Results.Problem(e.Message);
     }
 })
@@ -673,6 +725,7 @@ app.MapGet("/api/users/profile", async (ApiDbContext dbContext, HttpContext http
     }
     catch (Exception e)
     {
+        SentrySdk.CaptureException(e);
         return Results.Problem($"Error fetching profile: {e.Message}");
     }
 })
@@ -709,6 +762,7 @@ app.MapGet("/api/plaid/recurring", async (ApiDbContext dbContext, PlaidClient pl
     }
     catch (Exception e)
     {
+        SentrySdk.CaptureException(e);
         return Results.Problem(e.Message);
     }
 })
@@ -834,13 +888,13 @@ app.MapPost("/api/budget/finalize", async (ApiDbContext dbContext, HttpContext h
     }
     catch (Exception e)
     {
+        SentrySdk.CaptureException(e);
         return Results.Problem($"Finalization failed: {e.Message}");
     }
 })
 .WithName("FinalizeBudget")
 .WithOpenApi();
 
-// POST: /api/plaid/webhook
 // POST: /api/plaid/webhook
 app.MapPost("/api/plaid/webhook", async (
     ITransactionService transactionService,
@@ -854,7 +908,9 @@ app.MapPost("/api/plaid/webhook", async (
          requestBody.WebhookCode != "INITIAL_UPDATE" &&
          requestBody.WebhookCode != "TRANSACTIONS_REMOVED"))
     {
-        Console.WriteLine($"Ignoring webhook: type={requestBody.WebhookType}, code={requestBody.WebhookCode}");
+        SentrySdk.AddBreadcrumb(
+            $"Ignoring webhook: type={requestBody.WebhookType}, code={requestBody.WebhookCode}",
+            level: BreadcrumbLevel.Info);
         return Results.Ok(new { message = "Webhook received, no action needed for this type." });
     }
 
@@ -867,14 +923,18 @@ app.MapPost("/api/plaid/webhook", async (
         var item = await dbContext.PlaidItems.FirstOrDefaultAsync(p => p.ItemId == requestBody.ItemId);
         if (item == null)
         {
-            Console.WriteLine($"Webhook: PlaidItem not found for itemId={requestBody.ItemId}");
+            SentrySdk.AddBreadcrumb(
+                $"Webhook: PlaidItem not found for itemId={requestBody.ItemId}",
+                level: BreadcrumbLevel.Warning);
             return Results.Ok(new { message = "Item not found after sync." });
         }
 
         var user = await dbContext.Users.FirstOrDefaultAsync(u => u.Id == item.UserId);
         if (user == null)
         {
-            Console.WriteLine($"Webhook: user not found for itemId={requestBody.ItemId}, userId={item.UserId}");
+            SentrySdk.AddBreadcrumb(
+                $"Webhook: user not found for itemId={requestBody.ItemId}, userId={item.UserId}",
+                level: BreadcrumbLevel.Warning);
             return Results.Ok(new { message = "User not found; no notification sent." });
         }
 
@@ -908,7 +968,7 @@ app.MapPost("/api/plaid/webhook", async (
             }).ToArray();
 
             var json = JsonSerializer.Serialize(payloads);
-            var request = new HttpRequestMessage(
+            var pushRequest = new HttpRequestMessage(
                 HttpMethod.Post,
                 "https://exp.host/--/api/v2/push/send"
             )
@@ -916,12 +976,16 @@ app.MapPost("/api/plaid/webhook", async (
                 Content = new StringContent(json, Encoding.UTF8, "application/json")
             };
 
-            var expoResponse = await client.SendAsync(request);
-            Console.WriteLine($"Expo push response: {expoResponse.StatusCode}");
+            var expoResponse = await client.SendAsync(pushRequest);
+            SentrySdk.AddBreadcrumb(
+                $"Expo push response: {expoResponse.StatusCode}",
+                level: BreadcrumbLevel.Info);
         }
         else
         {
-            Console.WriteLine($"Webhook: no active devices for userId={user.Id}, skipping push.");
+            SentrySdk.AddBreadcrumb(
+                $"Webhook: no active devices for userId={user.Id}, skipping push.",
+                level: BreadcrumbLevel.Info);
         }
 
         return Results.Ok(new
@@ -932,7 +996,12 @@ app.MapPost("/api/plaid/webhook", async (
     }
     catch (Exception e)
     {
-        Console.WriteLine($"WEBHOOK FAILED PROCESSING for Item {requestBody.ItemId}: {e.Message}");
+        SentrySdk.CaptureException(e, scope =>
+        {
+            scope.SetTag("webhook.itemId", requestBody.ItemId ?? "unknown");
+            scope.SetTag("webhook.type", requestBody.WebhookType ?? "unknown");
+            scope.SetTag("webhook.code", requestBody.WebhookCode ?? "unknown");
+        });
         return Results.Ok(new { message = "Processing failed internally, but response sent." });
     }
 })
@@ -967,6 +1036,7 @@ app.MapGet("/api/transactions/deposits/pending", async (ApiDbContext dbContext, 
     }
     catch (Exception e)
     {
+        SentrySdk.CaptureException(e);
         return Results.Problem(e.Message);
     }
 })
@@ -1059,7 +1129,7 @@ app.MapPost("/api/transactions/{id}/decision", async (int id, UpdateTransactionD
                     break;
 
                 case TransactionUserDecision.LargeExpenseFromSavings:
-                    // Refund this period’s dynamic balance, but only once.
+                    // Refund this period's dynamic balance, but only once.
                     if (!tx.LargeExpenseHandled && balance != null)
                     {
                         balance.BalanceAmount += tx.Amount;
@@ -1079,8 +1149,6 @@ app.MapPost("/api/transactions/{id}/decision", async (int id, UpdateTransactionD
                     }
 
                     // 2) Create a FixedCost for future periods
-                    //    If the client passed a specific installment amount, use it.
-                    //    Otherwise, fall back to a simple 4-period split.
                     decimal installmentAmount;
 
                     if (body.FixedCostAmount.HasValue && body.FixedCostAmount.Value > 0)
@@ -1129,7 +1197,6 @@ app.MapPost("/api/transactions/{id}/decision", async (int id, UpdateTransactionD
             }
         }
         // Non-deposit, non-large-expense: we just record whatever they chose.
-        // (This should be rare, mostly defensive.)
         else
         {
             // For now, we don't change the balance at all in this branch.
@@ -1152,6 +1219,7 @@ app.MapPost("/api/transactions/{id}/decision", async (int id, UpdateTransactionD
     }
     catch (Exception e)
     {
+        SentrySdk.CaptureException(e);
         return Results.Problem(e.Message);
     }
 })
@@ -1181,6 +1249,7 @@ app.MapGet("/api/transactions/large-expenses/pending", async (ApiDbContext dbCon
     }
     catch (Exception e)
     {
+        SentrySdk.CaptureException(e);
         return Results.Problem(e.Message);
     }
 })
@@ -1290,6 +1359,7 @@ app.MapPost("/api/transactions/{id}/large-expense-decision",
     }
     catch (Exception e)
     {
+        SentrySdk.CaptureException(e);
         return Results.Problem(e.Message);
     }
 })
@@ -1343,6 +1413,7 @@ app.MapPost("/api/notifications/register-device",
         }
         catch (Exception e)
         {
+            SentrySdk.CaptureException(e);
             return Results.Problem(e.Message);
         }
     })
@@ -1396,8 +1467,8 @@ app.MapPost("/api/transactions/{id}/mark-recurring",
             UserId = user.Id,
             Name = fixedCostName,
             Amount = tx.Amount,
-            Category = "Recurring",          // you can tweak categories later
-            Type = "from_transaction",      // so we know where it came from
+            Category = "Recurring",
+            Type = "from_transaction",
             PlaidMerchantName = tx.MerchantName,
             PlaidAccountId = tx.AccountId,
             UserHasApproved = true,
@@ -1420,6 +1491,7 @@ app.MapPost("/api/transactions/{id}/mark-recurring",
     }
     catch (Exception e)
     {
+        SentrySdk.CaptureException(e);
         return Results.Problem(e.Message);
     }
 })
@@ -1464,7 +1536,7 @@ app.MapGet("/api/debt/snapshot", async (ApiDbContext dbContext, PlaidClient plai
 
             foreach (var acct in resp.Accounts)
             {
-                // Only care about credit accounts for “debt”
+                // Only care about credit accounts for "debt"
                 if (acct.Type != AccountType.Credit) continue;
 
                 var bal = acct.Balances.Current ?? 0m;
@@ -1492,6 +1564,7 @@ app.MapGet("/api/debt/snapshot", async (ApiDbContext dbContext, PlaidClient plai
     }
     catch (Exception e)
     {
+        SentrySdk.CaptureException(e);
         return Results.Problem(e.Message);
     }
 })
@@ -1503,29 +1576,27 @@ app.MapGet("/api/debt/snapshot", async (ApiDbContext dbContext, PlaidClient plai
 
 app.Lifetime.ApplicationStarted.Register(() =>
 {
-    Console.WriteLine("BOOT: ApplicationStarted fired");
+    SentrySdk.AddBreadcrumb("BOOT: ApplicationStarted fired", level: BreadcrumbLevel.Info);
 });
 
 app.Lifetime.ApplicationStopping.Register(() =>
 {
-    Console.WriteLine("BOOT: ApplicationStopping fired");
+    SentrySdk.AddBreadcrumb("BOOT: ApplicationStopping fired", level: BreadcrumbLevel.Info);
 });
 
 app.Lifetime.ApplicationStopped.Register(() =>
 {
-    Console.WriteLine("BOOT: ApplicationStopped fired");
+    SentrySdk.AddBreadcrumb("BOOT: ApplicationStopped fired", level: BreadcrumbLevel.Info);
 });
 
-Console.WriteLine("BOOT: before app.Run()");
+SentrySdk.AddBreadcrumb("BOOT: before app.Run()", level: BreadcrumbLevel.Info);
 
 
 
 // --- RUN THE APP ---
 app.Run();
 
-// --- TYPE DECLARATIONS (if you still keep them here) ---
-
-// Used for POST /api/users/register
+// --- TYPE DECLARATIONS ---
 
 public record MarkRecurringFromTransactionRequest(
     DateTime? FirstDueDate  // optional override; can be null for now
@@ -1534,4 +1605,3 @@ public record MarkRecurringFromTransactionRequest(
 
 
 public record RegisterDeviceRequest(string ExpoPushToken, string? Platform);
-

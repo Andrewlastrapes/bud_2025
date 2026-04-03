@@ -2,6 +2,7 @@ using BudgetApp.Api.Data;
 using Microsoft.EntityFrameworkCore;
 using Going.Plaid;
 using Going.Plaid.Transactions;
+using Sentry;
 
 namespace BudgetApp.Api.Services
 {
@@ -177,9 +178,7 @@ namespace BudgetApp.Api.Services
                     }
                     catch (Exception ex)
                     {
-                        Console.WriteLine(
-                            $"Failed to send notification for tx {tx.Id}: {ex.Message}"
-                        );
+                        SentrySdk.CaptureException(ex);
                     }
                 }
 
