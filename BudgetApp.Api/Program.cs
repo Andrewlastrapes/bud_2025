@@ -45,7 +45,7 @@ builder.WebHost.UseSentry(options =>
     options.Debug = false;
 });
 
-Console.WriteLine($"SENTRY_DSN present: {!string.IsNullOrEmpty(Environment.GetEnvironmentVariable("SENTRY_DSN"))}");
+Console.WriteLine($"SENTRY_DSN present: {!string.IsNullOrEmpty(System.Environment.GetEnvironmentVariable("SENTRY_DSN"))}");
 
 try
 {
