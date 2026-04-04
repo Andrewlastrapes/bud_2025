@@ -35,14 +35,15 @@ if (string.IsNullOrEmpty(System.Environment.GetEnvironmentVariable("ASPNETCORE_U
 // ─── Sentry ASP.NET Core integration ─────────────────────────────────────────
 // This hooks into the request pipeline, automatically capturing unhandled
 // exceptions and forwarding ILogger.LogError / LogWarning to Sentry.
-builder.WebHost.UseSentry(options =>
+builder.WebHost.UseSentry(o =>
 {
-    options.Dsn = System.Environment.GetEnvironmentVariable("SENTRY_DSN")
-                  ?? builder.Configuration["Sentry:Dsn"]
-                  ?? string.Empty;
-    options.TracesSampleRate = 1;
-    options.MaxBreadcrumbs = 200;
-    options.Debug = false;
+    o.Dsn = System.Environment.GetEnvironmentVariable("SENTRY_DSN")
+            ?? builder.Configuration["Sentry:Dsn"]
+            ?? string.Empty;
+    o.TracesSampleRate = 1.0;
+    o.MaxBreadcrumbs = 200;
+    // Set to false once you've confirmed events appear in the Sentry dashboard
+    o.Debug = true;
 });
 
 Console.WriteLine($"SENTRY_DSN present: {!string.IsNullOrEmpty(System.Environment.GetEnvironmentVariable("SENTRY_DSN"))}");
@@ -169,6 +170,9 @@ builder.Services.AddCors(options =>
 SentrySdk.AddBreadcrumb("BOOT: before builder.Build()", level: BreadcrumbLevel.Info);
 var app = builder.Build();
 SentrySdk.AddBreadcrumb("BOOT: after builder.Build()", level: BreadcrumbLevel.Info);
+
+// Verification — confirms DSN is wired correctly. Remove after first successful deploy.
+SentrySdk.CaptureMessage("Hello Sentry — BudgetApp.Api started");
 
 
 
@@ -427,7 +431,6 @@ app.MapGet("/api/plaid/accounts", async (ApiDbContext dbContext, HttpContext htt
     catch (Exception e)
     {
         SentrySdk.CaptureException(e);
-        SentrySdk.CaptureMessage("Sentry backend is alive");        
         return Results.Problem(e.Message);
     }
 })
