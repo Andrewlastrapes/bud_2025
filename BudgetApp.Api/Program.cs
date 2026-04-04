@@ -40,7 +40,7 @@ builder.WebHost.UseSentry(options =>
     options.Dsn = System.Environment.GetEnvironmentVariable("SENTRY_DSN")
                   ?? builder.Configuration["Sentry:Dsn"]
                   ?? string.Empty;
-    options.TracesSampleRate = 0.1–0.3;
+    options.TracesSampleRate = 1;
     options.MaxBreadcrumbs = 200;
     options.Debug = false;
 });
