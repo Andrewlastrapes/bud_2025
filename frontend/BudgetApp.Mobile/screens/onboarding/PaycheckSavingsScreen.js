@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { View, StyleSheet, Alert } from 'react-native';
+import { View, StyleSheet, Alert, Keyboard, TouchableWithoutFeedback } from 'react-native';
 import { Text, TextInput, Button, ActivityIndicator } from 'react-native-paper';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import axios from 'axios';
@@ -106,6 +106,7 @@ export default function PaycheckSavingsScreen({ navigation }) {
     };
 
     return (
+        <TouchableWithoutFeedback onPress={Keyboard.dismiss} accessible={false}>
         <SafeAreaView style={styles.container}>
             <Text style={styles.header}>Paycheck & Timeline (4/5)</Text>
 
@@ -146,6 +147,7 @@ export default function PaycheckSavingsScreen({ navigation }) {
                 Finalize My Dynamic Budget
             </Button>
         </SafeAreaView>
+        </TouchableWithoutFeedback>
     );
 }
 
