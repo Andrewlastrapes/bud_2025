@@ -221,7 +221,8 @@ app.MapPost("/api/users/register", async (ApiDbContext dbContext, HttpContext ht
 {
     try
     {
-;
+
+        SentrySdk.CaptureMessage("register Endpoint hit");
 
         // --- Verify Firebase token and derive UID ---
         string? idToken = httpContext.Request.Headers["Authorization"]
