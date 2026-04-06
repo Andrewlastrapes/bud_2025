@@ -360,6 +360,7 @@ app.MapPost("/api/plaid/exchange_public_token",
     async (PlaidClient plaidClient, ApiDbContext dbContext, ExchangeTokenRequest requestBody) =>
     {
         Console.WriteLine("🚀 HIT /exchange_public_token");
+        SentrySdk.CaptureMessage("exhange public token endpoint hit.s");
 
         using (SentrySdk.PushScope())
         {
@@ -381,6 +382,8 @@ app.MapPost("/api/plaid/exchange_public_token",
                 // --- STEP 1: Plaid exchange ---
                 Console.WriteLine("➡️ Calling Plaid exchange...");
                 SentrySdk.AddBreadcrumb("Calling Plaid exchange");
+                SentrySdk.CaptureMessage("Calling plaid exchannge");
+
 
                 var plaidRequest = new ItemPublicTokenExchangeRequest
                 {
@@ -392,6 +395,7 @@ app.MapPost("/api/plaid/exchange_public_token",
                 Console.WriteLine("✅ Plaid exchange success");
                 Console.WriteLine($"📦 ItemId: {response.ItemId}");
                 Console.WriteLine($"📦 Has AccessToken: {!string.IsNullOrEmpty(response.AccessToken)}");
+                SentrySdk.CaptureMessage("asdfaseasdafd");
 
                 SentrySdk.AddBreadcrumb("Plaid exchange success");
 
@@ -404,6 +408,8 @@ app.MapPost("/api/plaid/exchange_public_token",
                 // --- STEP 2: Find user ---
                 Console.WriteLine("➡️ Looking up user...");
                 SentrySdk.AddBreadcrumb("Looking up user");
+                SentrySdk.CaptureMessage("Looking up user");
+
 
                 var user = await dbContext.Users
                     .FirstOrDefaultAsync(u => u.FirebaseUuid == requestBody.FirebaseUuid);
