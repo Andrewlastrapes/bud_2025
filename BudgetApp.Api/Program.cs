@@ -984,7 +984,6 @@ app.MapPost("/api/budget/finalize", async (ApiDbContext dbContext, HttpContext h
 app.MapPost("/api/plaid/webhook", async (
     ITransactionService transactionService,
     ApiDbContext dbContext,
-    IHttpClientFactory httpClientFactory,
     PlaidWebhookRequest requestBody) =>
 {
     // Only care about Transactions webhooks that indicate new/changed data
@@ -1001,77 +1000,14 @@ app.MapPost("/api/plaid/webhook", async (
 
     try
     {
-        // 1) Sync & classify transactions (this updates dynamic balance + large expense flags)
+        // Sync & classify transactions.
+        // TransactionService.SyncAndProcessTransactions handles all per-transaction
+        // push notifications via ExpoNotificationService — no duplicate push needed here.
         var syncResponse = await transactionService.SyncAndProcessTransactions(requestBody.ItemId);
 
-        // 2) Find the Plaid item and user
-        var item = await dbContext.PlaidItems.FirstOrDefaultAsync(p => p.ItemId == requestBody.ItemId);
-        if (item == null)
-        {
-            SentrySdk.AddBreadcrumb(
-                $"Webhook: PlaidItem not found for itemId={requestBody.ItemId}",
-                level: BreadcrumbLevel.Warning);
-            return Results.Ok(new { message = "Item not found after sync." });
-        }
-
-        var user = await dbContext.Users.FirstOrDefaultAsync(u => u.Id == item.UserId);
-        if (user == null)
-        {
-            SentrySdk.AddBreadcrumb(
-                $"Webhook: user not found for itemId={requestBody.ItemId}, userId={item.UserId}",
-                level: BreadcrumbLevel.Warning);
-            return Results.Ok(new { message = "User not found; no notification sent." });
-        }
-
-        var balance = await dbContext.Balances.FirstOrDefaultAsync(b => b.UserId == user.Id);
-        var remaining = balance?.BalanceAmount ?? 0m;
-
-        // 3) Get all active devices for this user
-        var deviceTokens = await dbContext.UserDevices
-            .Where(d => d.UserId == user.Id && d.IsActive && d.ExpoPushToken != null)
-            .Select(d => d.ExpoPushToken!)
-            .ToListAsync();
-
-        if (deviceTokens.Any())
-        {
-            var client = httpClientFactory.CreateClient();
-
-            var messageBody =
-                $"Your period spend limit has been updated. Current remaining: {remaining:0.00}";
-
-            var payloads = deviceTokens.Select(token => new
-            {
-                to = token,
-                title = "Dynamic budget updated",
-                body = messageBody,
-                data = new
-                {
-                    type = "transactions_sync",
-                    hasNewTransactions = syncResponse.Added.Count > 0,
-                    dynamicBalance = remaining
-                }
-            }).ToArray();
-
-            var json = JsonSerializer.Serialize(payloads);
-            var pushRequest = new HttpRequestMessage(
-                HttpMethod.Post,
-                "https://exp.host/--/api/v2/push/send"
-            )
-            {
-                Content = new StringContent(json, Encoding.UTF8, "application/json")
-            };
-
-            var expoResponse = await client.SendAsync(pushRequest);
-            SentrySdk.AddBreadcrumb(
-                $"Expo push response: {expoResponse.StatusCode}",
-                level: BreadcrumbLevel.Info);
-        }
-        else
-        {
-            SentrySdk.AddBreadcrumb(
-                $"Webhook: no active devices for userId={user.Id}, skipping push.",
-                level: BreadcrumbLevel.Info);
-        }
+        SentrySdk.AddBreadcrumb(
+            $"Webhook: sync complete, added={syncResponse.Added.Count} itemId={requestBody.ItemId}",
+            level: BreadcrumbLevel.Info);
 
         return Results.Ok(new
         {
