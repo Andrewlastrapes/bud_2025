@@ -172,7 +172,7 @@ var app = builder.Build();
 SentrySdk.AddBreadcrumb("BOOT: after builder.Build()", level: BreadcrumbLevel.Info);
 
 // Verification — confirms DSN is wired correctly. Remove after first successful deploy.
-SentrySdk.CaptureMessage("Hello Sentry — BudgetApp.Api started");
+SentrySdk.CaptureMessage("Hello Sentry — BudgetApp.Api started, and this is new");
 
 
 
