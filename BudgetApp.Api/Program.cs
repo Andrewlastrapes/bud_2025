@@ -353,53 +353,128 @@ app.MapPost("/api/plaid/create_link_token", async (PlaidClient plaidClient, ICon
 .WithName("CreateLinkToken")
 .WithOpenApi();
 
-// POST: /api/plaid/exchange_public_token
 app.MapPost("/api/plaid/exchange_public_token",
     async (PlaidClient plaidClient, ApiDbContext dbContext, ExchangeTokenRequest requestBody) =>
     {
-        var plaidRequest = new ItemPublicTokenExchangeRequest { PublicToken = requestBody.PublicToken };
+        Console.WriteLine("🚀 HIT /exchange_public_token");
 
-        try
+        using (SentrySdk.PushScope())
         {
-            var response = await plaidClient.ItemPublicTokenExchangeAsync(plaidRequest);
-
-            var user = await dbContext.Users.FirstOrDefaultAsync(u => u.FirebaseUuid == requestBody.FirebaseUuid);
-
-            if (user == null)
+            SentrySdk.ConfigureScope(scope =>
             {
-                return Results.NotFound(new { message = "User not found." });
+                scope.SetTag("endpoint", "exchange_public_token");
+
+                scope.SetExtra("firebaseUuid", requestBody.FirebaseUuid ?? "null");
+                scope.SetExtra("hasPublicToken", !string.IsNullOrEmpty(requestBody.PublicToken));
+            });
+
+            SentrySdk.AddBreadcrumb("START exchange_public_token");
+
+            Console.WriteLine($"📥 FirebaseUuid: {requestBody.FirebaseUuid}");
+            Console.WriteLine($"📥 Has PublicToken: {!string.IsNullOrEmpty(requestBody.PublicToken)}");
+
+            try
+            {
+                // --- STEP 1: Plaid exchange ---
+                Console.WriteLine("➡️ Calling Plaid exchange...");
+                SentrySdk.AddBreadcrumb("Calling Plaid exchange");
+
+                var plaidRequest = new ItemPublicTokenExchangeRequest
+                {
+                    PublicToken = requestBody.PublicToken
+                };
+
+                var response = await plaidClient.ItemPublicTokenExchangeAsync(plaidRequest);
+
+                Console.WriteLine("✅ Plaid exchange success");
+                Console.WriteLine($"📦 ItemId: {response.ItemId}");
+                Console.WriteLine($"📦 Has AccessToken: {!string.IsNullOrEmpty(response.AccessToken)}");
+
+                SentrySdk.AddBreadcrumb("Plaid exchange success");
+
+                SentrySdk.ConfigureScope(scope =>
+                {
+                    scope.SetExtra("plaid_item_id", response.ItemId);
+                    scope.SetExtra("has_access_token", !string.IsNullOrEmpty(response.AccessToken));
+                });
+
+                // --- STEP 2: Find user ---
+                Console.WriteLine("➡️ Looking up user...");
+                SentrySdk.AddBreadcrumb("Looking up user");
+
+                var user = await dbContext.Users
+                    .FirstOrDefaultAsync(u => u.FirebaseUuid == requestBody.FirebaseUuid);
+
+                if (user == null)
+                {
+                    Console.WriteLine("❌ USER NOT FOUND");
+
+                    SentrySdk.CaptureMessage("USER NOT FOUND", scope =>
+                    {
+                        scope.Level = SentryLevel.Error;
+                        scope.SetExtra("firebaseUuid", requestBody.FirebaseUuid);
+                    });
+
+                    return Results.NotFound(new { message = "User not found." });
+                }
+
+                Console.WriteLine($"✅ User found: {user.Id}");
+                SentrySdk.AddBreadcrumb($"User found: {user.Id}");
+
+                // --- STEP 3: Save item ---
+                Console.WriteLine("➡️ Creating PlaidItem...");
+
+                var newItem = new PlaidItem
+                {
+                    UserId = user.Id,
+                    AccessToken = response.AccessToken,
+                    ItemId = response.ItemId,
+                    InstitutionName = "New Institution",
+                    InstitutionLogo = null,
+                    CreatedAt = DateTime.UtcNow,
+                    UpdatedAt = DateTime.UtcNow
+                };
+
+                Console.WriteLine("➡️ Adding to DB...");
+                SentrySdk.AddBreadcrumb("Adding PlaidItem to DB");
+
+                await dbContext.PlaidItems.AddAsync(newItem);
+
+                Console.WriteLine("➡️ Saving DB changes...");
+                SentrySdk.AddBreadcrumb("Saving DB changes");
+
+                await dbContext.SaveChangesAsync();
+
+                Console.WriteLine("✅ DB save success");
+                SentrySdk.AddBreadcrumb("DB save success");
+
+                SentrySdk.CaptureMessage("exchange_public_token SUCCESS");
+
+                Console.WriteLine("🎉 ENDPOINT SUCCESS");
+
+                return Results.Ok(new { message = "Public token exchanged and saved successfully." });
             }
-
-            var newItem = new PlaidItem
+            catch (ApiException e)
             {
-                UserId = user.Id,
-                AccessToken = response.AccessToken,
-                ItemId = response.ItemId,
-                InstitutionName = "New Institution",
-                InstitutionLogo = null,
-                CreatedAt = DateTime.UtcNow,
-                UpdatedAt = DateTime.UtcNow
-            };
+                Console.WriteLine("💥 PLAID ERROR");
+                Console.WriteLine(e.Message);
+                Console.WriteLine(e.Content);
 
-            await dbContext.PlaidItems.AddAsync(newItem);
-            await dbContext.SaveChangesAsync();
-
-            return Results.Ok(new { message = "Public token exchanged and saved successfully." });
-        }
-        catch (ApiException e)
-            {
                 SentrySdk.CaptureException(e);
-                return Results.Problem(e.Content);
+
+                return Results.Problem($"Plaid error: {e.Content}");
             }
             catch (Exception e)
             {
+                Console.WriteLine("💥 UNKNOWN ERROR");
+                Console.WriteLine(e.ToString());
+
                 SentrySdk.CaptureException(e);
+
                 return Results.Problem("Unexpected error occurred.");
             }
-                })
-            .WithName("ExchangePublicToken")
-            .WithOpenApi();
-
+        }
+    });
 // GET: /api/plaid/accounts
 app.MapGet("/api/plaid/accounts", async (ApiDbContext dbContext, HttpContext httpContext) =>
 {
