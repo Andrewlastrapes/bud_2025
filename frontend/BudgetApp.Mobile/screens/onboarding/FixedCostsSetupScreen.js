@@ -23,11 +23,26 @@ const getNextMonthFirstDay = () => {
 
 // --- Utility: Safely convert date string to ISO string ---
 const getISODate = (dateString, fieldName = 'Date') => {
-    if (!dateString) return null;
-    const date = new Date(dateString);
-    if (isNaN(date.getTime())) {
+    if (!dateString || !dateString.trim()) return null;
+
+    const parts = dateString.split('/');
+    if (parts.length !== 3) {
         throw new Error(`Invalid date format for ${fieldName}. Please use MM/DD/YYYY.`);
     }
+
+    const [month, day, year] = parts.map(Number);
+
+    const date = new Date(year, month - 1, day);
+
+    // Validate correctness (handles 02/30, etc.)
+    if (
+        date.getFullYear() !== year ||
+        date.getMonth() !== month - 1 ||
+        date.getDate() !== day
+    ) {
+        throw new Error(`Invalid date format for ${fieldName}. Please use MM/DD/YYYY.`);
+    }
+
     return date.toISOString();
 };
 
