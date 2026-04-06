@@ -387,13 +387,18 @@ app.MapPost("/api/plaid/exchange_public_token",
             return Results.Ok(new { message = "Public token exchanged and saved successfully." });
         }
         catch (ApiException e)
-        {
-            SentrySdk.CaptureException(e);
-            return Results.Problem(e.Content);
-        }
-    })
-.WithName("ExchangePublicToken")
-.WithOpenApi();
+            {
+                SentrySdk.CaptureException(e);
+                return Results.Problem(e.Content);
+            }
+            catch (Exception e)
+            {
+                SentrySdk.CaptureException(e);
+                return Results.Problem("Unexpected error occurred.");
+            }
+                })
+            .WithName("ExchangePublicToken")
+            .WithOpenApi();
 
 // GET: /api/plaid/accounts
 app.MapGet("/api/plaid/accounts", async (ApiDbContext dbContext, HttpContext httpContext) =>
