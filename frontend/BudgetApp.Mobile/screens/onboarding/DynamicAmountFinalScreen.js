@@ -21,6 +21,7 @@ export default function DynamicAmountFinalScreen({ navigation, route }) {
     dynamicSpendableAmount, // legacy alias
     paycheckAmount,
     fixedCostsRemaining,
+    baseRemaining,          // paycheck - fixedCosts (before debt/savings)
     debtPerPaycheck,
     savingsContribution,
     explanation,
@@ -128,6 +129,19 @@ export default function DynamicAmountFinalScreen({ navigation, route }) {
                 value={fixedCostsRemaining}
                 isDeduction
               />
+            )}
+
+            {/* Show base remaining as a subtotal if we have it */}
+            {baseRemaining != null && (parseFloat(debtPerPaycheck) > 0 || parseFloat(savingsContribution) > 0) && (
+              <>
+                <Divider style={[styles.divider, { marginVertical: 6 }]} />
+                <BreakdownRow
+                  label="Before debt & savings"
+                  value={baseRemaining}
+                  isPositive={parseFloat(baseRemaining) >= 0}
+                />
+                <Divider style={[styles.divider, { marginVertical: 6 }]} />
+              </>
             )}
 
             {parseFloat(debtPerPaycheck) > 0 && (

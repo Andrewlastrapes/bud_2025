@@ -86,7 +86,7 @@ namespace BudgetApp.Api.Tests
         }
     }
 
-    // ─── New: Pay Cycle Calculation ────────────────────────────────────────────
+    // ─── Pay Cycle Calculation ────────────────────────────────────────────────
 
     public class PayCycleCalculationTests
     {
@@ -95,7 +95,6 @@ namespace BudgetApp.Api.Tests
         [Fact]
         public void CalculatePreviousPaycheckDate_NextIsSecondDay_ReturnsSameMonthFirstDay()
         {
-            // Pay days: 1 and 15. Next paycheck is the 15th → previous is the 1st same month.
             var next = new DateTime(2026, 4, 15);
             var prev = _engine.CalculatePreviousPaycheckDate(1, 15, next);
 
@@ -105,7 +104,6 @@ namespace BudgetApp.Api.Tests
         [Fact]
         public void CalculatePreviousPaycheckDate_NextIsFirstDay_ReturnsPriorMonthSecondDay()
         {
-            // Pay days: 1 and 15. Next paycheck is the 1st → previous is the 15th of prior month.
             var next = new DateTime(2026, 4, 1);
             var prev = _engine.CalculatePreviousPaycheckDate(1, 15, next);
 
@@ -115,7 +113,6 @@ namespace BudgetApp.Api.Tests
         [Fact]
         public void CalculatePreviousPaycheckDate_ClampsToShortMonth()
         {
-            // Pay days: 1 and 31. Next paycheck is Feb 1 → previous is Jan 31.
             var next = new DateTime(2026, 2, 1);
             var prev = _engine.CalculatePreviousPaycheckDate(1, 31, next);
 
@@ -125,29 +122,130 @@ namespace BudgetApp.Api.Tests
         [Fact]
         public void CalculatePreviousPaycheckDate_Day31InShortMonth_ClampsToDayInMonth()
         {
-            // Pay days: 15 and 31. Next is April 15 → previous is March 31.
             var next = new DateTime(2026, 4, 15);
             var prev = _engine.CalculatePreviousPaycheckDate(15, 31, next);
 
-            // days[0]=15, days[1]=31, nextDay=15 == days[0] → prev is days[1] in prior month (March)
-            // DaysInMonth(March) = 31, so 31 is valid.
             Assert.Equal(new DateTime(2026, 3, 31), prev);
         }
     }
 
-    // ─── Budget Calculation Engine (no proration) ─────────────────────────────
+    // ─── Base Budget Calculation (paycheck - fixedCosts only) ─────────────────
     //
-    // Core formula: remainingToSpend = paycheckAmount - fixedBills - savings - debt
+    // This is displayed on the Debt screen BEFORE the user makes debt decisions.
+    // baseRemaining = paycheck - fixedCosts
+    // Debt and savings are NOT subtracted at this stage.
+
+    public class BaseBudgetCalculationTests
+    {
+        private readonly DynamicBudgetEngine _engine = new();
+
+        private BaseBudgetRequest MakeBaseRequest(
+            decimal paycheckAmount = 2500m,
+            decimal totalFixedBills = 800m)
+        {
+            return new BaseBudgetRequest
+            {
+                PaycheckAmount   = paycheckAmount,
+                Today            = new DateTime(2026, 4, 7),
+                NextPaycheckDate = new DateTime(2026, 4, 15),
+                TotalFixedBills  = totalFixedBills
+            };
+        }
+
+        [Fact]
+        public void BaseRemaining_IsPaycheckMinusFixedCosts()
+        {
+            var result = _engine.CalculateBaseBudget(MakeBaseRequest());
+
+            // 2500 - 800 = 1700
+            Assert.Equal(1700m, result.BaseRemaining);
+        }
+
+        [Fact]
+        public void BaseRemaining_WithNoFixedCosts_IsFullPaycheck()
+        {
+            var result = _engine.CalculateBaseBudget(MakeBaseRequest(totalFixedBills: 0m));
+
+            Assert.Equal(2500m, result.BaseRemaining);
+        }
+
+        [Fact]
+        public void BaseRemaining_CanBeNegative_WhenFixedCostsExceedPaycheck()
+        {
+            var result = _engine.CalculateBaseBudget(MakeBaseRequest(
+                paycheckAmount: 500m, totalFixedBills: 800m));
+
+            Assert.Equal(-300m, result.BaseRemaining);
+        }
+
+        [Fact]
+        public void BaseRemaining_TaskExample_April7_April15()
+        {
+            // paycheck $2500, fixed costs $1250 → base = $1250
+            var result = _engine.CalculateBaseBudget(MakeBaseRequest(
+                paycheckAmount: 2500m, totalFixedBills: 1250m));
+
+            Assert.Equal(1250m, result.BaseRemaining);
+        }
+
+        [Fact]
+        public void Result_PassesThroughPaycheckAndFixedCosts()
+        {
+            var result = _engine.CalculateBaseBudget(MakeBaseRequest(
+                paycheckAmount: 2500m, totalFixedBills: 800m));
+
+            Assert.Equal(2500m, result.PaycheckAmount);
+            Assert.Equal(800m,  result.FixedCostsRemaining);
+        }
+
+        [Fact]
+        public void BaseRemaining_DoesNotIncludeDebtOrSavings()
+        {
+            // No matter what debt/savings might be, base is only paycheck - fixed
+            var result = _engine.CalculateBaseBudget(MakeBaseRequest(
+                paycheckAmount: 2500m, totalFixedBills: 800m));
+
+            // 1700 — debt/savings are not subtracted
+            Assert.Equal(1700m, result.BaseRemaining);
+        }
+
+        [Fact]
+        public void AllMonetaryValues_AreRoundedToTwoDecimalPlaces()
+        {
+            var req = new BaseBudgetRequest
+            {
+                PaycheckAmount   = 2333.33m,
+                Today            = new DateTime(2026, 4, 7),
+                NextPaycheckDate = new DateTime(2026, 4, 15),
+                TotalFixedBills  = 333.33m
+            };
+
+            var result = _engine.CalculateBaseBudget(req);
+
+            static void AssertMaxTwoDecimals(decimal value, string name)
+            {
+                Assert.True(value == Math.Round(value, 2),
+                    $"{name} has more than 2 decimal places: {value}");
+            }
+
+            AssertMaxTwoDecimals(result.PaycheckAmount,      nameof(result.PaycheckAmount));
+            AssertMaxTwoDecimals(result.FixedCostsRemaining, nameof(result.FixedCostsRemaining));
+            AssertMaxTwoDecimals(result.BaseRemaining,       nameof(result.BaseRemaining));
+        }
+    }
+
+    // ─── Full Budget Calculation (paycheck - fixedCosts - debt - savings) ──────
     //
-    // There is NO time-based proration. The full paycheck minus obligations
-    // is the answer to "how much can I spend before I get paid again?"
+    // Core formula: remainingToSpend = paycheck - fixedBills - debt - savings
+    // There is NO time-based proration.
 
     public class BudgetCalculationEngineTests
     {
         private readonly DynamicBudgetEngine _engine = new();
 
         // Shared scenario: $2500 paycheck, fixed bills = $500, savings = $200, debt = $150.
-        // remainingToSpend = 2500 - 500 - 200 - 150 = 1650
+        // baseRemaining = 2500 - 500 = 2000
+        // remainingToSpend = 2000 - 150 - 200 = 1650
         private BudgetCalculationRequest MakeStandardRequest(
             decimal paycheckAmount = 2500m,
             decimal totalFixedBills = 500m,
@@ -168,7 +266,7 @@ namespace BudgetApp.Api.Tests
             };
         }
 
-        // ── Core formula tests ────────────────────────────────────────────────
+        // ── Core formula ──────────────────────────────────────────────────────
 
         [Fact]
         public void RemainingToSpend_IsPaycheckMinusAllObligations()
@@ -177,6 +275,15 @@ namespace BudgetApp.Api.Tests
 
             // 2500 - 500 - 200 - 150 = 1650
             Assert.Equal(1650m, result.RemainingToSpend);
+        }
+
+        [Fact]
+        public void BaseRemaining_IsPaycheckMinusFixedCosts_OnlyNoDebtNoSavings()
+        {
+            var result = _engine.CalculateDynamicBudget(MakeStandardRequest());
+
+            // 2500 - 500 = 2000 (debt and savings NOT included in baseRemaining)
+            Assert.Equal(2000m, result.BaseRemaining);
         }
 
         [Fact]
@@ -209,55 +316,51 @@ namespace BudgetApp.Api.Tests
         [Fact]
         public void RemainingToSpend_CanBeNegative_WhenObligationsExceedPaycheck()
         {
-            // 500 - 500 - 200 - 150 = -350
             var req = MakeStandardRequest(paycheckAmount: 500m);
             var result = _engine.CalculateDynamicBudget(req);
 
+            // 500 - 500 - 200 - 150 = -350
             Assert.Equal(-350m, result.RemainingToSpend);
         }
 
-        // ── No proration: result is the SAME regardless of day in pay cycle ──
+        // ── No proration: same result regardless of day in cycle ──────────────
 
         [Fact]
         public void RemainingToSpend_IsSameAtStartAndEndOfPayCycle()
         {
-            // Day of month should NOT matter — no proration applied
-            var reqEarlyInCycle = new BudgetCalculationRequest
+            var reqEarly = new BudgetCalculationRequest
             {
                 PaycheckAmount      = 2500m,
-                Today               = new DateTime(2026, 4, 1),  // start of cycle
+                Today               = new DateTime(2026, 4, 1),
                 NextPaycheckDate    = new DateTime(2026, 4, 15),
                 TotalFixedBills     = 500m,
                 SavingsContribution = 200m,
                 DebtPerPaycheck     = 150m
             };
 
-            var reqLateInCycle = new BudgetCalculationRequest
+            var reqLate = new BudgetCalculationRequest
             {
                 PaycheckAmount      = 2500m,
-                Today               = new DateTime(2026, 4, 14), // one day before payday
+                Today               = new DateTime(2026, 4, 14),
                 NextPaycheckDate    = new DateTime(2026, 4, 15),
                 TotalFixedBills     = 500m,
                 SavingsContribution = 200m,
                 DebtPerPaycheck     = 150m
             };
 
-            var earlyResult = _engine.CalculateDynamicBudget(reqEarlyInCycle);
-            var lateResult  = _engine.CalculateDynamicBudget(reqLateInCycle);
+            var earlyResult = _engine.CalculateDynamicBudget(reqEarly);
+            var lateResult  = _engine.CalculateDynamicBudget(reqLate);
 
-            // Both should give the same answer — 2500 - 850 = 1650
             Assert.Equal(1650m, earlyResult.RemainingToSpend);
             Assert.Equal(1650m, lateResult.RemainingToSpend);
         }
 
-        // ── Task example scenario: April 7, next paycheck April 15 ───────────
+        // ── Task example: April 7, next paycheck April 15 ────────────────────
 
         [Fact]
         public void RemainingToSpend_TaskExample_April7_April15()
         {
-            // Today: April 7. Next paycheck: April 15 ($2500)
-            // Fixed costs: $1250, Savings: $200, Debt: $300
-            // Expected: 2500 - 1250 - 200 - 300 = 750
+            // paycheck $2500, fixed $1250, savings $200, debt $300 → remaining $750
             var req = new BudgetCalculationRequest
             {
                 PaycheckAmount      = 2500m,
@@ -270,10 +373,11 @@ namespace BudgetApp.Api.Tests
 
             var result = _engine.CalculateDynamicBudget(req);
 
-            Assert.Equal(750m, result.RemainingToSpend);
+            Assert.Equal(1250m, result.BaseRemaining);   // 2500 - 1250
+            Assert.Equal(750m,  result.RemainingToSpend); // 1250 - 300 - 200
         }
 
-        // ── Individual field pass-through ─────────────────────────────────────
+        // ── Field pass-through ────────────────────────────────────────────────
 
         [Fact]
         public void Result_PassesThroughInputFields()
@@ -293,9 +397,8 @@ namespace BudgetApp.Api.Tests
             var req = MakeStandardRequest(totalFixedBills: 0m, debtPerPaycheck: 0m, savingsContribution: 300m);
             var result = _engine.CalculateDynamicBudget(req);
 
-            // 2500 - 0 - 300 - 0 = 2200
             Assert.Equal(300m,  result.SavingsContribution);
-            Assert.Equal(2200m, result.RemainingToSpend);
+            Assert.Equal(2200m, result.RemainingToSpend); // 2500 - 300
         }
 
         // ── Explanation text ──────────────────────────────────────────────────
@@ -356,7 +459,6 @@ namespace BudgetApp.Api.Tests
         {
             var result = _engine.CalculateDynamicBudget(MakeStandardRequest());
 
-            // Confirm no time-scaling language appears anywhere
             Assert.DoesNotContain("pay cycle", result.Explanation);
             Assert.DoesNotContain("prorate", result.Explanation);
             Assert.DoesNotContain("time remaining", result.Explanation);
@@ -388,6 +490,7 @@ namespace BudgetApp.Api.Tests
 
             AssertMaxTwoDecimals(result.PaycheckAmount,      nameof(result.PaycheckAmount));
             AssertMaxTwoDecimals(result.FixedCostsRemaining, nameof(result.FixedCostsRemaining));
+            AssertMaxTwoDecimals(result.BaseRemaining,       nameof(result.BaseRemaining));
             AssertMaxTwoDecimals(result.RemainingToSpend,    nameof(result.RemainingToSpend));
             AssertMaxTwoDecimals(result.DebtPerPaycheck,     nameof(result.DebtPerPaycheck));
             AssertMaxTwoDecimals(result.SavingsContribution, nameof(result.SavingsContribution));
@@ -402,6 +505,7 @@ namespace BudgetApp.Api.Tests
             var result2 = _engine.CalculateDynamicBudget(req);
 
             Assert.Equal(result1.RemainingToSpend, result2.RemainingToSpend);
+            Assert.Equal(result1.BaseRemaining,    result2.BaseRemaining);
         }
     }
 }

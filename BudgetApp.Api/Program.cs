@@ -854,6 +854,74 @@ app.MapGet("/api/plaid/recurring", async (ApiDbContext dbContext, PlaidClient pl
 .WithName("GetPlaidRecurring")
 .WithOpenApi();
 
+// POST: /api/budget/base
+// Returns baseRemaining = paycheck - fixedCosts (before debt & savings decisions).
+// Called by the Debt screen so users see the impact of their debt choices.
+app.MapPost("/api/budget/base", async (
+    ApiDbContext dbContext,
+    HttpContext httpContext,
+    IDynamicBudgetEngine budgetEngine,
+    BaseBudgetHttpRequest request) =>
+{
+    try
+    {
+        string? idToken = httpContext.Request.Headers["Authorization"].FirstOrDefault()?.Split(" ").Last();
+        if (string.IsNullOrEmpty(idToken)) return Results.Unauthorized();
+
+        var decodedToken = await FirebaseAdmin.Auth.FirebaseAuth.DefaultInstance.VerifyIdTokenAsync(idToken);
+        var user = await dbContext.Users.FirstOrDefaultAsync(u => u.FirebaseUuid == decodedToken.Uid);
+        if (user == null) return Results.NotFound("User not found.");
+
+        DateTime today = DateTime.UtcNow.Date;
+        DateTime nextPaycheck = request.NextPaycheckDate.Date;
+
+        if (nextPaycheck <= today)
+            return Results.BadRequest("Next paycheck date must be in the future.");
+
+        // Validate pay cycle
+        var previousPaycheck = budgetEngine.CalculatePreviousPaycheckDate(
+            request.PayDay1, request.PayDay2, nextPaycheck);
+
+        int payCycleDays = (int)(nextPaycheck - previousPaycheck).TotalDays;
+        if (payCycleDays <= 0)
+            return Results.BadRequest("Invalid pay cycle detected.");
+
+        // Filter fixed costs in this period (exclude Savings category — debt/savings not applied yet)
+        var fixedBillsThisPeriod = await dbContext.FixedCosts
+            .Where(fc => fc.UserId == user.Id
+                && fc.NextDueDate.HasValue
+                && fc.NextDueDate.Value.Date >= today
+                && fc.NextDueDate.Value.Date <= nextPaycheck
+                && fc.Category != "Savings")
+            .ToListAsync();
+
+        decimal totalFixedBills = fixedBillsThisPeriod.Sum(fc => fc.Amount);
+
+        // Calculate base budget: paycheck - fixedCosts only (NO debt, NO savings)
+        var baseResult = budgetEngine.CalculateBaseBudget(new BaseBudgetRequest
+        {
+            PaycheckAmount   = request.PaycheckAmount,
+            Today            = today,
+            NextPaycheckDate = nextPaycheck,
+            TotalFixedBills  = totalFixedBills
+        });
+
+        return Results.Ok(new
+        {
+            paycheckAmount      = baseResult.PaycheckAmount,
+            fixedCostsRemaining = baseResult.FixedCostsRemaining,
+            baseRemaining       = baseResult.BaseRemaining
+        });
+    }
+    catch (Exception e)
+    {
+        SentrySdk.CaptureException(e);
+        return Results.Problem($"Base budget calculation failed: {e.Message}");
+    }
+})
+.WithName("GetBaseBudget")
+.WithOpenApi();
+
 // POST: /api/budget/finalize
 app.MapPost("/api/budget/finalize", async (
     ApiDbContext dbContext,

@@ -1,10 +1,12 @@
 // File: screens/onboarding/SavingsOnboardingScreen.js
 //
-// Step 4 of onboarding: collect the user's savings contribution per paycheck.
-// Shows a debt warning if the user has debt (does NOT block savings — just warns).
+// Step 4 of onboarding: collect savings per paycheck.
 //
-// This screen makes the final /api/budget/finalize call once the user
-// confirms their savings amount. All prior params are forwarded from route.params.
+// Key change: the display base is `remainingAfterDebt` (paycheck - fixedCosts - debt),
+// NOT the raw paycheck amount. This reflects the user's actual disposable income
+// after their debt decision, so they make an informed savings choice.
+//
+// Makes the final /api/budget/finalize call.
 
 import React, { useState } from 'react';
 import {
@@ -27,10 +29,12 @@ export default function SavingsOnboardingScreen({ navigation, route }) {
   const [inputError, setInputError] = useState(null);
 
   // All params forwarded from prior onboarding screens
-  const paycheckAmount = route.params?.paycheckAmount ?? 0;
-  const payDay1 = route.params?.payDay1 ?? 1;
-  const payDay2 = route.params?.payDay2 ?? 15;
-  const debtPerPaycheck = route.params?.debtPerPaycheck ?? 0;
+  const paycheckAmount     = route.params?.paycheckAmount     ?? 0;
+  const payDay1            = route.params?.payDay1            ?? 1;
+  const payDay2            = route.params?.payDay2            ?? 15;
+  const debtPerPaycheck    = route.params?.debtPerPaycheck    ?? 0;
+  const remainingAfterDebt = route.params?.remainingAfterDebt ?? (paycheckAmount - debtPerPaycheck);
+  const fixedCostsRemaining = route.params?.fixedCostsRemaining ?? 0;
 
   const hasDebt = debtPerPaycheck > 0;
 
@@ -42,23 +46,17 @@ export default function SavingsOnboardingScreen({ navigation, route }) {
     const days = [day1, day2].sort((a, b) => a - b);
 
     let nextDate = null;
-
     for (const day of days) {
       const potentialDate = new Date(currentYear, currentMonth, day);
       if (potentialDate.getDate() === day && potentialDate >= today) {
-        if (!nextDate || potentialDate < nextDate) {
-          nextDate = potentialDate;
-        }
+        if (!nextDate || potentialDate < nextDate) nextDate = potentialDate;
       }
     }
 
     if (!nextDate) {
       let nextMonth = currentMonth + 1;
       let nextYear = currentYear;
-      if (nextMonth > 11) {
-        nextMonth = 0;
-        nextYear += 1;
-      }
+      if (nextMonth > 11) { nextMonth = 0; nextYear += 1; }
       nextDate = new Date(nextYear, nextMonth, days[0]);
     }
 
@@ -79,7 +77,7 @@ export default function SavingsOnboardingScreen({ navigation, route }) {
       const config = await getAuthHeader();
       const nextPaycheckDate = calculateNextPaycheckDate(payDay1, payDay2);
 
-      // If user entered a savings amount, save it as a fixed cost first
+      // Save savings as a fixed cost if > 0
       if (savingsPerPaycheck > 0) {
         await axios.post(
           `${API_BASE_URL}/api/fixed-costs`,
@@ -94,7 +92,7 @@ export default function SavingsOnboardingScreen({ navigation, route }) {
         );
       }
 
-      // Call /api/budget/finalize with all collected data
+      // Call /api/budget/finalize with all data
       const response = await axios.post(
         `${API_BASE_URL}/api/budget/finalize`,
         {
@@ -109,15 +107,15 @@ export default function SavingsOnboardingScreen({ navigation, route }) {
 
       const data = response.data;
 
-      // Navigate to the final summary screen
       navigation.navigate('DynamicAmountFinal', {
-        remainingToSpend:    data.remainingToSpend,
+        remainingToSpend:     data.remainingToSpend,
         dynamicSpendableAmount: data.dynamicSpendableAmount ?? data.remainingToSpend,
-        paycheckAmount:      data.paycheckAmount,
-        fixedCostsRemaining: data.fixedCostsRemaining,
-        debtPerPaycheck:     data.debtPerPaycheck,
-        savingsContribution: data.savingsContribution,
-        explanation:         data.explanation,
+        paycheckAmount:       data.paycheckAmount,
+        fixedCostsRemaining:  data.fixedCostsRemaining,
+        baseRemaining:        data.baseRemaining,
+        debtPerPaycheck:      data.debtPerPaycheck,
+        savingsContribution:  data.savingsContribution,
+        explanation:          data.explanation,
       });
     } catch (e) {
       console.error('Finalization failed:', e);
@@ -132,7 +130,6 @@ export default function SavingsOnboardingScreen({ navigation, route }) {
     const trimmed = savingsInput.trim();
 
     if (trimmed === '') {
-      // Treat empty as $0 savings
       handleFinalize(0);
       return;
     }
@@ -146,16 +143,11 @@ export default function SavingsOnboardingScreen({ navigation, route }) {
     handleFinalize(value);
   };
 
-  const handleSkip = () => {
-    handleFinalize(0);
-  };
+  const handleSkip = () => handleFinalize(0);
 
-  // Live preview: paycheck - savings input
+  // Live preview uses remainingAfterDebt as the starting point
   const savingsValue = parseFloat(savingsInput) || 0;
-  const previewRemaining =
-    paycheckAmount > 0
-      ? (parseFloat(paycheckAmount) - debtPerPaycheck - savingsValue).toFixed(2)
-      : null;
+  const finalRemaining = Math.round((remainingAfterDebt - savingsValue) * 100) / 100;
 
   return (
     <TouchableWithoutFeedback onPress={Keyboard.dismiss} accessible={false}>
@@ -164,17 +156,38 @@ export default function SavingsOnboardingScreen({ navigation, route }) {
 
           <Text style={styles.header}>Savings (4/4)</Text>
 
-          {/* Debt warning — shown only when user has debt */}
+          {/* After-debt available banner */}
+          <Card style={styles.availableCard}>
+            <Card.Content>
+              <Text style={styles.availableLabel}>
+                {hasDebt
+                  ? 'After your debt payment, you have:'
+                  : 'After fixed costs, you have:'}
+              </Text>
+              <Text style={[
+                styles.availableAmount,
+                remainingAfterDebt < 0 && styles.negative,
+              ]}>
+                ${remainingAfterDebt.toFixed(2)}
+              </Text>
+              <Text style={styles.availableNote}>
+                {hasDebt
+                  ? `$${paycheckAmount.toFixed(2)} − $${fixedCostsRemaining.toFixed(2)} fixed − $${debtPerPaycheck.toFixed(2)} debt`
+                  : `$${paycheckAmount.toFixed(2)} − $${fixedCostsRemaining.toFixed(2)} fixed costs`}
+              </Text>
+            </Card.Content>
+          </Card>
+
+          {/* Debt warning */}
           {hasDebt && (
             <Card style={styles.warningCard}>
               <Card.Content style={styles.warningContent}>
                 <Text style={styles.warningIcon}>⚠️</Text>
                 <Text style={styles.warningText}>
-                  You are currently paying off{' '}
-                  <Text style={styles.bold}>${debtPerPaycheck.toFixed(2)}</Text> per paycheck in debt.
-                  {'\n\n'}
-                  Consider pausing savings until your debt is reduced. However, even a small savings
-                  contribution is better than none — the choice is yours.
+                  You're paying off{' '}
+                  <Text style={styles.bold}>${debtPerPaycheck.toFixed(2)}</Text>/paycheck in debt.
+                  {'\n'}
+                  Consider pausing savings until your debt is paid down — but the choice is yours.
                 </Text>
               </Card.Content>
             </Card>
@@ -202,47 +215,64 @@ export default function SavingsOnboardingScreen({ navigation, route }) {
 
           {inputError && <Text style={styles.error}>{inputError}</Text>}
 
-          {/* Live preview */}
-          {paycheckAmount > 0 && (
-            <Card style={styles.previewCard}>
-              <Card.Content>
-                <Text style={styles.previewTitle}>Estimated budget</Text>
-                <Divider style={{ marginVertical: 8 }} />
+          {/* Live preview — always shown so user sees impact */}
+          <Card style={styles.previewCard}>
+            <Card.Content>
+              <Text style={styles.previewTitle}>Your budget breakdown</Text>
+              <Divider style={{ marginVertical: 8 }} />
+
+              <View style={styles.previewRow}>
+                <Text style={styles.previewLabel}>Income</Text>
+                <Text style={styles.previewValue}>+${paycheckAmount.toFixed(2)}</Text>
+              </View>
+
+              {fixedCostsRemaining > 0 && (
                 <View style={styles.previewRow}>
-                  <Text style={styles.previewLabel}>Income</Text>
-                  <Text style={styles.previewValue}>+${parseFloat(paycheckAmount).toFixed(2)}</Text>
-                </View>
-                {debtPerPaycheck > 0 && (
-                  <View style={styles.previewRow}>
-                    <Text style={styles.previewLabel}>Debt payoff</Text>
-                    <Text style={[styles.previewValue, styles.deduction]}>−${debtPerPaycheck.toFixed(2)}</Text>
-                  </View>
-                )}
-                {savingsValue > 0 && (
-                  <View style={styles.previewRow}>
-                    <Text style={styles.previewLabel}>Savings</Text>
-                    <Text style={[styles.previewValue, styles.deduction]}>−${savingsValue.toFixed(2)}</Text>
-                  </View>
-                )}
-                <Divider style={{ marginVertical: 8 }} />
-                <View style={styles.previewRow}>
-                  <Text style={[styles.previewLabel, styles.bold]}>Approx. remaining</Text>
-                  <Text
-                    style={[
-                      styles.previewValue,
-                      styles.bold,
-                      parseFloat(previewRemaining) < 0 && styles.negativeText,
-                    ]}
-                  >
-                    ${previewRemaining}
+                  <Text style={styles.previewLabel}>Fixed costs</Text>
+                  <Text style={[styles.previewValue, styles.deduction]}>
+                    −${fixedCostsRemaining.toFixed(2)}
                   </Text>
                 </View>
-                <Text style={styles.previewNote}>
-                  (Fixed costs will be subtracted on the next screen.)
+              )}
+
+              {hasDebt && (
+                <View style={styles.previewRow}>
+                  <Text style={styles.previewLabel}>Debt payoff</Text>
+                  <Text style={[styles.previewValue, styles.deduction]}>
+                    −${debtPerPaycheck.toFixed(2)}
+                  </Text>
+                </View>
+              )}
+
+              {savingsValue > 0 && (
+                <View style={styles.previewRow}>
+                  <Text style={styles.previewLabel}>Savings</Text>
+                  <Text style={[styles.previewValue, styles.deduction]}>
+                    −${savingsValue.toFixed(2)}
+                  </Text>
+                </View>
+              )}
+
+              <Divider style={{ marginVertical: 8 }} />
+
+              <View style={styles.previewRow}>
+                <Text style={[styles.previewLabel, styles.bold]}>Final remaining</Text>
+                <Text style={[
+                  styles.previewValue,
+                  styles.bold,
+                  finalRemaining < 0 && styles.negativeText,
+                ]}>
+                  ${finalRemaining.toFixed(2)}
                 </Text>
-              </Card.Content>
-            </Card>
-          )}
+              </View>
+
+              {finalRemaining < 0 && (
+                <Text style={styles.warningNote}>
+                  ⚠️ Savings amount exceeds your remaining budget. Consider a lower amount.
+                </Text>
+              )}
+            </Card.Content>
+          </Card>
 
           <Button
             mode="contained"
@@ -251,7 +281,7 @@ export default function SavingsOnboardingScreen({ navigation, route }) {
             style={styles.button}
             contentStyle={styles.buttonContent}
           >
-            {isSaving ? 'Calculating…' : 'See My Budget'}
+            {isSaving ? 'Calculating…' : 'See My Final Budget'}
           </Button>
 
           <Button
@@ -281,10 +311,34 @@ const styles = StyleSheet.create({
     color: '#1a1a1a',
   },
 
+  // After-debt banner
+  availableCard: {
+    backgroundColor: '#e8f5e9',
+    borderRadius: 14,
+    marginBottom: 16,
+  },
+  availableLabel: {
+    fontSize: 13,
+    color: '#444',
+    marginBottom: 4,
+  },
+  availableAmount: {
+    fontSize: 36,
+    fontWeight: 'bold',
+    color: '#2e7d32',
+    letterSpacing: -0.5,
+  },
+  availableNote: {
+    fontSize: 12,
+    color: '#666',
+    marginTop: 4,
+  },
+
+  // Debt warning
   warningCard: {
     backgroundColor: '#fff8e1',
     borderRadius: 12,
-    marginBottom: 20,
+    marginBottom: 16,
     borderLeftWidth: 4,
     borderLeftColor: '#f59e0b',
   },
@@ -293,14 +347,14 @@ const styles = StyleSheet.create({
     alignItems: 'flex-start',
   },
   warningIcon: {
-    fontSize: 20,
-    marginRight: 10,
+    fontSize: 18,
+    marginRight: 8,
     marginTop: 2,
   },
   warningText: {
-    fontSize: 14,
+    fontSize: 13,
     color: '#78350f',
-    lineHeight: 22,
+    lineHeight: 20,
     flex: 1,
   },
 
@@ -325,6 +379,7 @@ const styles = StyleSheet.create({
     marginBottom: 8,
   },
 
+  // Live preview
   previewCard: {
     backgroundColor: '#f5f5f5',
     borderRadius: 12,
@@ -344,15 +399,16 @@ const styles = StyleSheet.create({
   previewLabel: {
     fontSize: 14,
     color: '#555',
+    flex: 1,
   },
   previewValue: {
     fontSize: 14,
     color: '#333',
     fontVariant: ['tabular-nums'],
   },
-  previewNote: {
+  warningNote: {
     fontSize: 12,
-    color: '#999',
+    color: '#b71c1c',
     marginTop: 8,
     fontStyle: 'italic',
   },
@@ -362,6 +418,9 @@ const styles = StyleSheet.create({
   bold: {
     fontWeight: '700',
     color: '#1a1a1a',
+  },
+  negative: {
+    color: '#c62828',
   },
   negativeText: {
     color: '#c62828',

@@ -16,7 +16,33 @@ public record DepositContext
 }
 
 /// <summary>
-/// Input to the pure budget calculation engine.
+/// Input for the base budget calculation (no debt, no savings applied yet).
+/// Used to answer: "Before debt and savings decisions, how much do I have?"
+/// </summary>
+public record BaseBudgetRequest
+{
+    public decimal PaycheckAmount { get; init; }
+    public DateTime Today { get; init; }
+    public DateTime NextPaycheckDate { get; init; }
+
+    /// <summary>Sum of fixed-cost bills due within [Today, NextPaycheckDate].</summary>
+    public decimal TotalFixedBills { get; init; }
+}
+
+/// <summary>
+/// Result of the base budget calculation.
+/// baseRemaining = paycheck - fixedCosts
+/// Debt and savings are NOT subtracted — that happens after user decisions.
+/// </summary>
+public record BaseBudgetResult
+{
+    public decimal PaycheckAmount { get; init; }
+    public decimal FixedCostsRemaining { get; init; }
+    public decimal BaseRemaining { get; init; }
+}
+
+/// <summary>
+/// Input to the full budget calculation engine.
 /// All DB-dependent values (bill sums, savings sums) are resolved before calling.
 /// </summary>
 public record BudgetCalculationRequest
@@ -44,6 +70,7 @@ public record BudgetCalculationResult
 {
     public decimal PaycheckAmount { get; init; }
     public decimal FixedCostsRemaining { get; init; }
+    public decimal BaseRemaining { get; init; }
     public decimal DebtPerPaycheck { get; init; }
     public decimal SavingsContribution { get; init; }
     public decimal RemainingToSpend { get; init; }
@@ -71,12 +98,22 @@ public interface IDynamicBudgetEngine
     DateTime CalculatePreviousPaycheckDate(int payDay1, int payDay2, DateTime nextPaycheckDate);
 
     /// <summary>
-    /// Calculates how much the user can spend until the next paycheck.
+    /// Calculates the base budget BEFORE debt and savings decisions.
+    ///
+    /// This is the number shown on the Debt screen so users understand
+    /// what they have available before choosing a debt payment amount.
+    ///
+    /// Formula: baseRemaining = paycheck - fixedCosts
+    /// </summary>
+    BaseBudgetResult CalculateBaseBudget(BaseBudgetRequest request);
+
+    /// <summary>
+    /// Calculates the final budget after all obligations (fixed + debt + savings).
     ///
     /// NO proration — the full paycheck minus obligations is available to spend,
     /// regardless of where we are in the pay cycle.
     ///
-    /// Formula: remainingToSpend = paycheckAmount - fixedBills - savings - debt
+    /// Formula: remainingToSpend = paycheck - fixedBills - savings - debt
     /// </summary>
     BudgetCalculationResult CalculateDynamicBudget(BudgetCalculationRequest request);
 }
@@ -131,17 +168,12 @@ public class DynamicBudgetEngine : IDynamicBudgetEngine
         return (amount / expectedPaycheckAmount) >= LargeExpenseThresholdRatio;
     }
 
-    // ─── Pay Cycle (used only for date validation, not for calculation) ───────
+    // ─── Pay Cycle (used for date validation) ────────────────────────────────
 
     /// <summary>
     /// Given two pay-day-of-month numbers and the next paycheck date, returns the
     /// immediately preceding paycheck date.
-    ///
-    /// Rules:
-    ///   - If nextPaycheck falls on the smaller of the two days, the previous paycheck
-    ///     was the larger day in the prior month.
-    ///   - Otherwise, the previous paycheck was the smaller day in the same month.
-    ///   - Clamps to last valid day of month to handle short months (e.g., Feb 28/29).
+    /// Clamps to last valid day of month to handle short months (e.g., Feb 28/29).
     /// </summary>
     public DateTime CalculatePreviousPaycheckDate(int payDay1, int payDay2, DateTime nextPaycheckDate)
     {
@@ -163,30 +195,49 @@ public class DynamicBudgetEngine : IDynamicBudgetEngine
         }
     }
 
-    // ─── Budget Calculation (no proration) ───────────────────────────────────
+    // ─── Base Budget (paycheck minus fixed costs only) ────────────────────────
 
     /// <summary>
-    /// Calculates how much the user has left to spend until the next paycheck.
+    /// Returns how much is available BEFORE the user decides on debt and savings.
+    /// This is displayed on the Debt screen so the user can make an informed choice.
     ///
-    /// This is NOT a monthly budget and does NOT prorate by time.
-    /// The question answered is: "How much can I spend before I get paid again?"
+    /// Formula: baseRemaining = paycheck - fixedCosts
+    /// </summary>
+    public BaseBudgetResult CalculateBaseBudget(BaseBudgetRequest req)
+    {
+        decimal fixedCostsRemaining = Math.Round(req.TotalFixedBills, 2);
+        decimal baseRemaining = Math.Round(req.PaycheckAmount - fixedCostsRemaining, 2);
+
+        return new BaseBudgetResult
+        {
+            PaycheckAmount      = Math.Round(req.PaycheckAmount, 2),
+            FixedCostsRemaining = fixedCostsRemaining,
+            BaseRemaining       = baseRemaining
+        };
+    }
+
+    // ─── Full Budget Calculation (paycheck minus ALL obligations) ─────────────
+
+    /// <summary>
+    /// Calculates how much the user has left to spend until the next paycheck,
+    /// after applying debt and savings decisions.
     ///
-    /// Step 1: totalObligations = fixedBills + savings + debt
-    /// Step 2: remainingToSpend = paycheckAmount - totalObligations
-    /// Step 3: return structured result + human-readable explanation
+    /// Formula: remainingToSpend = paycheck - fixedBills - debt - savings
     /// </summary>
     public BudgetCalculationResult CalculateDynamicBudget(BudgetCalculationRequest req)
     {
-        // Step 1 — Sum all obligations due before next paycheck
         decimal fixedCostsRemaining = Math.Round(req.TotalFixedBills, 2);
         decimal savingsContribution = Math.Round(req.SavingsContribution, 2);
-        decimal debtPerPaycheck = Math.Round(req.DebtPerPaycheck, 2);
+        decimal debtPerPaycheck     = Math.Round(req.DebtPerPaycheck, 2);
 
-        // Step 2 — Remaining to spend (no proration)
+        // Base: paycheck minus fixed costs (before debt/savings decisions)
+        decimal baseRemaining = Math.Round(req.PaycheckAmount - fixedCostsRemaining, 2);
+
+        // Final: subtract debt and savings
         decimal remainingToSpend = Math.Round(
-            req.PaycheckAmount - fixedCostsRemaining - savingsContribution - debtPerPaycheck, 2);
+            baseRemaining - debtPerPaycheck - savingsContribution, 2);
 
-        // Step 3 — Build explanation
+        // Build explanation
         var explanationLines = new List<string>
         {
             $"Income:       ${req.PaycheckAmount:0.00}"
@@ -210,12 +261,13 @@ public class DynamicBudgetEngine : IDynamicBudgetEngine
 
         return new BudgetCalculationResult
         {
-            PaycheckAmount     = Math.Round(req.PaycheckAmount, 2),
+            PaycheckAmount      = Math.Round(req.PaycheckAmount, 2),
             FixedCostsRemaining = fixedCostsRemaining,
-            DebtPerPaycheck    = debtPerPaycheck,
+            BaseRemaining       = baseRemaining,
+            DebtPerPaycheck     = debtPerPaycheck,
             SavingsContribution = savingsContribution,
-            RemainingToSpend   = remainingToSpend,
-            Explanation        = explanation
+            RemainingToSpend    = remainingToSpend,
+            Explanation         = explanation
         };
     }
 
