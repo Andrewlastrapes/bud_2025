@@ -1,26 +1,5 @@
-// File: Data/DepositContext.cs
-using System;
-
-namespace BudgetApp.Api.Data
-{
-    public class DepositContext
-    {
-
-        public decimal Amount { get; set; }
-
-
-        public DateTime Date { get; set; }
-
-
-        public string? MerchantName { get; set; }
-
-
-        public int PayDay1 { get; set; }
-
-
-        public int PayDay2 { get; set; }
-
-
-        public decimal ExpectedPaycheckAmount { get; set; }
-    }
-}
+// This file intentionally empty.
+// DepositContext is defined in BudgetApp.Api.Services.DynamicBudgetEngine
+// as a record with nullable PayDay1/PayDay2/ExpectedPaycheckAmount properties.
+// The class that was here was a stale duplicate and has been removed.
+namespace BudgetApp.Api.Data;

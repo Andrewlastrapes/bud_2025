@@ -855,7 +855,11 @@ app.MapGet("/api/plaid/recurring", async (ApiDbContext dbContext, PlaidClient pl
 .WithOpenApi();
 
 // POST: /api/budget/finalize
-app.MapPost("/api/budget/finalize", async (ApiDbContext dbContext, HttpContext httpContext, FinalizeBudgetRequest request) =>
+app.MapPost("/api/budget/finalize", async (
+    ApiDbContext dbContext,
+    HttpContext httpContext,
+    IDynamicBudgetEngine budgetEngine,
+    FinalizeBudgetRequest request) =>
 {
     try
     {
@@ -872,103 +876,93 @@ app.MapPost("/api/budget/finalize", async (ApiDbContext dbContext, HttpContext h
         DateTime nextPaycheck = request.NextPaycheckDate.Date;
 
         if (nextPaycheck <= today)
-        {
             return Results.BadRequest("Next paycheck date must be in the future.");
-        }
 
-        DateTime CalculatePreviousPaycheckDate(int day1, int day2, DateTime nextPay)
-        {
-            var days = new[] { day1, day2 }.OrderBy(d => d).ToArray();
-            int nextDay = nextPay.Day;
-
-            if (nextDay == days[0])
-            {
-                var prevMonthFirst = new DateTime(nextPay.Year, nextPay.Month, 1).AddMonths(-1);
-                int prevDay = days[1];
-                int daysInPrevMonth = DateTime.DaysInMonth(prevMonthFirst.Year, prevMonthFirst.Month);
-                if (prevDay > daysInPrevMonth) prevDay = daysInPrevMonth;
-
-                return new DateTime(prevMonthFirst.Year, prevMonthFirst.Month, prevDay);
-            }
-            else
-            {
-                int prevDay = days[0];
-                int daysInThisMonth = DateTime.DaysInMonth(nextPay.Year, nextPay.Month);
-                if (prevDay > daysInThisMonth) prevDay = daysInThisMonth;
-
-                return new DateTime(nextPay.Year, nextPay.Month, prevDay);
-            }
-        }
-
-        var previousPaycheck = CalculatePreviousPaycheckDate(request.PayDay1, request.PayDay2, nextPaycheck);
+        // Step 1 — Determine pay cycle using the engine
+        var previousPaycheck = budgetEngine.CalculatePreviousPaycheckDate(
+            request.PayDay1, request.PayDay2, nextPaycheck);
 
         int payCycleDays = (int)(nextPaycheck - previousPaycheck).TotalDays;
         if (payCycleDays <= 0)
-        {
             return Results.BadRequest("Invalid pay cycle detected.");
-        }
 
         int daysUntilNextPaycheck = (int)(nextPaycheck - today).TotalDays;
         if (daysUntilNextPaycheck < 0 || daysUntilNextPaycheck > payCycleDays)
-        {
             return Results.BadRequest("Next paycheck date is inconsistent with pay days / current date.");
-        }
 
+        // Step 2 — Filter fixed costs for this period
         var fixedBillsThisPeriod = await dbContext.FixedCosts
             .Where(fc => fc.UserId == user.Id
                 && fc.NextDueDate.HasValue
                 && fc.NextDueDate.Value.Date >= today
-                && fc.NextDueDate.Value.Date <= nextPaycheck)
+                && fc.NextDueDate.Value.Date <= nextPaycheck
+                && fc.Category != "Savings")
             .ToListAsync();
 
         var savingsThisPeriod = await dbContext.FixedCosts
-            .Where(fc => fc.UserId == user.Id
-                && fc.Category == "Savings")
+            .Where(fc => fc.UserId == user.Id && fc.Category == "Savings")
             .ToListAsync();
 
-        var totalRecurringCosts = fixedBillsThisPeriod.Sum(fc => fc.Amount)
-                         + savingsThisPeriod.Sum(fc => fc.Amount);
+        decimal totalFixedBills = fixedBillsThisPeriod.Sum(fc => fc.Amount);
+        decimal savingsContribution = savingsThisPeriod.Sum(fc => fc.Amount);
+        decimal debtPerPaycheck = request.DebtPerPaycheck ?? 0m;
 
-        decimal debtThisPeriod = request.DebtPerPaycheck ?? 0m;
-        totalRecurringCosts += debtThisPeriod;
+        // Steps 3–6 — Delegate to the pure budget engine
+        var calcRequest = new BudgetCalculationRequest
+        {
+            PaycheckAmount      = request.PaycheckAmount,
+            Today               = today,
+            PreviousPaycheckDate = previousPaycheck,
+            NextPaycheckDate    = nextPaycheck,
+            TotalFixedBills     = totalFixedBills,
+            SavingsContribution = savingsContribution,
+            DebtPerPaycheck     = debtPerPaycheck
+        };
 
-        decimal effectivePaycheck = request.PaycheckAmount - totalRecurringCosts;
+        var result = budgetEngine.CalculateDynamicBudget(calcRequest);
 
-        decimal prorateFactor = (decimal)daysUntilNextPaycheck / payCycleDays;
-        decimal finalDynamicBalance = effectivePaycheck * prorateFactor;
-
+        // Persist the dynamic balance
         var balanceRecord = await dbContext.Balances.FirstOrDefaultAsync(b => b.UserId == user.Id);
         if (balanceRecord == null)
         {
             balanceRecord = new Balance
             {
-                UserId = user.Id,
-                BalanceAmount = finalDynamicBalance,
-                CreatedAt = DateTime.UtcNow,
-                UpdatedAt = DateTime.UtcNow
+                UserId        = user.Id,
+                BalanceAmount = result.DynamicSpendableAmount,
+                CreatedAt     = DateTime.UtcNow,
+                UpdatedAt     = DateTime.UtcNow
             };
             await dbContext.Balances.AddAsync(balanceRecord);
         }
         else
         {
-            balanceRecord.BalanceAmount = finalDynamicBalance;
-            balanceRecord.UpdatedAt = DateTime.UtcNow;
+            balanceRecord.BalanceAmount = result.DynamicSpendableAmount;
+            balanceRecord.UpdatedAt     = DateTime.UtcNow;
         }
 
-        user.OnboardingComplete = true;
-        user.PayDay1 = request.PayDay1;
-        user.PayDay2 = request.PayDay2;
-        user.ExpectedPaycheckAmount = request.PaycheckAmount;
-        user.DebtPerPaycheck = request.DebtPerPaycheck;
-
+        // Persist user settings
+        user.OnboardingComplete      = true;
+        user.PayDay1                 = request.PayDay1;
+        user.PayDay2                 = request.PayDay2;
+        user.ExpectedPaycheckAmount  = request.PaycheckAmount;
+        user.DebtPerPaycheck         = request.DebtPerPaycheck;
 
         await dbContext.SaveChangesAsync();
 
+        // Return full structured response
         return Results.Ok(new
         {
-            message = "Setup complete.",
-            dynamicBalance = finalDynamicBalance.ToString("0.00"),
-            prorateFactor = prorateFactor.ToString("0.00")
+            message                = "Setup complete.",
+            paycheckAmount         = result.PaycheckAmount,
+            totalRecurringCosts    = result.TotalRecurringCosts,
+            debtPerPaycheck        = result.DebtPerPaycheck,
+            savingsContribution    = result.SavingsContribution,
+            effectivePaycheck      = result.EffectivePaycheck,
+            prorateFactor          = result.ProrateFactor,
+            dynamicSpendableAmount = result.DynamicSpendableAmount,
+            explanation            = result.Explanation,
+            // Legacy fields — kept for backwards compatibility
+            dynamicBalance         = result.DynamicSpendableAmount.ToString("0.00")
         });
     }
     catch (Exception e)
