@@ -23,32 +23,34 @@ public record BudgetCalculationRequest
 {
     public decimal PaycheckAmount { get; init; }
     public DateTime Today { get; init; }
-    public DateTime PreviousPaycheckDate { get; init; }
     public DateTime NextPaycheckDate { get; init; }
 
     /// <summary>Sum of fixed-cost bills due within [Today, NextPaycheckDate].</summary>
     public decimal TotalFixedBills { get; init; }
 
-    /// <summary>Sum of all savings fixed costs (always included, no date filter).</summary>
+    /// <summary>Savings contribution per paycheck (always included, no date filter).</summary>
     public decimal SavingsContribution { get; init; }
 
-    /// <summary>Optional per-paycheck debt payoff allocation.</summary>
+    /// <summary>Per-paycheck debt payoff allocation.</summary>
     public decimal DebtPerPaycheck { get; init; }
 }
 
 /// <summary>
-/// Full deterministic result from the 6-step budget engine.
+/// Result from the no-proration budget engine.
+/// Formula: remainingToSpend = paycheckAmount - fixedBills - savings - debt
 /// All monetary values are rounded to 2 decimal places.
 /// </summary>
 public record BudgetCalculationResult
 {
     public decimal PaycheckAmount { get; init; }
-    public decimal TotalRecurringCosts { get; init; }
+    public decimal FixedCostsRemaining { get; init; }
     public decimal DebtPerPaycheck { get; init; }
     public decimal SavingsContribution { get; init; }
-    public decimal EffectivePaycheck { get; init; }
-    public decimal ProrateFactor { get; init; }
-    public decimal DynamicSpendableAmount { get; init; }
+    public decimal RemainingToSpend { get; init; }
+
+    /// <summary>Legacy alias — equals RemainingToSpend. Kept for API backwards compatibility.</summary>
+    public decimal DynamicSpendableAmount => RemainingToSpend;
+
     public string Explanation { get; init; } = string.Empty;
 }
 
@@ -69,8 +71,12 @@ public interface IDynamicBudgetEngine
     DateTime CalculatePreviousPaycheckDate(int payDay1, int payDay2, DateTime nextPaycheckDate);
 
     /// <summary>
-    /// Executes the 6-step dynamic budget calculation.
-    /// Pure arithmetic — no side effects, no I/O.
+    /// Calculates how much the user can spend until the next paycheck.
+    ///
+    /// NO proration — the full paycheck minus obligations is available to spend,
+    /// regardless of where we are in the pay cycle.
+    ///
+    /// Formula: remainingToSpend = paycheckAmount - fixedBills - savings - debt
     /// </summary>
     BudgetCalculationResult CalculateDynamicBudget(BudgetCalculationRequest request);
 }
@@ -125,7 +131,7 @@ public class DynamicBudgetEngine : IDynamicBudgetEngine
         return (amount / expectedPaycheckAmount) >= LargeExpenseThresholdRatio;
     }
 
-    // ─── Pay Cycle ────────────────────────────────────────────────────────────
+    // ─── Pay Cycle (used only for date validation, not for calculation) ───────
 
     /// <summary>
     /// Given two pay-day-of-month numbers and the next paycheck date, returns the
@@ -157,68 +163,59 @@ public class DynamicBudgetEngine : IDynamicBudgetEngine
         }
     }
 
-    // ─── Budget Calculation (6-step engine) ──────────────────────────────────
+    // ─── Budget Calculation (no proration) ───────────────────────────────────
 
     /// <summary>
-    /// Step 1: payCycleDays  = nextPaycheck − previousPaycheck
-    /// Step 2: daysUntilNext = nextPaycheck − today
-    /// Step 3: totalRecurringCosts = fixedBills + savings + debt
-    /// Step 4: effectivePaycheck   = paycheckAmount − totalRecurringCosts
-    /// Step 5: prorateFactor       = daysUntilNext / payCycleDays
-    ///         dynamicSpendable    = effectivePaycheck × prorateFactor
-    /// Step 6: return structured result + human-readable explanation
+    /// Calculates how much the user has left to spend until the next paycheck.
+    ///
+    /// This is NOT a monthly budget and does NOT prorate by time.
+    /// The question answered is: "How much can I spend before I get paid again?"
+    ///
+    /// Step 1: totalObligations = fixedBills + savings + debt
+    /// Step 2: remainingToSpend = paycheckAmount - totalObligations
+    /// Step 3: return structured result + human-readable explanation
     /// </summary>
     public BudgetCalculationResult CalculateDynamicBudget(BudgetCalculationRequest req)
     {
-        // Step 1 — Pay cycle
-        int payCycleDays = (int)(req.NextPaycheckDate - req.PreviousPaycheckDate).TotalDays;
-        int daysUntilNextPaycheck = (int)(req.NextPaycheckDate - req.Today).TotalDays;
+        // Step 1 — Sum all obligations due before next paycheck
+        decimal fixedCostsRemaining = Math.Round(req.TotalFixedBills, 2);
+        decimal savingsContribution = Math.Round(req.SavingsContribution, 2);
+        decimal debtPerPaycheck = Math.Round(req.DebtPerPaycheck, 2);
 
-        // Step 3 — Total obligations
-        decimal totalRecurringCosts = Math.Round(
-            req.TotalFixedBills + req.SavingsContribution + req.DebtPerPaycheck, 2);
+        // Step 2 — Remaining to spend (no proration)
+        decimal remainingToSpend = Math.Round(
+            req.PaycheckAmount - fixedCostsRemaining - savingsContribution - debtPerPaycheck, 2);
 
-        // Step 4 — Effective paycheck
-        decimal effectivePaycheck = Math.Round(req.PaycheckAmount - totalRecurringCosts, 2);
-
-        // Step 5 — Prorate
-        decimal prorateFactor = payCycleDays > 0
-            ? Math.Round((decimal)daysUntilNextPaycheck / payCycleDays, 4)
-            : 0m;
-
-        decimal dynamicSpendableAmount = Math.Round(effectivePaycheck * prorateFactor, 2);
-
-        // Step 6 — Build explanation
+        // Step 3 — Build explanation
         var explanationLines = new List<string>
         {
-            $"- ${req.PaycheckAmount:0.00} paycheck"
+            $"Income:       ${req.PaycheckAmount:0.00}"
         };
 
-        if (req.TotalFixedBills > 0)
-            explanationLines.Add($"- minus ${req.TotalFixedBills:0.00} in upcoming bills");
+        if (fixedCostsRemaining > 0)
+            explanationLines.Add($"Fixed costs:  −${fixedCostsRemaining:0.00}");
 
-        if (req.DebtPerPaycheck > 0)
-            explanationLines.Add($"- minus ${req.DebtPerPaycheck:0.00} toward debt");
+        if (debtPerPaycheck > 0)
+            explanationLines.Add($"Debt payoff:  −${debtPerPaycheck:0.00}");
 
-        if (req.SavingsContribution > 0)
-            explanationLines.Add($"- minus ${req.SavingsContribution:0.00} in savings");
+        if (savingsContribution > 0)
+            explanationLines.Add($"Savings:      −${savingsContribution:0.00}");
 
-        int proratePercent = (int)Math.Round(prorateFactor * 100);
+        explanationLines.Add($"──────────────────────────");
+        explanationLines.Add($"Remaining:     ${remainingToSpend:0.00}");
+
         string explanation =
-            $"You'll have ${dynamicSpendableAmount:0.00} to spend before your next paycheck.\n\n" +
-            $"This is based on:\n{string.Join("\n", explanationLines)}\n\n" +
-            $"Adjusted for time remaining in this pay cycle ({proratePercent}%).";
+            $"You have ${remainingToSpend:0.00} to spend until your next paycheck.\n\n" +
+            string.Join("\n", explanationLines);
 
         return new BudgetCalculationResult
         {
-            PaycheckAmount        = Math.Round(req.PaycheckAmount, 2),
-            TotalRecurringCosts   = totalRecurringCosts,
-            DebtPerPaycheck       = Math.Round(req.DebtPerPaycheck, 2),
-            SavingsContribution   = Math.Round(req.SavingsContribution, 2),
-            EffectivePaycheck     = effectivePaycheck,
-            ProrateFactor         = prorateFactor,
-            DynamicSpendableAmount = dynamicSpendableAmount,
-            Explanation           = explanation
+            PaycheckAmount     = Math.Round(req.PaycheckAmount, 2),
+            FixedCostsRemaining = fixedCostsRemaining,
+            DebtPerPaycheck    = debtPerPaycheck,
+            SavingsContribution = savingsContribution,
+            RemainingToSpend   = remainingToSpend,
+            Explanation        = explanation
         };
     }
 

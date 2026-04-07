@@ -125,7 +125,7 @@ namespace BudgetApp.Api.Tests
         [Fact]
         public void CalculatePreviousPaycheckDate_Day31InShortMonth_ClampsToDayInMonth()
         {
-            // Pay days: 15 and 31. Next is April 15 → previous is April 31 clamped to 30.
+            // Pay days: 15 and 31. Next is April 15 → previous is March 31.
             var next = new DateTime(2026, 4, 15);
             var prev = _engine.CalculatePreviousPaycheckDate(15, 31, next);
 
@@ -135,170 +135,145 @@ namespace BudgetApp.Api.Tests
         }
     }
 
-    // ─── New: Budget Calculation Engine (6-step) ───────────────────────────────
+    // ─── Budget Calculation Engine (no proration) ─────────────────────────────
+    //
+    // Core formula: remainingToSpend = paycheckAmount - fixedBills - savings - debt
+    //
+    // There is NO time-based proration. The full paycheck minus obligations
+    // is the answer to "how much can I spend before I get paid again?"
 
     public class BudgetCalculationEngineTests
     {
         private readonly DynamicBudgetEngine _engine = new();
 
-        // Shared scenario: $2500 paycheck, 16-day pay cycle, 14 days remaining.
-        // Fixed bills = $500, savings = $200, debt = $150.
-        // totalRecurring = 850, effectivePaycheck = 1650
-        // prorateFactor = 14/16 = 0.875, spendable = 1650 * 0.875 = 1443.75
+        // Shared scenario: $2500 paycheck, fixed bills = $500, savings = $200, debt = $150.
+        // remainingToSpend = 2500 - 500 - 200 - 150 = 1650
         private BudgetCalculationRequest MakeStandardRequest(
             decimal paycheckAmount = 2500m,
             decimal totalFixedBills = 500m,
             decimal savingsContribution = 200m,
-            decimal debtPerPaycheck = 150m,
-            int payCycleDays = 16,
-            int daysUntilNext = 14)
+            decimal debtPerPaycheck = 150m)
         {
-            var today = new DateTime(2026, 4, 1);
-            var nextPaycheck = today.AddDays(daysUntilNext);
-            var prevPaycheck = nextPaycheck.AddDays(-payCycleDays);
+            var today = new DateTime(2026, 4, 7);
+            var nextPaycheck = new DateTime(2026, 4, 15);
 
             return new BudgetCalculationRequest
             {
-                PaycheckAmount       = paycheckAmount,
-                Today                = today,
-                PreviousPaycheckDate = prevPaycheck,
-                NextPaycheckDate     = nextPaycheck,
-                TotalFixedBills      = totalFixedBills,
-                SavingsContribution  = savingsContribution,
-                DebtPerPaycheck      = debtPerPaycheck
+                PaycheckAmount      = paycheckAmount,
+                Today               = today,
+                NextPaycheckDate    = nextPaycheck,
+                TotalFixedBills     = totalFixedBills,
+                SavingsContribution = savingsContribution,
+                DebtPerPaycheck     = debtPerPaycheck
             };
         }
 
-        // ── Step 3: totalRecurringCosts ───────────────────────────────────────
+        // ── Core formula tests ────────────────────────────────────────────────
 
         [Fact]
-        public void TotalRecurringCosts_IsSumOfBillsSavingsDebt()
+        public void RemainingToSpend_IsPaycheckMinusAllObligations()
         {
             var result = _engine.CalculateDynamicBudget(MakeStandardRequest());
 
-            // 500 + 200 + 150 = 850
-            Assert.Equal(850m, result.TotalRecurringCosts);
+            // 2500 - 500 - 200 - 150 = 1650
+            Assert.Equal(1650m, result.RemainingToSpend);
         }
 
         [Fact]
-        public void TotalRecurringCosts_WhenNoDebt_IsBillsPlusSavings()
+        public void RemainingToSpend_EqualsDynamicSpendableAmount_LegacyAlias()
+        {
+            var result = _engine.CalculateDynamicBudget(MakeStandardRequest());
+
+            Assert.Equal(result.RemainingToSpend, result.DynamicSpendableAmount);
+        }
+
+        [Fact]
+        public void RemainingToSpend_WhenNoDebt_IsPaycheckMinusFixedAndSavings()
         {
             var req = MakeStandardRequest(debtPerPaycheck: 0m);
             var result = _engine.CalculateDynamicBudget(req);
 
-            // 500 + 200 + 0 = 700
-            Assert.Equal(700m, result.TotalRecurringCosts);
+            // 2500 - 500 - 200 = 1800
+            Assert.Equal(1800m, result.RemainingToSpend);
         }
 
         [Fact]
-        public void SavingsAlwaysIncluded_EvenWithNoBillsOrDebt()
+        public void RemainingToSpend_WhenNoObligations_IsFullPaycheck()
         {
-            var req = MakeStandardRequest(totalFixedBills: 0m, debtPerPaycheck: 0m, savingsContribution: 300m);
+            var req = MakeStandardRequest(totalFixedBills: 0m, savingsContribution: 0m, debtPerPaycheck: 0m);
             var result = _engine.CalculateDynamicBudget(req);
 
-            Assert.Equal(300m, result.TotalRecurringCosts);
-            Assert.Equal(300m, result.SavingsContribution);
-        }
-
-        // ── Step 4: effectivePaycheck ─────────────────────────────────────────
-
-        [Fact]
-        public void EffectivePaycheck_IsPaycheckMinusTotalRecurring()
-        {
-            var result = _engine.CalculateDynamicBudget(MakeStandardRequest());
-
-            // 2500 - 850 = 1650
-            Assert.Equal(1650m, result.EffectivePaycheck);
+            Assert.Equal(2500m, result.RemainingToSpend);
         }
 
         [Fact]
-        public void EffectivePaycheck_CanBeNegative_WhenCostsExceedPaycheck()
+        public void RemainingToSpend_CanBeNegative_WhenObligationsExceedPaycheck()
         {
-            var req = MakeStandardRequest(paycheckAmount: 500m, totalFixedBills: 600m);
+            // 500 - 500 - 200 - 150 = -350
+            var req = MakeStandardRequest(paycheckAmount: 500m);
             var result = _engine.CalculateDynamicBudget(req);
 
-            // 500 - (600+200+150) = 500 - 950 = -450
-            Assert.Equal(-450m, result.EffectivePaycheck);
+            Assert.Equal(-350m, result.RemainingToSpend);
         }
 
-        // ── Step 5: prorateFactor & dynamicSpendableAmount ───────────────────
+        // ── No proration: result is the SAME regardless of day in pay cycle ──
 
         [Fact]
-        public void ProrateFactor_IsRatioOfDaysRemainingToCycleDays()
+        public void RemainingToSpend_IsSameAtStartAndEndOfPayCycle()
         {
-            // 14 days remaining out of 16-day cycle = 0.875
-            var result = _engine.CalculateDynamicBudget(MakeStandardRequest(payCycleDays: 16, daysUntilNext: 14));
+            // Day of month should NOT matter — no proration applied
+            var reqEarlyInCycle = new BudgetCalculationRequest
+            {
+                PaycheckAmount      = 2500m,
+                Today               = new DateTime(2026, 4, 1),  // start of cycle
+                NextPaycheckDate    = new DateTime(2026, 4, 15),
+                TotalFixedBills     = 500m,
+                SavingsContribution = 200m,
+                DebtPerPaycheck     = 150m
+            };
 
-            Assert.Equal(0.875m, result.ProrateFactor);
+            var reqLateInCycle = new BudgetCalculationRequest
+            {
+                PaycheckAmount      = 2500m,
+                Today               = new DateTime(2026, 4, 14), // one day before payday
+                NextPaycheckDate    = new DateTime(2026, 4, 15),
+                TotalFixedBills     = 500m,
+                SavingsContribution = 200m,
+                DebtPerPaycheck     = 150m
+            };
+
+            var earlyResult = _engine.CalculateDynamicBudget(reqEarlyInCycle);
+            var lateResult  = _engine.CalculateDynamicBudget(reqLateInCycle);
+
+            // Both should give the same answer — 2500 - 850 = 1650
+            Assert.Equal(1650m, earlyResult.RemainingToSpend);
+            Assert.Equal(1650m, lateResult.RemainingToSpend);
         }
 
-        [Fact]
-        public void DynamicSpendableAmount_IsEffectivePaycheckTimesProrateFactor()
-        {
-            // effectivePaycheck = 1650, prorateFactor = 0.875 → 1443.75
-            var result = _engine.CalculateDynamicBudget(MakeStandardRequest(payCycleDays: 16, daysUntilNext: 14));
-
-            Assert.Equal(1443.75m, result.DynamicSpendableAmount);
-        }
+        // ── Task example scenario: April 7, next paycheck April 15 ───────────
 
         [Fact]
-        public void DynamicSpendableAmount_AtStartOfCycle_IsNearFullEffectivePaycheck()
+        public void RemainingToSpend_TaskExample_April7_April15()
         {
-            // 15 days remaining out of 15-day cycle = prorateFactor 1.0
-            var req = MakeStandardRequest(payCycleDays: 15, daysUntilNext: 15);
-            var result = _engine.CalculateDynamicBudget(req);
-
-            Assert.Equal(1m, result.ProrateFactor);
-            Assert.Equal(1650m, result.DynamicSpendableAmount);
-        }
-
-        [Fact]
-        public void DynamicSpendableAmount_NearEndOfCycle_IsSmall()
-        {
-            // 1 day remaining out of 15-day cycle
-            var req = MakeStandardRequest(payCycleDays: 15, daysUntilNext: 1);
-            var result = _engine.CalculateDynamicBudget(req);
-
-            // prorateFactor = round(1/15, 4) = 0.0667
-            // spendable = 1650 * 0.0667 = 110.055 → rounds to 110.06
-            Assert.Equal(0.0667m, result.ProrateFactor);
-            Assert.Equal(110.06m, result.DynamicSpendableAmount);
-        }
-
-        [Fact]
-        public void DynamicSpendableAmount_StandardBiMonthly_MatchesKnownValues()
-        {
-            // Bi-monthly (1st and 15th) — today is April 7, next paycheck April 15.
-            // payCycleDays = 14 (April 1 → April 15)
-            // daysUntilNext = 8 (April 7 → April 15)
-            // effectivePaycheck = 2500 - 850 = 1650
-            // prorateFactor = round(8/14, 4) = 0.5714
-            // spendable = 1650 * 0.5714 = 942.81
-
-            var today = new DateTime(2026, 4, 7);
-            var nextPaycheck = new DateTime(2026, 4, 15);
-            var prevPaycheck = new DateTime(2026, 4, 1);
-
+            // Today: April 7. Next paycheck: April 15 ($2500)
+            // Fixed costs: $1250, Savings: $200, Debt: $300
+            // Expected: 2500 - 1250 - 200 - 300 = 750
             var req = new BudgetCalculationRequest
             {
-                PaycheckAmount       = 2500m,
-                Today                = today,
-                PreviousPaycheckDate = prevPaycheck,
-                NextPaycheckDate     = nextPaycheck,
-                TotalFixedBills      = 500m,
-                SavingsContribution  = 200m,
-                DebtPerPaycheck      = 150m
+                PaycheckAmount      = 2500m,
+                Today               = new DateTime(2026, 4, 7),
+                NextPaycheckDate    = new DateTime(2026, 4, 15),
+                TotalFixedBills     = 1250m,
+                SavingsContribution = 200m,
+                DebtPerPaycheck     = 300m
             };
 
             var result = _engine.CalculateDynamicBudget(req);
 
-            Assert.Equal(850m, result.TotalRecurringCosts);
-            Assert.Equal(1650m, result.EffectivePaycheck);
-            Assert.Equal(0.5714m, result.ProrateFactor);
-            Assert.Equal(942.81m, result.DynamicSpendableAmount);
+            Assert.Equal(750m, result.RemainingToSpend);
         }
 
-        // ── Step 6: structured result fields ─────────────────────────────────
+        // ── Individual field pass-through ─────────────────────────────────────
 
         [Fact]
         public void Result_PassesThroughInputFields()
@@ -307,16 +282,30 @@ namespace BudgetApp.Api.Tests
             var result = _engine.CalculateDynamicBudget(req);
 
             Assert.Equal(2500m, result.PaycheckAmount);
-            Assert.Equal(150m, result.DebtPerPaycheck);
-            Assert.Equal(200m, result.SavingsContribution);
+            Assert.Equal(500m,  result.FixedCostsRemaining);
+            Assert.Equal(150m,  result.DebtPerPaycheck);
+            Assert.Equal(200m,  result.SavingsContribution);
         }
 
         [Fact]
-        public void Explanation_ContainsDynamicSpendableAmount()
+        public void SavingsAlwaysIncluded_EvenWithNoBillsOrDebt()
+        {
+            var req = MakeStandardRequest(totalFixedBills: 0m, debtPerPaycheck: 0m, savingsContribution: 300m);
+            var result = _engine.CalculateDynamicBudget(req);
+
+            // 2500 - 0 - 300 - 0 = 2200
+            Assert.Equal(300m,  result.SavingsContribution);
+            Assert.Equal(2200m, result.RemainingToSpend);
+        }
+
+        // ── Explanation text ──────────────────────────────────────────────────
+
+        [Fact]
+        public void Explanation_ContainsRemainingToSpend()
         {
             var result = _engine.CalculateDynamicBudget(MakeStandardRequest());
 
-            Assert.Contains(result.DynamicSpendableAmount.ToString("0.00"), result.Explanation);
+            Assert.Contains(result.RemainingToSpend.ToString("0.00"), result.Explanation);
         }
 
         [Fact]
@@ -324,7 +313,7 @@ namespace BudgetApp.Api.Tests
         {
             var result = _engine.CalculateDynamicBudget(MakeStandardRequest());
 
-            Assert.Contains("$2500.00 paycheck", result.Explanation);
+            Assert.Contains("2500.00", result.Explanation);
         }
 
         [Fact]
@@ -332,8 +321,8 @@ namespace BudgetApp.Api.Tests
         {
             var result = _engine.CalculateDynamicBudget(MakeStandardRequest(debtPerPaycheck: 150m));
 
-            Assert.Contains("toward debt", result.Explanation);
-            Assert.Contains("$150.00", result.Explanation);
+            Assert.Contains("Debt payoff", result.Explanation);
+            Assert.Contains("150.00", result.Explanation);
         }
 
         [Fact]
@@ -341,7 +330,7 @@ namespace BudgetApp.Api.Tests
         {
             var result = _engine.CalculateDynamicBudget(MakeStandardRequest(debtPerPaycheck: 0m));
 
-            Assert.DoesNotContain("toward debt", result.Explanation);
+            Assert.DoesNotContain("Debt payoff", result.Explanation);
         }
 
         [Fact]
@@ -349,17 +338,28 @@ namespace BudgetApp.Api.Tests
         {
             var result = _engine.CalculateDynamicBudget(MakeStandardRequest(savingsContribution: 200m));
 
-            Assert.Contains("in savings", result.Explanation);
-            Assert.Contains("$200.00", result.Explanation);
+            Assert.Contains("Savings", result.Explanation);
+            Assert.Contains("200.00", result.Explanation);
         }
 
         [Fact]
-        public void Explanation_ContainsBillsLine_WhenBillsIsNonZero()
+        public void Explanation_ContainsFixedCostsLine_WhenBillsIsNonZero()
         {
             var result = _engine.CalculateDynamicBudget(MakeStandardRequest(totalFixedBills: 500m));
 
-            Assert.Contains("in upcoming bills", result.Explanation);
-            Assert.Contains("$500.00", result.Explanation);
+            Assert.Contains("Fixed costs", result.Explanation);
+            Assert.Contains("500.00", result.Explanation);
+        }
+
+        [Fact]
+        public void Explanation_DoesNotContainProration()
+        {
+            var result = _engine.CalculateDynamicBudget(MakeStandardRequest());
+
+            // Confirm no time-scaling language appears anywhere
+            Assert.DoesNotContain("pay cycle", result.Explanation);
+            Assert.DoesNotContain("prorate", result.Explanation);
+            Assert.DoesNotContain("time remaining", result.Explanation);
         }
 
         // ── Rounding & precision ──────────────────────────────────────────────
@@ -367,22 +367,18 @@ namespace BudgetApp.Api.Tests
         [Fact]
         public void AllMonetaryValues_AreRoundedToTwoDecimalPlaces()
         {
-            // Use values that would produce many decimal places without rounding
-            var today = new DateTime(2026, 4, 7);
             var req = new BudgetCalculationRequest
             {
-                PaycheckAmount       = 2333.33m,
-                Today                = today,
-                PreviousPaycheckDate = new DateTime(2026, 4, 1),
-                NextPaycheckDate     = new DateTime(2026, 4, 15),
-                TotalFixedBills      = 333.33m,
-                SavingsContribution  = 111.11m,
-                DebtPerPaycheck      = 77.77m
+                PaycheckAmount      = 2333.33m,
+                Today               = new DateTime(2026, 4, 7),
+                NextPaycheckDate    = new DateTime(2026, 4, 15),
+                TotalFixedBills     = 333.33m,
+                SavingsContribution = 111.11m,
+                DebtPerPaycheck     = 77.77m
             };
 
             var result = _engine.CalculateDynamicBudget(req);
 
-            // Assert no more than 2 decimal places on each monetary field
             static void AssertMaxTwoDecimals(decimal value, string fieldName)
             {
                 decimal rounded = Math.Round(value, 2);
@@ -390,24 +386,22 @@ namespace BudgetApp.Api.Tests
                     $"{fieldName} has more than 2 decimal places: {value}");
             }
 
-            AssertMaxTwoDecimals(result.PaycheckAmount,          nameof(result.PaycheckAmount));
-            AssertMaxTwoDecimals(result.TotalRecurringCosts,     nameof(result.TotalRecurringCosts));
-            AssertMaxTwoDecimals(result.EffectivePaycheck,       nameof(result.EffectivePaycheck));
-            AssertMaxTwoDecimals(result.DynamicSpendableAmount,  nameof(result.DynamicSpendableAmount));
-            AssertMaxTwoDecimals(result.DebtPerPaycheck,         nameof(result.DebtPerPaycheck));
-            AssertMaxTwoDecimals(result.SavingsContribution,     nameof(result.SavingsContribution));
+            AssertMaxTwoDecimals(result.PaycheckAmount,      nameof(result.PaycheckAmount));
+            AssertMaxTwoDecimals(result.FixedCostsRemaining, nameof(result.FixedCostsRemaining));
+            AssertMaxTwoDecimals(result.RemainingToSpend,    nameof(result.RemainingToSpend));
+            AssertMaxTwoDecimals(result.DebtPerPaycheck,     nameof(result.DebtPerPaycheck));
+            AssertMaxTwoDecimals(result.SavingsContribution, nameof(result.SavingsContribution));
         }
 
         [Fact]
-        public void DynamicSpendableAmount_IsReproducible_GivenSameInputs()
+        public void RemainingToSpend_IsReproducible_GivenSameInputs()
         {
             var req = MakeStandardRequest();
 
             var result1 = _engine.CalculateDynamicBudget(req);
             var result2 = _engine.CalculateDynamicBudget(req);
 
-            Assert.Equal(result1.DynamicSpendableAmount, result2.DynamicSpendableAmount);
-            Assert.Equal(result1.ProrateFactor, result2.ProrateFactor);
+            Assert.Equal(result1.RemainingToSpend, result2.RemainingToSpend);
         }
     }
 }

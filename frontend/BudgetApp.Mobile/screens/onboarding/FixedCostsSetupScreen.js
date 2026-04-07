@@ -55,20 +55,26 @@ const getAuthHeader = async () => {
     return { headers: { 'Authorization': `Bearer ${token}` } };
 };
 
-export default function FixedCostsSetupScreen({ navigation }) {
+export default function FixedCostsSetupScreen({ navigation, route }) {
     const [isLoading, setIsLoading] = useState(true);
     const [isSaving, setIsSaving] = useState(false);
+
+    // Income params forwarded from DepositOnboardingScreen
+    const incomeParams = {
+        paycheckAmount: route.params?.paycheckAmount,
+        payDay1: route.params?.payDay1,
+        payDay2: route.params?.payDay2,
+    };
 
     // Mandatory Fixed Inputs
     const [manualRent, setManualRent] = useState('');
     const [manualCar, setManualCar] = useState('');
     const [manualStudentLoan, setManualStudentLoan] = useState('');
-    const [manualSavingsGoal, setManualSavingsGoal] = useState('');
 
     // Date Inputs
     const [manualRentDueDate, setManualRentDueDate] = useState('');
-    const [manualCarDueDate, setManualCarDueDate] = useState(''); // NEW STATE
-    const [manualStudentLoanDueDate, setManualStudentLoanDueDate] = useState(''); // NEW STATE
+    const [manualCarDueDate, setManualCarDueDate] = useState('');
+    const [manualStudentLoanDueDate, setManualStudentLoanDueDate] = useState('');
 
     // Dynamic List State
     const [otherManualCosts, setOtherManualCosts] = useState([]);
@@ -162,11 +168,11 @@ export default function FixedCostsSetupScreen({ navigation }) {
                 }
             };
 
-            // 1. Mandatory Fixed Costs (All now include dates where necessary)
+            // 1. Mandatory Fixed Costs
             addManualCost('Rent/Mortgage', manualRent, manualRentDueDate, 'Housing');
-            addManualCost('Car Payment', manualCar, manualCarDueDate, 'Transportation'); // USING NEW DATE STATE
-            addManualCost('Student Loan', manualStudentLoan, manualStudentLoanDueDate, 'Loan'); // USING NEW DATE STATE
-            addManualCost('Savings Goal', manualSavingsGoal, null, 'Savings'); // Savings goal passes NULL date
+            addManualCost('Car Payment', manualCar, manualCarDueDate, 'Transportation');
+            addManualCost('Student Loan', manualStudentLoan, manualStudentLoanDueDate, 'Loan');
+            // NOTE: Savings is collected in a dedicated screen AFTER debt onboarding.
 
             // 2. Dynamic Manual Costs (from the list)
             otherManualCosts.forEach(cost => {
@@ -193,8 +199,8 @@ export default function FixedCostsSetupScreen({ navigation }) {
                 await axios.post(`${API_BASE_URL}/api/fixed-costs`, cost, config);
             }
 
-            // Success! Move to the next step.
-            navigation.navigate('DebtOnboarding');
+            // Success! Move to the next step, passing income params through.
+            navigation.navigate('DebtOnboarding', incomeParams);
 
         } catch (error) {
             console.error("Failed to save costs:", error);
@@ -215,7 +221,7 @@ export default function FixedCostsSetupScreen({ navigation }) {
 
     return (
         <SafeAreaView style={styles.container}>
-            <Text style={styles.header}>Recurring Costs Setup (3/5)</Text>
+            <Text style={styles.header}>Fixed Costs (2/4)</Text>
             <ScrollView contentContainerStyle={styles.scrollContent}>
 
                 {/* --- A. Mandatory Payments & Savings (Fixed Inputs) --- */}
@@ -280,16 +286,6 @@ export default function FixedCostsSetupScreen({ navigation }) {
                             />
                         </View>
 
-                        {/* SAVINGS GOAL: No Date Needed */}
-                        <Text style={styles.inputLabel}>Monthly Savings Goal</Text>
-                        <TextInput
-                            label="Amount ($)"
-                            value={manualSavingsGoal}
-                            onChangeText={setManualSavingsGoal}
-                            keyboardType="numeric"
-                            style={styles.input}
-                        />
-
                     </Card.Content>
                 </Card>
 
@@ -351,7 +347,7 @@ export default function FixedCostsSetupScreen({ navigation }) {
             </ScrollView>
 
             <Button mode="contained" onPress={handleNext} loading={isSaving} style={styles.bottomButton}>
-                Next: Finalize Paycheck
+                Next: Debt
             </Button>
 
             {/* --- Modal to Add Dynamic Recurring Costs --- */}

@@ -878,7 +878,7 @@ app.MapPost("/api/budget/finalize", async (
         if (nextPaycheck <= today)
             return Results.BadRequest("Next paycheck date must be in the future.");
 
-        // Step 1 — Determine pay cycle using the engine
+        // Step 1 — Validate pay cycle using the engine
         var previousPaycheck = budgetEngine.CalculatePreviousPaycheckDate(
             request.PayDay1, request.PayDay2, nextPaycheck);
 
@@ -890,7 +890,8 @@ app.MapPost("/api/budget/finalize", async (
         if (daysUntilNextPaycheck < 0 || daysUntilNextPaycheck > payCycleDays)
             return Results.BadRequest("Next paycheck date is inconsistent with pay days / current date.");
 
-        // Step 2 — Filter fixed costs for this period
+        // Step 2 — Filter fixed costs that occur BEFORE the next paycheck
+        // (savings are excluded from the date filter — always included per paycheck)
         var fixedBillsThisPeriod = await dbContext.FixedCosts
             .Where(fc => fc.UserId == user.Id
                 && fc.NextDueDate.HasValue
@@ -907,12 +908,12 @@ app.MapPost("/api/budget/finalize", async (
         decimal savingsContribution = savingsThisPeriod.Sum(fc => fc.Amount);
         decimal debtPerPaycheck = request.DebtPerPaycheck ?? 0m;
 
-        // Steps 3–6 — Delegate to the pure budget engine
+        // Step 3 — Delegate to the pure budget engine (NO proration)
+        // Formula: remainingToSpend = paycheckAmount - fixedBills - savings - debt
         var calcRequest = new BudgetCalculationRequest
         {
             PaycheckAmount      = request.PaycheckAmount,
             Today               = today,
-            PreviousPaycheckDate = previousPaycheck,
             NextPaycheckDate    = nextPaycheck,
             TotalFixedBills     = totalFixedBills,
             SavingsContribution = savingsContribution,
@@ -921,14 +922,14 @@ app.MapPost("/api/budget/finalize", async (
 
         var result = budgetEngine.CalculateDynamicBudget(calcRequest);
 
-        // Persist the dynamic balance
+        // Persist the remaining-to-spend as the user's balance
         var balanceRecord = await dbContext.Balances.FirstOrDefaultAsync(b => b.UserId == user.Id);
         if (balanceRecord == null)
         {
             balanceRecord = new Balance
             {
                 UserId        = user.Id,
-                BalanceAmount = result.DynamicSpendableAmount,
+                BalanceAmount = result.RemainingToSpend,
                 CreatedAt     = DateTime.UtcNow,
                 UpdatedAt     = DateTime.UtcNow
             };
@@ -936,7 +937,7 @@ app.MapPost("/api/budget/finalize", async (
         }
         else
         {
-            balanceRecord.BalanceAmount = result.DynamicSpendableAmount;
+            balanceRecord.BalanceAmount = result.RemainingToSpend;
             balanceRecord.UpdatedAt     = DateTime.UtcNow;
         }
 
@@ -949,20 +950,19 @@ app.MapPost("/api/budget/finalize", async (
 
         await dbContext.SaveChangesAsync();
 
-        // Return full structured response
+        // Return structured response — no proration fields
         return Results.Ok(new
         {
             message                = "Setup complete.",
             paycheckAmount         = result.PaycheckAmount,
-            totalRecurringCosts    = result.TotalRecurringCosts,
+            fixedCostsRemaining    = result.FixedCostsRemaining,
             debtPerPaycheck        = result.DebtPerPaycheck,
             savingsContribution    = result.SavingsContribution,
-            effectivePaycheck      = result.EffectivePaycheck,
-            prorateFactor          = result.ProrateFactor,
+            remainingToSpend       = result.RemainingToSpend,
+            // Legacy alias kept so older clients still work
             dynamicSpendableAmount = result.DynamicSpendableAmount,
-            explanation            = result.Explanation,
-            // Legacy fields — kept for backwards compatibility
-            dynamicBalance         = result.DynamicSpendableAmount.ToString("0.00")
+            dynamicBalance         = result.RemainingToSpend.ToString("0.00"),
+            explanation            = result.Explanation
         });
     }
     catch (Exception e)

@@ -77,10 +77,10 @@ function WebPlaidContent({
 
       <Button
         mode="outlined"
-        onPress={() => navigation.navigate('FixedCostsSetup')}
+        onPress={() => navigation.navigate('DepositOnboarding')}
         style={styles.postConnectButton}
       >
-        Continue to Fixed Costs Setup
+        Continue: Enter Your Income
       </Button>
     </View>
   );
@@ -128,7 +128,7 @@ function WebPlaidContent({
   return (
     <SafeAreaView style={styles.safeArea}>
       <View style={styles.contentContainer}>
-        <Text style={styles.header}>Connect Your Accounts (1/4)</Text>
+        <Text style={styles.header}>Connect Your Accounts</Text>
 
         {!!error && (
           <Text style={styles.errorText} selectable>
@@ -217,10 +217,10 @@ function NativePlaidContent({
 
       <Button
         mode="outlined"
-        onPress={() => navigation.navigate('FixedCostsSetup')}
+        onPress={() => navigation.navigate('DepositOnboarding')}
         style={styles.postConnectButton}
       >
-        Continue to Fixed Costs Setup
+        Continue: Enter Your Income
       </Button>
     </View>
   );
@@ -277,7 +277,7 @@ function NativePlaidContent({
   return (
     <SafeAreaView style={styles.safeArea}>
       <View style={styles.contentContainer}>
-        <Text style={styles.header}>Connect Your Accounts (1/4)</Text>
+        <Text style={styles.header}>Connect Your Accounts</Text>
 
         {!!error && (
           <Text style={styles.errorText} selectable>
