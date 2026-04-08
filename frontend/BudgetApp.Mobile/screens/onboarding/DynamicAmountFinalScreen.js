@@ -1,27 +1,33 @@
-// File: screens/onboarding/DynamicAmountFinalScreen.js
-//
-// Final onboarding screen: displays the user's remaining-to-spend amount
-// with a clean breakdown. No proration, no time-remaining tags.
-//
-// Displayed answer to: "How much do I have left until I get paid again?"
-
 import React, { useState } from 'react';
-import { View, ScrollView, StyleSheet, Alert, ActivityIndicator } from 'react-native';
+import { View, ScrollView, StyleSheet, Alert, ActivityIndicator, StatusBar } from 'react-native';
 import { Text, Button, Divider } from 'react-native-paper';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import axios from 'axios';
 import { StackActions } from '@react-navigation/native';
-
 import { auth } from '../../firebaseConfig';
 import { API_BASE_URL } from '../../config/api';
+
+// ─── Design tokens ────────────────────────────────────────────────────────────
+const C = {
+  primary:   '#5B21B6',
+  primaryLt: '#7C3AED',
+  success:   '#10B981',
+  successBg: '#ECFDF5',
+  danger:    '#EF4444',
+  surface:   '#FFFFFF',
+  bg:        '#F5F3FF',
+  text:      '#1E1B4B',
+  muted:     '#6B7280',
+  border:    '#E5E7EB',
+};
 
 export default function DynamicAmountFinalScreen({ navigation, route }) {
   const {
     remainingToSpend,
-    dynamicSpendableAmount, // legacy alias
+    dynamicSpendableAmount,
     paycheckAmount,
     fixedCostsRemaining,
-    baseRemaining,          // paycheck - fixedCosts (before debt/savings)
+    baseRemaining,
     debtPerPaycheck,
     savingsContribution,
     explanation,
@@ -29,13 +35,12 @@ export default function DynamicAmountFinalScreen({ navigation, route }) {
 
   const [isChecking, setIsChecking] = useState(false);
 
-  // Resolve primary display value — prefer new field, fall back to legacy alias
   const displayAmount =
-    remainingToSpend != null
-      ? parseFloat(remainingToSpend).toFixed(2)
-      : dynamicSpendableAmount != null
-      ? parseFloat(dynamicSpendableAmount).toFixed(2)
-      : '0.00';
+    remainingToSpend != null        ? parseFloat(remainingToSpend).toFixed(2)
+    : dynamicSpendableAmount != null ? parseFloat(dynamicSpendableAmount).toFixed(2)
+    : '0.00';
+
+  const isPositive = parseFloat(displayAmount) >= 0;
 
   const getAuthHeader = async () => {
     const user = auth.currentUser;
@@ -46,41 +51,23 @@ export default function DynamicAmountFinalScreen({ navigation, route }) {
 
   const handleFinish = async () => {
     setIsChecking(true);
-
     try {
       const config = await getAuthHeader();
-      let profile;
       let retryCount = 0;
-
-      // Poll backend until onboardingComplete is true (max 5 retries)
       do {
-        if (retryCount > 0) {
-          await new Promise((resolve) => setTimeout(resolve, 500));
-        }
-
-        const response = await axios.get(`${API_BASE_URL}/api/users/profile`, config);
-        profile = response.data;
-
+        if (retryCount > 0) await new Promise(r => setTimeout(r, 500));
+        const { data: profile } = await axios.get(`${API_BASE_URL}/api/users/profile`, config);
         if (profile.onboardingComplete) {
           const parentNav = navigation.getParent();
-          if (parentNav) {
-            parentNav.dispatch(StackActions.replace('App'));
-          } else {
-            navigation.navigate('App');
-          }
+          if (parentNav) parentNav.dispatch(StackActions.replace('App'));
+          else navigation.navigate('App');
           return;
         }
-
         retryCount++;
       } while (retryCount < 5);
-
-      Alert.alert(
-        'Setup Error',
-        'Failed to confirm setup status. Please log out and log back in.',
-      );
+      Alert.alert('Setup Error', 'Failed to confirm setup. Please log out and try again.');
     } catch (e) {
-      console.error('Error verifying final setup status', e);
-      Alert.alert('Network Error', 'Could not verify final setup status. Please try again.');
+      Alert.alert('Network Error', 'Could not verify setup status.');
     } finally {
       setIsChecking(false);
     }
@@ -88,282 +75,169 @@ export default function DynamicAmountFinalScreen({ navigation, route }) {
 
   if (isChecking) {
     return (
-      <View style={styles.loadingContainer}>
-        <ActivityIndicator size="large" />
-        <Text style={styles.loadingText}>Finalizing your setup...</Text>
+      <View style={s.loadingContainer}>
+        <ActivityIndicator size="large" color={C.primary} />
+        <Text style={{ marginTop: 14, color: C.muted, fontSize: 15 }}>Finalizing your setup…</Text>
       </View>
     );
   }
 
   return (
-    <SafeAreaView style={styles.container}>
-      <ScrollView contentContainerStyle={styles.scrollContent} showsVerticalScrollIndicator={false}>
+    <SafeAreaView style={s.safe}>
+      <StatusBar barStyle="light-content" backgroundColor={C.primary} />
+      <ScrollView contentContainerStyle={s.scroll} showsVerticalScrollIndicator={false}>
 
-        <Text style={styles.header}>Your Budget is Ready!</Text>
-
-        {/* ── Big spendable number ── */}
-        <View style={styles.amountBox}>
-          <Text style={styles.amountLabel}>
-            You have this much to spend until your next paycheck:
-          </Text>
-          <Text style={[styles.amountValue, parseFloat(displayAmount) < 0 && styles.amountNegative]}>
+        {/* Hero header */}
+        <View style={s.hero}>
+          <Text style={s.heroEyebrow}>YOUR DYNAMIC BUDGET</Text>
+          <Text style={s.heroLabel}>You have until your next paycheck:</Text>
+          <Text style={[s.heroAmount, !isPositive && { color: '#FECACA' }]}>
             ${displayAmount}
           </Text>
+          {isPositive && (
+            <View style={s.heroBadge}>
+              <Text style={s.heroBadgeTxt}>✓ Budget set</Text>
+            </View>
+          )}
         </View>
 
-        {/* ── Breakdown table ── */}
+        {/* Breakdown card */}
         {paycheckAmount != null && (
-          <View style={styles.breakdownCard}>
-            <Text style={styles.breakdownTitle}>How we calculated this</Text>
-            <Divider style={styles.divider} />
+          <View style={s.card}>
+            <Text style={s.cardTitle}>How we calculated this</Text>
+            <Divider style={s.div} />
 
-            <BreakdownRow
-              label="Income (net)"
-              value={paycheckAmount}
-              isPositive
-            />
+            <Row label="Income (net)" value={paycheckAmount} color={C.success} prefix="+" />
 
             {parseFloat(fixedCostsRemaining) > 0 && (
-              <BreakdownRow
-                label="Fixed costs"
-                value={fixedCostsRemaining}
-                isDeduction
-              />
+              <Row label="Fixed costs" value={fixedCostsRemaining} color={C.danger} prefix="−" />
             )}
 
-            {/* Show base remaining as a subtotal if we have it */}
+            {/* Subtotal: before debt & savings */}
             {baseRemaining != null && (parseFloat(debtPerPaycheck) > 0 || parseFloat(savingsContribution) > 0) && (
               <>
-                <Divider style={[styles.divider, { marginVertical: 6 }]} />
-                <BreakdownRow
-                  label="Before debt & savings"
-                  value={baseRemaining}
-                  isPositive={parseFloat(baseRemaining) >= 0}
-                />
-                <Divider style={[styles.divider, { marginVertical: 6 }]} />
+                <View style={s.subtotalRow}>
+                  <Text style={s.subtotalLabel}>Before debt & savings</Text>
+                  <Text style={[s.subtotalValue, parseFloat(baseRemaining) < 0 && { color: C.danger }]}>
+                    ${parseFloat(baseRemaining).toFixed(2)}
+                  </Text>
+                </View>
+                <Divider style={[s.div, { marginVertical: 6 }]} />
               </>
             )}
 
             {parseFloat(debtPerPaycheck) > 0 && (
-              <BreakdownRow
-                label="Debt payoff"
-                value={debtPerPaycheck}
-                isDeduction
-              />
+              <Row label="Debt payoff" value={debtPerPaycheck} color={C.danger} prefix="−" />
             )}
 
             {parseFloat(savingsContribution) > 0 && (
-              <BreakdownRow
-                label="Savings goal"
-                value={savingsContribution}
-                isDeduction
-              />
+              <Row label="Savings goal" value={savingsContribution} color={C.danger} prefix="−" />
             )}
 
-            <Divider style={styles.divider} />
+            <Divider style={s.div} />
 
-            <BreakdownRow
-              label="Remaining to spend"
-              value={remainingToSpend ?? dynamicSpendableAmount}
-              isPositive={parseFloat(remainingToSpend ?? dynamicSpendableAmount) >= 0}
-              bold
-              large
-            />
+            <View style={s.totalRow}>
+              <Text style={s.totalLabel}>Remaining to spend</Text>
+              <Text style={[s.totalValue, !isPositive && { color: C.danger }]}>
+                ${displayAmount}
+              </Text>
+            </View>
           </View>
         )}
 
-        {/* ── Engine explanation ── */}
+        {/* Explanation monospace card */}
         {explanation && (
-          <View style={styles.explanationCard}>
-            <Text style={styles.explanationText}>{explanation}</Text>
+          <View style={s.explainCard}>
+            <Text style={s.explainHead}>DETAILS</Text>
+            <Text style={s.explainTxt}>{explanation}</Text>
           </View>
         )}
 
-        <View style={styles.infoBox}>
-          <Text style={styles.infoText}>
-            💡 This number updates automatically whenever new transactions come in from
-            your linked bank accounts.
+        {/* Info nudge */}
+        <View style={s.infoCard}>
+          <Text style={s.infoTxt}>
+            💡 Your budget updates automatically as new transactions arrive from your linked accounts.
           </Text>
         </View>
 
       </ScrollView>
 
-      <Button
-        mode="contained"
-        onPress={handleFinish}
-        style={styles.button}
-        contentStyle={styles.buttonContent}
-      >
-        I Understand — Finish Setup
-      </Button>
+      <View style={s.footer}>
+        <Button mode="contained" onPress={handleFinish}
+          style={s.btn} contentStyle={s.btnContent} labelStyle={s.btnLabel} buttonColor={C.primary}>
+          I Understand — Start Using My Budget
+        </Button>
+      </View>
     </SafeAreaView>
   );
 }
 
-// ─── Small helper component for breakdown rows ────────────────────────────────
-
-function BreakdownRow({ label, value, isPositive, isDeduction, bold, large }) {
-  const formattedValue =
-    value != null
-      ? `${isDeduction ? '−' : ''}$${Math.abs(parseFloat(value)).toFixed(2)}`
-      : null;
-
+function Row({ label, value, color, prefix }) {
   return (
-    <View style={styles.row}>
-      <Text style={[styles.rowLabel, bold && styles.rowBold, large && styles.rowLarge]}>
-        {label}
+    <View style={s.row}>
+      <Text style={s.rowLabel}>{label}</Text>
+      <Text style={[s.rowValue, { color }]}>
+        {prefix}${Math.abs(parseFloat(value)).toFixed(2)}
       </Text>
-      {formattedValue != null && (
-        <Text
-          style={[
-            styles.rowValue,
-            bold && styles.rowBold,
-            large && styles.rowLarge,
-            isDeduction ? styles.rowDeduction : isPositive ? styles.rowPositive : null,
-          ]}
-        >
-          {formattedValue}
-        </Text>
-      )}
     </View>
   );
 }
 
-// ─── Styles ───────────────────────────────────────────────────────────────────
+const s = StyleSheet.create({
+  safe:             { flex: 1, backgroundColor: C.bg },
+  scroll:           { paddingBottom: 110 },
+  loadingContainer: { flex: 1, justifyContent: 'center', alignItems: 'center', backgroundColor: C.bg },
 
-const styles = StyleSheet.create({
-  container: { flex: 1, backgroundColor: '#f5f5f5' },
-  scrollContent: { padding: 24, paddingBottom: 100 },
-  loadingContainer: { flex: 1, justifyContent: 'center', alignItems: 'center' },
-  loadingText: { marginTop: 12, color: '#666' },
-
-  header: {
-    fontSize: 24,
-    fontWeight: 'bold',
-    textAlign: 'center',
-    marginBottom: 24,
-    color: '#1a1a1a',
-  },
-
-  // Big amount block
-  amountBox: {
+  // Hero
+  hero: {
+    backgroundColor: C.primary,
+    paddingTop: 32, paddingBottom: 40,
+    paddingHorizontal: 28,
     alignItems: 'center',
-    backgroundColor: '#fff',
-    borderRadius: 16,
-    padding: 28,
-    marginBottom: 20,
-    shadowColor: '#000',
-    shadowOpacity: 0.06,
-    shadowRadius: 8,
-    elevation: 2,
   },
-  amountLabel: {
-    fontSize: 15,
-    color: '#666',
-    marginBottom: 12,
-    textAlign: 'center',
-    lineHeight: 22,
-  },
-  amountValue: {
-    fontSize: 60,
-    fontWeight: 'bold',
-    color: '#6200ee',
-    letterSpacing: -1,
-  },
-  amountNegative: {
-    color: '#c62828',
-  },
+  heroEyebrow: { fontSize: 11, fontWeight: '700', letterSpacing: 2, color: '#C4B5FD', marginBottom: 10 },
+  heroLabel:   { fontSize: 15, color: '#DDD6FE', marginBottom: 12, textAlign: 'center' },
+  heroAmount:  { fontSize: 64, fontWeight: '900', color: '#FFFFFF', letterSpacing: -2, textAlign: 'center' },
+  heroBadge:   { marginTop: 14, backgroundColor: 'rgba(255,255,255,0.15)', borderRadius: 20, paddingHorizontal: 14, paddingVertical: 5 },
+  heroBadgeTxt:{ fontSize: 13, color: '#FFFFFF', fontWeight: '600' },
 
   // Breakdown card
-  breakdownCard: {
-    backgroundColor: '#fff',
-    borderRadius: 16,
-    padding: 20,
-    marginBottom: 16,
-    shadowColor: '#000',
-    shadowOpacity: 0.06,
-    shadowRadius: 8,
-    elevation: 2,
+  card: {
+    backgroundColor: C.surface, borderRadius: 24, padding: 22,
+    margin: 20, marginBottom: 12,
+    shadowColor: '#5B21B6', shadowOpacity: 0.08, shadowRadius: 12, shadowOffset: { width: 0, height: 4 },
+    elevation: 4,
   },
-  breakdownTitle: {
-    fontSize: 15,
-    fontWeight: '600',
-    color: '#333',
-    marginBottom: 12,
-  },
-  divider: {
-    marginVertical: 10,
-    backgroundColor: '#eee',
-  },
+  cardTitle: { fontSize: 14, fontWeight: '700', color: C.muted, letterSpacing: 0.5, marginBottom: 12 },
+  div:       { backgroundColor: '#F3F4F6', marginVertical: 10 },
 
-  // Breakdown rows
-  row: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'center',
-    paddingVertical: 5,
-  },
-  rowLabel: {
-    fontSize: 14,
-    color: '#555',
-    flex: 1,
-  },
-  rowValue: {
-    fontSize: 14,
-    color: '#333',
-    fontVariant: ['tabular-nums'],
-  },
-  rowBold: {
-    fontWeight: '700',
-    color: '#1a1a1a',
-  },
-  rowLarge: {
-    fontSize: 16,
-  },
-  rowPositive: {
-    color: '#2e7d32',
-  },
-  rowDeduction: {
-    color: '#c62828',
-  },
+  row:      { flexDirection: 'row', justifyContent: 'space-between', paddingVertical: 5 },
+  rowLabel: { fontSize: 14, color: C.muted, flex: 1 },
+  rowValue: { fontSize: 15, fontWeight: '600', fontVariant: ['tabular-nums'] },
 
-  // Explanation card
-  explanationCard: {
-    backgroundColor: '#fff',
-    borderRadius: 16,
-    padding: 20,
-    marginBottom: 16,
-    shadowColor: '#000',
-    shadowOpacity: 0.06,
-    shadowRadius: 8,
-    elevation: 2,
-  },
-  explanationText: {
-    fontSize: 14,
-    color: '#444',
-    lineHeight: 22,
-    fontFamily: 'monospace',
-  },
+  subtotalRow:  { flexDirection: 'row', justifyContent: 'space-between', paddingVertical: 5 },
+  subtotalLabel:{ fontSize: 13, color: C.text, fontWeight: '600', flex: 1 },
+  subtotalValue:{ fontSize: 14, fontWeight: '700', color: C.text, fontVariant: ['tabular-nums'] },
 
-  // Info box
-  infoBox: {
-    backgroundColor: '#e8f5e9',
-    borderRadius: 12,
-    padding: 16,
-    marginBottom: 16,
-  },
-  infoText: {
-    fontSize: 13,
-    color: '#2e7d32',
-    lineHeight: 20,
-  },
+  totalRow:   { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', paddingVertical: 4 },
+  totalLabel: { fontSize: 16, fontWeight: '800', color: C.text, flex: 1 },
+  totalValue: { fontSize: 22, fontWeight: '900', color: C.success, fontVariant: ['tabular-nums'] },
 
-  button: {
-    margin: 20,
-    marginBottom: 10,
-    borderRadius: 12,
+  // Explanation
+  explainCard: {
+    backgroundColor: '#1E1B4B', borderRadius: 20, padding: 18,
+    marginHorizontal: 20, marginBottom: 12,
   },
-  buttonContent: {
-    paddingVertical: 6,
-  },
+  explainHead: { fontSize: 10, fontWeight: '700', color: '#7C3AED', letterSpacing: 2, marginBottom: 10 },
+  explainTxt:  { fontSize: 13, color: '#C4B5FD', lineHeight: 22, fontFamily: 'monospace' },
+
+  // Info
+  infoCard: { backgroundColor: '#EDE9FE', borderRadius: 16, padding: 16, marginHorizontal: 20, marginBottom: 12 },
+  infoTxt:  { fontSize: 13, color: C.primary, lineHeight: 20 },
+
+  // Footer
+  footer:     { position: 'absolute', bottom: 0, left: 0, right: 0, backgroundColor: C.surface, padding: 20, borderTopWidth: 1, borderTopColor: C.border },
+  btn:        { borderRadius: 16 },
+  btnContent: { paddingVertical: 8 },
+  btnLabel:   { fontSize: 16, fontWeight: '700', letterSpacing: 0.3 },
 });

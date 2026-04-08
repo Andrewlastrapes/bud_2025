@@ -1,50 +1,67 @@
-// File: screens/onboarding/DebtOnboardingScreen.js
-//
-// Step 3 of onboarding: interactive debt payment decision screen.
-//
-// Flow:
-// 1. Fetch debt snapshot (credit card balances from Plaid)
-// 2. Call POST /api/budget/base to get baseRemaining (paycheck - fixedCosts)
-// 3. User picks a payment amount (presets or custom)
-// 4. Show live payoff timeline + remaining-after-debt preview
-// 5. Offer "pay in full" if baseRemaining >= totalDebt
-// 6. Forward all data to SavingsOnboardingScreen
-
 import React, { useEffect, useState } from 'react';
 import {
   View,
   ScrollView,
   StyleSheet,
   TouchableOpacity,
+  StatusBar,
 } from 'react-native';
 import { Text, Card, ActivityIndicator, Button, TextInput, Divider } from 'react-native-paper';
 import axios from 'axios';
 import { auth } from '../../firebaseConfig';
 import { API_BASE_URL } from '../../config/api';
 
-// Preset debt payment options shown as quick-select buttons
-const PAYMENT_PRESETS = [100, 200, 300, 500];
+// ─── Design tokens ────────────────────────────────────────────────────────────
+const C = {
+  primary:   '#5B21B6',
+  primaryLt: '#7C3AED',
+  success:   '#10B981',
+  successBg: '#ECFDF5',
+  danger:    '#EF4444',
+  dangerBg:  '#FEF2F2',
+  warning:   '#F59E0B',
+  warnBg:    '#FFFBEB',
+  infoBg:    '#EDE9FE',
+  blue:      '#1D4ED8',
+  blueBg:    '#EFF6FF',
+  surface:   '#FFFFFF',
+  bg:        '#F5F3FF',
+  text:      '#1E1B4B',
+  muted:     '#6B7280',
+  border:    '#E5E7EB',
+};
+
+const PRESETS = [100, 200, 300, 500];
+
+function StepDots({ current, total }) {
+  return (
+    <View style={dot.row}>
+      {Array.from({ length: total }).map((_, i) => (
+        <View key={i} style={[dot.dot, i + 1 === current && dot.active]} />
+      ))}
+    </View>
+  );
+}
+const dot = StyleSheet.create({
+  row:    { flexDirection: 'row', gap: 6, justifyContent: 'center', marginBottom: 20 },
+  dot:    { width: 8, height: 8, borderRadius: 4, backgroundColor: '#DDD6FE' },
+  active: { width: 24, backgroundColor: C.primary },
+});
 
 export default function DebtOnboardingScreen({ navigation, route }) {
-  // ── Loading / data state ───────────────────────────────────────────────────
-  const [snapshot, setSnapshot] = useState(null);       // credit card snapshot
-  const [baseBudget, setBaseBudget] = useState(null);   // { paycheckAmount, fixedCostsRemaining, baseRemaining }
-  const [isLoadingDebt, setIsLoadingDebt] = useState(true);
-  const [isLoadingBase, setIsLoadingBase] = useState(true);
-  const [loadError, setLoadError] = useState(null);
+  const [snapshot,      setSnapshot]      = useState(null);
+  const [baseBudget,    setBaseBudget]    = useState(null);
+  const [loadingDebt,   setLoadingDebt]   = useState(true);
+  const [loadingBase,   setLoadingBase]   = useState(true);
+  const [loadError,     setLoadError]     = useState(null);
+  const [isExpanded,    setIsExpanded]    = useState(false);
+  const [selectedPreset, setSelectedPreset] = useState(null);
+  const [customInput,   setCustomInput]   = useState('');
+  const [inputError,    setInputError]    = useState(null);
 
-  // ── UI state ───────────────────────────────────────────────────────────────
-  const [isExpanded, setIsExpanded] = useState(false);  // collapsible debt list
-  const [selectedPreset, setSelectedPreset] = useState(null); // which preset is active
-  const [customInput, setCustomInput] = useState('');   // custom amount field
-  const [inputError, setInputError] = useState(null);
-
-  // ── Income params from prior screens ──────────────────────────────────────
   const paycheckAmount = route.params?.paycheckAmount ?? 0;
   const payDay1        = route.params?.payDay1 ?? 1;
   const payDay2        = route.params?.payDay2 ?? 15;
-
-  // ── Helpers ───────────────────────────────────────────────────────────────
 
   const getAuthHeader = async () => {
     const user = auth.currentUser;
@@ -53,607 +70,307 @@ export default function DebtOnboardingScreen({ navigation, route }) {
     return { headers: { Authorization: `Bearer ${token}` } };
   };
 
-  // Calculate next paycheck date from two fixed pay days
-  const calculateNextPaycheckDate = (day1, day2) => {
+  const calcNextPaycheck = (d1, d2) => {
     const today = new Date();
-    const currentMonth = today.getMonth();
-    const currentYear = today.getFullYear();
-    const days = [day1, day2].sort((a, b) => a - b);
-
+    const days  = [d1, d2].sort((a, b) => a - b);
     let nextDate = null;
     for (const day of days) {
-      const d = new Date(currentYear, currentMonth, day);
+      const d = new Date(today.getFullYear(), today.getMonth(), day);
       if (d.getDate() === day && d >= today) {
         if (!nextDate || d < nextDate) nextDate = d;
       }
     }
-
     if (!nextDate) {
-      let m = currentMonth + 1;
-      let y = currentYear;
-      if (m > 11) { m = 0; y += 1; }
+      let m = today.getMonth() + 1, y = today.getFullYear();
+      if (m > 11) { m = 0; y++; }
       nextDate = new Date(y, m, days[0]);
     }
-
     return nextDate;
   };
 
-  // ── Data fetching ──────────────────────────────────────────────────────────
-
   useEffect(() => {
-    const fetchData = async () => {
+    const load = async () => {
       try {
         const config = await getAuthHeader();
-
-        // Fetch debt snapshot (credit card balances from Plaid)
-        const debtPromise = axios
-          .get(`${API_BASE_URL}/api/debt/snapshot`, config)
-          .then((r) => setSnapshot(r.data))
-          .catch((e) => {
-            console.error('Failed to load debt snapshot:', e);
-            // Don't block the screen if debt snapshot fails
-            setSnapshot({ totalDebt: 0, accounts: [] });
-          })
-          .finally(() => setIsLoadingDebt(false));
-
-        // Fetch base budget (paycheck - fixedCosts, before debt/savings)
-        const nextPaycheckDate = calculateNextPaycheckDate(payDay1, payDay2);
-        const basePromise = axios
-          .post(
-            `${API_BASE_URL}/api/budget/base`,
-            { paycheckAmount, payDay1, payDay2, nextPaycheckDate },
-            config,
-          )
-          .then((r) => setBaseBudget(r.data))
-          .catch((e) => {
-            console.error('Failed to load base budget:', e);
-            // Fallback: compute locally if API fails
-            setBaseBudget({
-              paycheckAmount,
-              fixedCostsRemaining: 0,
-              baseRemaining: paycheckAmount,
-            });
-          })
-          .finally(() => setIsLoadingBase(false));
-
-        await Promise.all([debtPromise, basePromise]);
+        const p1 = axios.get(`${API_BASE_URL}/api/debt/snapshot`, config)
+          .then(r => setSnapshot(r.data))
+          .catch(() => setSnapshot({ totalDebt: 0, accounts: [] }))
+          .finally(() => setLoadingDebt(false));
+        const p2 = axios.post(`${API_BASE_URL}/api/budget/base`,
+          { paycheckAmount, payDay1, payDay2, nextPaycheckDate: calcNextPaycheck(payDay1, payDay2) }, config)
+          .then(r => setBaseBudget(r.data))
+          .catch(() => setBaseBudget({ paycheckAmount, fixedCostsRemaining: 0, baseRemaining: paycheckAmount }))
+          .finally(() => setLoadingBase(false));
+        await Promise.all([p1, p2]);
       } catch (e) {
-        console.error('DebtOnboarding fetch error:', e);
-        setLoadError('Could not load your data. Please try again.');
-        setIsLoadingDebt(false);
-        setIsLoadingBase(false);
+        setLoadError('Could not load your data.');
+        setLoadingDebt(false);
+        setLoadingBase(false);
       }
     };
-
-    fetchData();
+    load();
   }, []);
 
-  // ── Derived values ─────────────────────────────────────────────────────────
-
-  const isLoading = isLoadingDebt || isLoadingBase;
-  const totalDebt = snapshot?.totalDebt ?? 0;
+  const isLoading     = loadingDebt || loadingBase;
+  const totalDebt     = snapshot?.totalDebt ?? 0;
   const baseRemaining = baseBudget?.baseRemaining ?? paycheckAmount;
-  const canPayInFull = totalDebt > 0 && baseRemaining >= totalDebt;
+  const canPayInFull  = totalDebt > 0 && baseRemaining >= totalDebt;
 
-  // Resolve current selected amount (preset takes priority; custom overrides)
-  const resolveSelectedAmount = () => {
-    const custom = parseFloat(customInput);
-    if (!isNaN(custom) && custom > 0) return custom;
+  const getAmount = () => {
+    const c = parseFloat(customInput);
+    if (!isNaN(c) && c > 0) return c;
     if (selectedPreset != null) return selectedPreset;
     return 0;
   };
 
-  const selectedAmount = resolveSelectedAmount();
+  const selectedAmount    = getAmount();
+  const remainAfterDebt   = baseRemaining - selectedAmount;
+  const numPaychecks      = selectedAmount > 0 && totalDebt > 0
+    ? Math.ceil(totalDebt / selectedAmount) : null;
 
-  // Live calculations
-  const remainingAfterDebt = Math.max(0, baseRemaining - selectedAmount);
-  const numberOfPaychecks =
-    selectedAmount > 0 && totalDebt > 0
-      ? Math.ceil(totalDebt / selectedAmount)
-      : null;
-
-  // ── Navigation ─────────────────────────────────────────────────────────────
-
-  const goNext = (debtPerPaycheck) => {
-    navigation.navigate('SavingsOnboarding', {
-      paycheckAmount,
-      payDay1,
-      payDay2,
-      debtPerPaycheck,
-      baseRemaining,
-      remainingAfterDebt: Math.round((baseRemaining - debtPerPaycheck) * 100) / 100,
-      fixedCostsRemaining: baseBudget?.fixedCostsRemaining ?? 0,
-    });
-  };
+  const goNext = (debt) => navigation.navigate('SavingsOnboarding', {
+    paycheckAmount,
+    payDay1,
+    payDay2,
+    debtPerPaycheck: debt,
+    baseRemaining,
+    remainingAfterDebt: Math.round((baseRemaining - debt) * 100) / 100,
+    fixedCostsRemaining: baseBudget?.fixedCostsRemaining ?? 0,
+  });
 
   const handleContinue = () => {
     setInputError(null);
-
-    if (selectedAmount === 0 && customInput.trim() === '' && selectedPreset === null) {
-      // User hasn't selected anything — treat as skip
-      goNext(0);
-      return;
-    }
-
-    if (selectedAmount < 0 || isNaN(selectedAmount)) {
-      setInputError('Please enter a valid amount.');
-      return;
-    }
-
+    if (selectedAmount < 0 || isNaN(selectedAmount)) { setInputError('Enter a valid amount.'); return; }
     goNext(selectedAmount);
   };
 
-  const handleSkip = () => goNext(0);
-
-  const handlePayInFull = () => {
-    setSelectedPreset(null);
-    setCustomInput(totalDebt.toFixed(2));
-    goNext(totalDebt);
-  };
-
-  const handlePresetPress = (amount) => {
-    setInputError(null);
-    setCustomInput(''); // clear custom when preset selected
-    setSelectedPreset(amount === selectedPreset ? null : amount); // toggle
-  };
-
-  const handleCustomChange = (v) => {
-    setInputError(null);
-    setCustomInput(v);
-    setSelectedPreset(null); // clear preset when typing custom
-  };
-
-  // ── Loading state ──────────────────────────────────────────────────────────
-
   if (isLoading) {
     return (
-      <View style={styles.center}>
-        <ActivityIndicator size="large" />
-        <Text style={{ marginTop: 12, color: '#666' }}>Loading your balances…</Text>
+      <View style={s.center}>
+        <ActivityIndicator size="large" color={C.primary} />
+        <Text style={s.loadText}>Loading your accounts…</Text>
       </View>
     );
   }
-
-  if (loadError && !snapshot) {
-    return (
-      <View style={styles.center}>
-        <Text style={styles.errorText}>{loadError}</Text>
-        <Button mode="outlined" style={{ marginTop: 16 }} onPress={handleSkip}>
-          Skip debt setup for now
-        </Button>
-      </View>
-    );
-  }
-
-  // ── No debt detected ───────────────────────────────────────────────────────
 
   if (!snapshot || totalDebt <= 0) {
     return (
-      <View style={styles.container}>
-        <Text style={styles.title}>Debt (3/4)</Text>
-
-        <Card style={styles.noDebtCard}>
-          <Card.Content>
-            <Text style={styles.noDebtText}>✅ No outstanding credit card balances detected.</Text>
-            <Text style={[styles.bodyText, { marginTop: 6 }]}>
-              We didn't find any credit card debt in your linked accounts.
-            </Text>
-          </Card.Content>
-        </Card>
-
-        <Button mode="contained" style={{ marginTop: 24 }} onPress={() => goNext(0)}>
-          Continue
+      <View style={[s.center, { padding: 32 }]}>
+        <View style={s.noDebtIcon}><Text style={{ fontSize: 32 }}>✅</Text></View>
+        <Text style={s.noDebtTitle}>No debt detected</Text>
+        <Text style={s.noDebtBody}>
+          We didn't find any outstanding credit card balances in your linked accounts.
+        </Text>
+        <Button mode="contained" onPress={() => goNext(0)} style={s.btn}
+          contentStyle={s.btnContent} labelStyle={s.btnLabel} buttonColor={C.primary}>
+          Continue →
         </Button>
       </View>
     );
   }
 
-  // ── Main screen ────────────────────────────────────────────────────────────
-
   return (
-    <ScrollView contentContainerStyle={styles.container} keyboardShouldPersistTaps="handled">
-      <Text style={styles.title}>Debt (3/4)</Text>
+    <ScrollView style={s.safe} contentContainerStyle={s.scroll} keyboardShouldPersistTaps="handled">
+      <StatusBar barStyle="dark-content" />
+      <StepDots current={3} total={4} />
 
-      {/* ── Available budget banner ── */}
-      <Card style={styles.availableCard}>
-        <Card.Content>
-          <Text style={styles.availableLabel}>Available before debt & savings</Text>
-          <Text style={[
-            styles.availableAmount,
-            baseRemaining < 0 && styles.negative,
-          ]}>
-            ${baseRemaining.toFixed(2)}
-          </Text>
-          <Text style={styles.availableNote}>
-            (${paycheckAmount.toFixed(2)} paycheck − ${(baseBudget?.fixedCostsRemaining ?? 0).toFixed(2)} fixed costs)
-          </Text>
-        </Card.Content>
-      </Card>
+      <Text style={s.eyebrow}>STEP 3 OF 4</Text>
+      <Text style={s.heading}>Credit Card Debt</Text>
+      <Text style={s.sub}>Choose how much to put toward debt each paycheck.</Text>
 
-      {/* ── Collapsible debt accounts list ── */}
-      <TouchableOpacity
-        style={styles.collapseHeader}
-        onPress={() => setIsExpanded((prev) => !prev)}
-        activeOpacity={0.7}
-      >
-        <Text style={styles.collapseTitle}>
-          {isExpanded ? '▼' : '▶'}{' '}
-          Credit card debt — total:{' '}
-          <Text style={styles.highlight}>${totalDebt.toFixed(2)}</Text>
+      {/* Available banner */}
+      <View style={s.availCard}>
+        <Text style={s.availLabel}>Available before debt & savings</Text>
+        <Text style={[s.availAmt, baseRemaining < 0 && { color: C.danger }]}>
+          ${baseRemaining.toFixed(2)}
         </Text>
+        <Text style={s.availNote}>
+          ${paycheckAmount.toFixed(2)} paycheck − ${(baseBudget?.fixedCostsRemaining ?? 0).toFixed(2)} fixed costs
+        </Text>
+      </View>
+
+      {/* Collapsible debt list */}
+      <TouchableOpacity style={s.collapseBtn} onPress={() => setIsExpanded(v => !v)} activeOpacity={0.7}>
+        <View style={{ flex: 1 }}>
+          <Text style={s.collapseLabel}>
+            Total debt: <Text style={{ color: C.danger, fontWeight: '700' }}>${totalDebt.toFixed(2)}</Text>
+          </Text>
+        </View>
+        <Text style={s.chevron}>{isExpanded ? '▲' : '▼'}</Text>
       </TouchableOpacity>
 
       {isExpanded && (
-        <View style={styles.accountList}>
-          {snapshot.accounts?.map((acct, idx) => (
-            <Card key={idx} style={styles.accountCard}>
-              <Card.Content style={styles.accountRow}>
-                <View style={{ flex: 1 }}>
-                  <Text style={styles.accountName}>
-                    {acct.institutionName} — {acct.accountName}
-                    {acct.mask ? ` ••••${acct.mask}` : ''}
-                  </Text>
-                </View>
-                <Text style={styles.accountBalance}>${acct.currentBalance.toFixed(2)}</Text>
-              </Card.Content>
-            </Card>
+        <View style={s.accountList}>
+          {snapshot.accounts?.map((a, i) => (
+            <View key={i} style={s.accountRow}>
+              <View style={{ flex: 1 }}>
+                <Text style={s.acctName}>{a.institutionName} — {a.accountName}{a.mask ? ` ••••${a.mask}` : ''}</Text>
+              </View>
+              <Text style={s.acctBal}>${a.currentBalance.toFixed(2)}</Text>
+            </View>
           ))}
         </View>
       )}
 
-      {/* ── "Pay in full" option ── */}
+      {/* Pay in full */}
       {canPayInFull && (
-        <Card style={styles.payInFullCard}>
-          <Card.Content>
-            <Text style={styles.payInFullTitle}>🎉 You can pay off all debt this paycheck!</Text>
-            <Text style={styles.payInFullBody}>
-              Your available budget (${baseRemaining.toFixed(2)}) covers your total debt (${totalDebt.toFixed(2)}).
-            </Text>
-            <Button
-              mode="contained"
-              style={styles.payInFullButton}
-              onPress={handlePayInFull}
-            >
-              Pay off all ${totalDebt.toFixed(2)} now
-            </Button>
-          </Card.Content>
-        </Card>
+        <View style={s.fullCard}>
+          <Text style={s.fullTitle}>🎉 You can clear all debt this paycheck!</Text>
+          <Text style={s.fullBody}>
+            Your available budget (${baseRemaining.toFixed(2)}) covers your total debt (${totalDebt.toFixed(2)}).
+          </Text>
+          <Button mode="contained" onPress={() => { setCustomInput(totalDebt.toFixed(2)); goNext(totalDebt); }}
+            style={[s.btn, { marginTop: 12 }]} contentStyle={s.btnContent}
+            labelStyle={s.btnLabel} buttonColor={C.blue}>
+            Pay off all ${totalDebt.toFixed(2)} now
+          </Button>
+        </View>
       )}
 
-      {/* ── Payment selection ── */}
-      <Text style={styles.sectionTitle}>How much per paycheck toward debt?</Text>
-      <Text style={styles.bodyText}>
-        Choose a preset amount or enter a custom value.
-      </Text>
-
-      {/* Preset buttons */}
-      <View style={styles.presetRow}>
-        {PAYMENT_PRESETS.map((amount) => (
+      {/* Presets */}
+      <Text style={s.sectionTitle}>Payment per paycheck</Text>
+      <View style={s.presetRow}>
+        {PRESETS.map(amt => (
           <TouchableOpacity
-            key={amount}
-            style={[
-              styles.presetButton,
-              selectedPreset === amount && styles.presetButtonActive,
-            ]}
-            onPress={() => handlePresetPress(amount)}
+            key={amt}
+            style={[s.preset, selectedPreset === amt && s.presetActive]}
+            onPress={() => { setInputError(null); setCustomInput(''); setSelectedPreset(selectedPreset === amt ? null : amt); }}
           >
-            <Text style={[
-              styles.presetLabel,
-              selectedPreset === amount && styles.presetLabelActive,
-            ]}>
-              ${amount}
-            </Text>
+            <Text style={[s.presetTxt, selectedPreset === amt && s.presetTxtActive]}>${amt}</Text>
           </TouchableOpacity>
         ))}
       </View>
 
-      {/* Custom input */}
       <TextInput
         mode="outlined"
-        label="Custom amount per paycheck ($)"
+        label="Custom amount ($)"
         value={customInput}
-        onChangeText={handleCustomChange}
+        onChangeText={v => { setInputError(null); setCustomInput(v); setSelectedPreset(null); }}
         keyboardType="numeric"
-        style={{ marginTop: 12 }}
+        style={s.input}
+        outlineStyle={s.inputOutline}
         placeholder="e.g. 250"
       />
+      {inputError && <Text style={s.errorTxt}>{inputError}</Text>}
 
-      {inputError && <Text style={styles.errorText}>{inputError}</Text>}
-
-      {/* ── Payoff timeline ── */}
-      {selectedAmount > 0 && numberOfPaychecks != null && (
-        <Card style={styles.timelineCard}>
-          <Card.Content>
-            <Text style={styles.timelineText}>
-              💳 At{' '}
-              <Text style={styles.highlight}>${selectedAmount.toFixed(2)}</Text>
-              {' '}per paycheck, you'll pay off{' '}
-              <Text style={styles.highlight}>${totalDebt.toFixed(2)}</Text>
-              {' '}in debt in{' '}
-              <Text style={styles.highlight}>
-                {numberOfPaychecks} {numberOfPaychecks === 1 ? 'paycheck' : 'paychecks'}
-              </Text>
-              .
-            </Text>
-          </Card.Content>
-        </Card>
+      {/* Payoff timeline */}
+      {numPaychecks != null && selectedAmount > 0 && (
+        <View style={s.timelineCard}>
+          <Text style={s.timelineTxt}>
+            💳 <Text style={{ fontWeight: '700' }}>${selectedAmount.toFixed(2)}/paycheck</Text> pays off{' '}
+            <Text style={{ fontWeight: '700' }}>${totalDebt.toFixed(2)}</Text> in{' '}
+            <Text style={{ fontWeight: '700', color: C.primary }}>{numPaychecks} {numPaychecks === 1 ? 'paycheck' : 'paychecks'}</Text>.
+          </Text>
+        </View>
       )}
 
-      {/* ── Live remaining preview ── */}
+      {/* Live preview */}
       {selectedAmount > 0 && (
-        <Card style={styles.previewCard}>
-          <Card.Content>
-            <Text style={styles.previewTitle}>After debt payment</Text>
-            <Divider style={{ marginVertical: 8 }} />
-            <View style={styles.previewRow}>
-              <Text style={styles.previewLabel}>Available (base)</Text>
-              <Text style={styles.previewValue}>${baseRemaining.toFixed(2)}</Text>
-            </View>
-            <View style={styles.previewRow}>
-              <Text style={styles.previewLabel}>Debt payment</Text>
-              <Text style={[styles.previewValue, styles.deduction]}>
-                −${selectedAmount.toFixed(2)}
-              </Text>
-            </View>
-            <Divider style={{ marginVertical: 8 }} />
-            <View style={styles.previewRow}>
-              <Text style={[styles.previewLabel, styles.bold]}>Remaining for savings & spending</Text>
-              <Text style={[
-                styles.previewValue,
-                styles.bold,
-                remainingAfterDebt < 0 && styles.negative,
-              ]}>
-                ${remainingAfterDebt.toFixed(2)}
-              </Text>
-            </View>
-            {remainingAfterDebt < 0 && (
-              <Text style={styles.warningNote}>
-                ⚠️ This debt payment exceeds your available budget. Consider a lower amount.
-              </Text>
-            )}
-          </Card.Content>
-        </Card>
+        <View style={[s.previewCard, remainAfterDebt < 0 && s.previewCardDanger]}>
+          <Text style={s.previewTitle}>After debt payment</Text>
+          <Divider style={{ marginVertical: 10, backgroundColor: '#E5E7EB' }} />
+          <View style={s.previewRow}><Text style={s.pl}>Available</Text><Text style={s.pv}>${baseRemaining.toFixed(2)}</Text></View>
+          <View style={s.previewRow}><Text style={s.pl}>Debt</Text><Text style={[s.pv, { color: C.danger }]}>−${selectedAmount.toFixed(2)}</Text></View>
+          <Divider style={{ marginVertical: 10, backgroundColor: '#E5E7EB' }} />
+          <View style={s.previewRow}>
+            <Text style={[s.pl, s.bold]}>Left for savings & spending</Text>
+            <Text style={[s.pv, s.bold, remainAfterDebt < 0 && { color: C.danger }]}>${remainAfterDebt.toFixed(2)}</Text>
+          </View>
+          {remainAfterDebt < 0 && <Text style={s.warnTxt}>⚠️ Amount exceeds available budget.</Text>}
+        </View>
       )}
 
-      {/* ── Action buttons ── */}
-      <Button
-        mode="contained"
-        style={styles.continueButton}
-        onPress={handleContinue}
-      >
-        {selectedAmount > 0
-          ? `Continue with $${selectedAmount.toFixed(2)} / paycheck`
-          : 'Continue (no debt payment)'}
+      <Button mode="contained" onPress={handleContinue} style={s.btn}
+        contentStyle={s.btnContent} labelStyle={s.btnLabel} buttonColor={C.primary}>
+        {selectedAmount > 0 ? `Continue with $${selectedAmount.toFixed(2)}/paycheck →` : 'Continue (no payment) →'}
       </Button>
-
-      <Button mode="text" style={{ marginTop: 4 }} onPress={handleSkip}>
-        Skip — no debt payment for now
+      <Button mode="text" onPress={() => goNext(0)} style={{ marginTop: 4 }} textColor={C.muted}>
+        Skip — no debt payment
       </Button>
     </ScrollView>
   );
 }
 
-const styles = StyleSheet.create({
-  container: {
+const s = StyleSheet.create({
+  safe:   { flex: 1, backgroundColor: C.bg },
+  scroll: { padding: 24, paddingBottom: 56 },
+  center: { flex: 1, justifyContent: 'center', alignItems: 'center', backgroundColor: C.bg },
+
+  loadText: { marginTop: 14, color: C.muted, fontSize: 15 },
+
+  eyebrow: { fontSize: 11, fontWeight: '700', letterSpacing: 1.5, color: C.primaryLt, marginBottom: 6 },
+  heading: { fontSize: 28, fontWeight: '800', color: C.text, marginBottom: 6, letterSpacing: -0.5 },
+  sub:     { fontSize: 15, color: C.muted, lineHeight: 22, marginBottom: 20 },
+
+  // Available banner
+  availCard: {
+    backgroundColor: C.successBg,
+    borderRadius: 20,
     padding: 20,
-    paddingBottom: 40,
-  },
-  center: {
-    flex: 1,
-    justifyContent: 'center',
-    alignItems: 'center',
-    padding: 24,
-  },
-  title: {
-    fontSize: 22,
-    fontWeight: '700',
     marginBottom: 16,
-    color: '#1a1a1a',
+    borderWidth: 1,
+    borderColor: '#A7F3D0',
   },
+  availLabel: { fontSize: 12, fontWeight: '600', color: '#065F46', letterSpacing: 0.3, marginBottom: 4 },
+  availAmt:   { fontSize: 38, fontWeight: '800', color: C.success, letterSpacing: -1 },
+  availNote:  { fontSize: 12, color: '#6EE7B7', marginTop: 4 },
 
-  // Available budget banner
-  availableCard: {
-    backgroundColor: '#e8f5e9',
-    borderRadius: 14,
-    marginBottom: 20,
+  // Collapsible
+  collapseBtn: {
+    flexDirection: 'row', alignItems: 'center',
+    backgroundColor: C.surface, borderRadius: 14, padding: 16,
+    marginBottom: 2, borderWidth: 1, borderColor: C.border,
   },
-  availableLabel: {
-    fontSize: 13,
-    color: '#444',
-    marginBottom: 4,
-  },
-  availableAmount: {
-    fontSize: 40,
-    fontWeight: 'bold',
-    color: '#2e7d32',
-    letterSpacing: -0.5,
-  },
-  availableNote: {
-    fontSize: 12,
-    color: '#666',
-    marginTop: 4,
-  },
-
-  // Collapsible header
-  collapseHeader: {
-    paddingVertical: 12,
-    paddingHorizontal: 4,
-    borderBottomWidth: 1,
-    borderBottomColor: '#eee',
-    marginBottom: 8,
-  },
-  collapseTitle: {
-    fontSize: 15,
-    color: '#333',
-  },
+  collapseLabel: { fontSize: 15, color: C.text, fontWeight: '500' },
+  chevron:       { fontSize: 13, color: C.muted },
 
   // Account list
-  accountList: {
-    marginBottom: 16,
-  },
-  accountCard: {
-    marginTop: 8,
-    backgroundColor: '#fafafa',
-  },
-  accountRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-  },
-  accountName: {
-    fontSize: 14,
-    color: '#444',
-  },
-  accountBalance: {
-    fontSize: 14,
-    fontWeight: '600',
-    color: '#c62828',
-  },
+  accountList: { backgroundColor: C.surface, borderRadius: 14, overflow: 'hidden', marginBottom: 16, borderWidth: 1, borderColor: C.border },
+  accountRow:  { flexDirection: 'row', alignItems: 'center', padding: 14, borderBottomWidth: 1, borderBottomColor: '#F3F4F6' },
+  acctName:    { fontSize: 13, color: C.text },
+  acctBal:     { fontSize: 14, fontWeight: '700', color: C.danger },
 
   // Pay in full
-  payInFullCard: {
-    backgroundColor: '#e3f2fd',
-    borderRadius: 14,
-    marginBottom: 20,
-    borderLeftWidth: 4,
-    borderLeftColor: '#1976d2',
+  fullCard: {
+    backgroundColor: C.blueBg, borderRadius: 20, padding: 18, marginBottom: 20,
+    borderWidth: 1, borderColor: '#BFDBFE',
   },
-  payInFullTitle: {
-    fontSize: 15,
-    fontWeight: '600',
-    color: '#1565c0',
-    marginBottom: 6,
-  },
-  payInFullBody: {
-    fontSize: 13,
-    color: '#1976d2',
-    marginBottom: 12,
-  },
-  payInFullButton: {
-    backgroundColor: '#1976d2',
-  },
+  fullTitle: { fontSize: 15, fontWeight: '700', color: C.blue, marginBottom: 6 },
+  fullBody:  { fontSize: 13, color: '#3B82F6', lineHeight: 20 },
 
-  // Section header
-  sectionTitle: {
-    fontSize: 16,
-    fontWeight: '600',
-    marginTop: 16,
-    marginBottom: 6,
-    color: '#222',
-  },
-  bodyText: {
-    fontSize: 13,
-    color: '#666',
-    marginBottom: 10,
-  },
+  sectionTitle: { fontSize: 15, fontWeight: '700', color: C.text, marginTop: 8, marginBottom: 12 },
 
-  // Preset buttons
-  presetRow: {
-    flexDirection: 'row',
-    flexWrap: 'wrap',
-    gap: 8,
-    marginTop: 8,
-  },
-  presetButton: {
-    borderWidth: 1.5,
-    borderColor: '#6200ee',
-    borderRadius: 8,
-    paddingHorizontal: 18,
-    paddingVertical: 10,
-    backgroundColor: '#fff',
-  },
-  presetButtonActive: {
-    backgroundColor: '#6200ee',
-  },
-  presetLabel: {
-    fontSize: 14,
-    color: '#6200ee',
-    fontWeight: '600',
-  },
-  presetLabelActive: {
-    color: '#fff',
-  },
+  // Presets
+  presetRow:      { flexDirection: 'row', gap: 10, marginBottom: 14, flexWrap: 'wrap' },
+  preset:         { borderWidth: 1.5, borderColor: C.primaryLt, borderRadius: 12, paddingHorizontal: 20, paddingVertical: 11, backgroundColor: C.surface },
+  presetActive:   { backgroundColor: C.primary, borderColor: C.primary },
+  presetTxt:      { fontSize: 15, fontWeight: '700', color: C.primaryLt },
+  presetTxtActive:{ color: '#FFFFFF' },
 
-  // Payoff timeline
-  timelineCard: {
-    marginTop: 16,
-    backgroundColor: '#f3e8ff',
-    borderRadius: 12,
-  },
-  timelineText: {
-    fontSize: 14,
-    color: '#333',
-    lineHeight: 22,
-  },
+  input:        { backgroundColor: C.surface, marginBottom: 4 },
+  inputOutline: { borderRadius: 12, borderColor: C.border },
+  errorTxt:     { color: C.danger, fontSize: 13, marginBottom: 8, marginTop: 2 },
 
-  // Live preview
-  previewCard: {
-    marginTop: 16,
-    backgroundColor: '#f5f5f5',
-    borderRadius: 12,
-  },
-  previewTitle: {
-    fontSize: 14,
-    fontWeight: '600',
-    color: '#444',
-  },
-  previewRow: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    paddingVertical: 3,
-  },
-  previewLabel: {
-    fontSize: 14,
-    color: '#555',
-    flex: 1,
-  },
-  previewValue: {
-    fontSize: 14,
-    color: '#333',
-    fontVariant: ['tabular-nums'],
-  },
-  deduction: {
-    color: '#c62828',
-  },
+  // Timeline
+  timelineCard: { backgroundColor: C.infoBg, borderRadius: 14, padding: 14, marginTop: 14 },
+  timelineTxt:  { fontSize: 14, color: C.primary, lineHeight: 22 },
 
-  // Warning
-  warningNote: {
-    fontSize: 12,
-    color: '#b71c1c',
-    marginTop: 8,
-    fontStyle: 'italic',
-  },
+  // Preview
+  previewCard:      { backgroundColor: C.surface, borderRadius: 18, padding: 18, marginTop: 14, borderWidth: 1, borderColor: C.border },
+  previewCardDanger:{ borderColor: '#FECACA' },
+  previewTitle:     { fontSize: 13, fontWeight: '700', color: C.muted, letterSpacing: 0.5 },
+  previewRow:       { flexDirection: 'row', justifyContent: 'space-between', paddingVertical: 3 },
+  pl:               { fontSize: 14, color: C.muted, flex: 1 },
+  pv:               { fontSize: 14, color: C.text, fontVariant: ['tabular-nums'] },
+  warnTxt:          { fontSize: 12, color: C.danger, marginTop: 8, fontStyle: 'italic' },
 
   // No debt
-  noDebtCard: {
-    backgroundColor: '#e8f5e9',
-    borderRadius: 12,
-    marginTop: 8,
-  },
-  noDebtText: {
-    fontSize: 16,
-    fontWeight: '600',
-    color: '#2e7d32',
-  },
+  noDebtIcon:  { width: 72, height: 72, borderRadius: 36, backgroundColor: C.successBg, alignItems: 'center', justifyContent: 'center', marginBottom: 16 },
+  noDebtTitle: { fontSize: 22, fontWeight: '800', color: C.text, marginBottom: 8 },
+  noDebtBody:  { fontSize: 15, color: C.muted, textAlign: 'center', lineHeight: 22, marginBottom: 28, paddingHorizontal: 8 },
 
-  // Shared
-  highlight: {
-    fontWeight: '700',
-  },
-  bold: {
-    fontWeight: '700',
-    color: '#1a1a1a',
-  },
-  negative: {
-    color: '#c62828',
-  },
-  errorText: {
-    color: '#c62828',
-    fontSize: 13,
-    marginTop: 6,
-  },
-
-  continueButton: {
-    marginTop: 24,
-    borderRadius: 10,
-  },
+  bold: { fontWeight: '700', color: C.text },
+  btn:         { borderRadius: 16, marginTop: 20 },
+  btnContent:  { paddingVertical: 8 },
+  btnLabel:    { fontSize: 16, fontWeight: '700', letterSpacing: 0.3 },
 });

@@ -1,13 +1,3 @@
-// File: screens/onboarding/SavingsOnboardingScreen.js
-//
-// Step 4 of onboarding: collect savings per paycheck.
-//
-// Key change: the display base is `remainingAfterDebt` (paycheck - fixedCosts - debt),
-// NOT the raw paycheck amount. This reflects the user's actual disposable income
-// after their debt decision, so they make an informed savings choice.
-//
-// Makes the final /api/budget/finalize call.
-
 import React, { useState } from 'react';
 import {
   View,
@@ -16,51 +6,72 @@ import {
   Alert,
   Keyboard,
   TouchableWithoutFeedback,
+  StatusBar,
 } from 'react-native';
-import { Text, TextInput, Button, Card, Divider } from 'react-native-paper';
+import { Text, TextInput, Button, Divider } from 'react-native-paper';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import axios from 'axios';
 import { auth } from '../../firebaseConfig';
 import { API_BASE_URL } from '../../config/api';
 
+// ─── Design tokens ────────────────────────────────────────────────────────────
+const C = {
+  primary:   '#5B21B6',
+  primaryLt: '#7C3AED',
+  success:   '#10B981',
+  successBg: '#ECFDF5',
+  danger:    '#EF4444',
+  warning:   '#F59E0B',
+  warnBg:    '#FFFBEB',
+  surface:   '#FFFFFF',
+  bg:        '#F5F3FF',
+  text:      '#1E1B4B',
+  muted:     '#6B7280',
+  border:    '#E5E7EB',
+};
+
+function StepDots({ current, total }) {
+  return (
+    <View style={dot.row}>
+      {Array.from({ length: total }).map((_, i) => (
+        <View key={i} style={[dot.dot, i + 1 === current && dot.active]} />
+      ))}
+    </View>
+  );
+}
+const dot = StyleSheet.create({
+  row:    { flexDirection: 'row', gap: 6, justifyContent: 'center', marginBottom: 20 },
+  dot:    { width: 8, height: 8, borderRadius: 4, backgroundColor: '#DDD6FE' },
+  active: { width: 24, backgroundColor: C.primary },
+});
+
 export default function SavingsOnboardingScreen({ navigation, route }) {
   const [savingsInput, setSavingsInput] = useState('');
-  const [isSaving, setIsSaving] = useState(false);
-  const [inputError, setInputError] = useState(null);
+  const [isSaving,     setIsSaving]     = useState(false);
+  const [inputError,   setInputError]   = useState(null);
 
-  // All params forwarded from prior onboarding screens
-  const paycheckAmount     = route.params?.paycheckAmount     ?? 0;
-  const payDay1            = route.params?.payDay1            ?? 1;
-  const payDay2            = route.params?.payDay2            ?? 15;
-  const debtPerPaycheck    = route.params?.debtPerPaycheck    ?? 0;
-  const remainingAfterDebt = route.params?.remainingAfterDebt ?? (paycheckAmount - debtPerPaycheck);
+  const paycheckAmount      = route.params?.paycheckAmount      ?? 0;
+  const payDay1             = route.params?.payDay1             ?? 1;
+  const payDay2             = route.params?.payDay2             ?? 15;
+  const debtPerPaycheck     = route.params?.debtPerPaycheck     ?? 0;
+  const remainingAfterDebt  = route.params?.remainingAfterDebt  ?? (paycheckAmount - debtPerPaycheck);
   const fixedCostsRemaining = route.params?.fixedCostsRemaining ?? 0;
+  const hasDebt             = debtPerPaycheck > 0;
 
-  const hasDebt = debtPerPaycheck > 0;
-
-  // Calculate next paycheck date from two fixed pay days
-  const calculateNextPaycheckDate = (day1, day2) => {
+  const calcNextPaycheck = (d1, d2) => {
     const today = new Date();
-    const currentMonth = today.getMonth();
-    const currentYear = today.getFullYear();
-    const days = [day1, day2].sort((a, b) => a - b);
-
-    let nextDate = null;
+    const days  = [d1, d2].sort((a, b) => a - b);
+    let next = null;
     for (const day of days) {
-      const potentialDate = new Date(currentYear, currentMonth, day);
-      if (potentialDate.getDate() === day && potentialDate >= today) {
-        if (!nextDate || potentialDate < nextDate) nextDate = potentialDate;
-      }
+      const d = new Date(today.getFullYear(), today.getMonth(), day);
+      if (d.getDate() === day && d >= today) { if (!next || d < next) next = d; }
     }
-
-    if (!nextDate) {
-      let nextMonth = currentMonth + 1;
-      let nextYear = currentYear;
-      if (nextMonth > 11) { nextMonth = 0; nextYear += 1; }
-      nextDate = new Date(nextYear, nextMonth, days[0]);
+    if (!next) {
+      let m = today.getMonth() + 1, y = today.getFullYear();
+      if (m > 11) { m = 0; y++; }
+      next = new Date(y, m, days[0]);
     }
-
-    return nextDate;
+    return next;
   };
 
   const getAuthHeader = async () => {
@@ -72,225 +83,137 @@ export default function SavingsOnboardingScreen({ navigation, route }) {
 
   const handleFinalize = async (savingsPerPaycheck) => {
     setIsSaving(true);
-
     try {
       const config = await getAuthHeader();
-      const nextPaycheckDate = calculateNextPaycheckDate(payDay1, payDay2);
+      const nextPaycheckDate = calcNextPaycheck(payDay1, payDay2);
 
-      // Save savings as a fixed cost if > 0
       if (savingsPerPaycheck > 0) {
-        await axios.post(
-          `${API_BASE_URL}/api/fixed-costs`,
-          {
-            name: 'Savings Goal',
-            amount: savingsPerPaycheck,
-            category: 'Savings',
-            type: 'manual',
-            nextDueDate: null,
-          },
-          config,
-        );
+        await axios.post(`${API_BASE_URL}/api/fixed-costs`,
+          { name: 'Savings Goal', amount: savingsPerPaycheck, category: 'Savings', type: 'manual', nextDueDate: null }, config);
       }
 
-      // Call /api/budget/finalize with all data
-      const response = await axios.post(
-        `${API_BASE_URL}/api/budget/finalize`,
-        {
-          paycheckAmount,
-          nextPaycheckDate,
-          payDay1,
-          payDay2,
-          debtPerPaycheck: debtPerPaycheck || null,
-        },
-        config,
-      );
-
-      const data = response.data;
+      const { data } = await axios.post(`${API_BASE_URL}/api/budget/finalize`,
+        { paycheckAmount, nextPaycheckDate, payDay1, payDay2, debtPerPaycheck: debtPerPaycheck || null }, config);
 
       navigation.navigate('DynamicAmountFinal', {
-        remainingToSpend:     data.remainingToSpend,
+        remainingToSpend:      data.remainingToSpend,
         dynamicSpendableAmount: data.dynamicSpendableAmount ?? data.remainingToSpend,
-        paycheckAmount:       data.paycheckAmount,
-        fixedCostsRemaining:  data.fixedCostsRemaining,
-        baseRemaining:        data.baseRemaining,
-        debtPerPaycheck:      data.debtPerPaycheck,
-        savingsContribution:  data.savingsContribution,
-        explanation:          data.explanation,
+        paycheckAmount:        data.paycheckAmount,
+        fixedCostsRemaining:   data.fixedCostsRemaining,
+        baseRemaining:         data.baseRemaining,
+        debtPerPaycheck:       data.debtPerPaycheck,
+        savingsContribution:   data.savingsContribution,
+        explanation:           data.explanation,
       });
     } catch (e) {
       console.error('Finalization failed:', e);
-      Alert.alert('Error', e.message || 'An unknown error occurred. Please try again.');
+      Alert.alert('Error', e.message || 'An unknown error occurred.');
     }
-
     setIsSaving(false);
   };
 
   const handleContinue = () => {
     setInputError(null);
     const trimmed = savingsInput.trim();
-
-    if (trimmed === '') {
-      handleFinalize(0);
-      return;
-    }
-
-    const value = parseFloat(trimmed);
-    if (Number.isNaN(value) || value < 0) {
-      setInputError('Please enter a valid amount, or leave blank for $0 savings.');
-      return;
-    }
-
-    handleFinalize(value);
+    if (trimmed === '') { handleFinalize(0); return; }
+    const v = parseFloat(trimmed);
+    if (isNaN(v) || v < 0) { setInputError('Enter a valid amount or leave blank for $0.'); return; }
+    handleFinalize(v);
   };
 
-  const handleSkip = () => handleFinalize(0);
-
-  // Live preview uses remainingAfterDebt as the starting point
-  const savingsValue = parseFloat(savingsInput) || 0;
+  const savingsValue   = parseFloat(savingsInput) || 0;
   const finalRemaining = Math.round((remainingAfterDebt - savingsValue) * 100) / 100;
 
   return (
     <TouchableWithoutFeedback onPress={Keyboard.dismiss} accessible={false}>
-      <SafeAreaView style={styles.container}>
-        <ScrollView contentContainerStyle={styles.scrollContent}>
+      <SafeAreaView style={s.safe}>
+        <StatusBar barStyle="dark-content" backgroundColor={C.bg} />
+        <ScrollView contentContainerStyle={s.scroll}>
 
-          <Text style={styles.header}>Savings (4/4)</Text>
+          <StepDots current={4} total={4} />
 
-          {/* After-debt available banner */}
-          <Card style={styles.availableCard}>
-            <Card.Content>
-              <Text style={styles.availableLabel}>
-                {hasDebt
-                  ? 'After your debt payment, you have:'
-                  : 'After fixed costs, you have:'}
-              </Text>
-              <Text style={[
-                styles.availableAmount,
-                remainingAfterDebt < 0 && styles.negative,
-              ]}>
-                ${remainingAfterDebt.toFixed(2)}
-              </Text>
-              <Text style={styles.availableNote}>
-                {hasDebt
-                  ? `$${paycheckAmount.toFixed(2)} − $${fixedCostsRemaining.toFixed(2)} fixed − $${debtPerPaycheck.toFixed(2)} debt`
-                  : `$${paycheckAmount.toFixed(2)} − $${fixedCostsRemaining.toFixed(2)} fixed costs`}
-              </Text>
-            </Card.Content>
-          </Card>
+          <Text style={s.eyebrow}>STEP 4 OF 4</Text>
+          <Text style={s.heading}>Savings</Text>
+          <Text style={s.sub}>Set aside money each paycheck before you spend it.</Text>
+
+          {/* After-debt available */}
+          <View style={s.availCard}>
+            <Text style={s.availLabel}>
+              {hasDebt ? 'After debt payment, you have' : 'After fixed costs, you have'}
+            </Text>
+            <Text style={[s.availAmt, remainingAfterDebt < 0 && { color: C.danger }]}>
+              ${remainingAfterDebt.toFixed(2)}
+            </Text>
+            <Text style={s.availNote}>
+              {hasDebt
+                ? `$${paycheckAmount.toFixed(2)} − $${fixedCostsRemaining.toFixed(2)} fixed − $${debtPerPaycheck.toFixed(2)} debt`
+                : `$${paycheckAmount.toFixed(2)} − $${fixedCostsRemaining.toFixed(2)} fixed costs`}
+            </Text>
+          </View>
 
           {/* Debt warning */}
           {hasDebt && (
-            <Card style={styles.warningCard}>
-              <Card.Content style={styles.warningContent}>
-                <Text style={styles.warningIcon}>⚠️</Text>
-                <Text style={styles.warningText}>
-                  You're paying off{' '}
-                  <Text style={styles.bold}>${debtPerPaycheck.toFixed(2)}</Text>/paycheck in debt.
-                  {'\n'}
-                  Consider pausing savings until your debt is paid down — but the choice is yours.
+            <View style={s.warnCard}>
+              <Text style={s.warnIcon}>⚠️</Text>
+              <View style={{ flex: 1 }}>
+                <Text style={s.warnTitle}>Paying off debt</Text>
+                <Text style={s.warnBody}>
+                  You're already putting <Text style={{ fontWeight: '700' }}>${debtPerPaycheck.toFixed(2)}</Text>/paycheck toward debt.
+                  Consider pausing savings until your debt is reduced — but the choice is yours.
                 </Text>
-              </Card.Content>
-            </Card>
+              </View>
+            </View>
           )}
 
-          <Text style={styles.label}>
-            How much do you want to save per paycheck?
-          </Text>
-          <Text style={styles.hint}>
-            Leave blank or enter $0 to skip savings for now. You can always update this later.
-          </Text>
+          <Text style={s.fieldLabel}>Savings per paycheck</Text>
+          <Text style={s.hint}>Leave blank or $0 to skip. You can change this anytime.</Text>
 
           <TextInput
             mode="outlined"
-            label="Savings per paycheck ($)"
+            label="$0.00"
             value={savingsInput}
-            onChangeText={(v) => {
-              setInputError(null);
-              setSavingsInput(v);
-            }}
+            onChangeText={v => { setInputError(null); setSavingsInput(v); }}
             keyboardType="numeric"
-            style={styles.input}
+            style={s.input}
+            outlineStyle={s.inputOutline}
             disabled={isSaving}
+            left={<TextInput.Affix text="$" />}
           />
+          {inputError && <Text style={s.errorTxt}>{inputError}</Text>}
 
-          {inputError && <Text style={styles.error}>{inputError}</Text>}
+          {/* Breakdown preview */}
+          <View style={s.previewCard}>
+            <Text style={s.previewHead}>Budget breakdown</Text>
+            <Divider style={{ marginVertical: 10, backgroundColor: '#E5E7EB' }} />
 
-          {/* Live preview — always shown so user sees impact */}
-          <Card style={styles.previewCard}>
-            <Card.Content>
-              <Text style={styles.previewTitle}>Your budget breakdown</Text>
-              <Divider style={{ marginVertical: 8 }} />
+            <View style={s.row}><Text style={s.pl}>Income</Text><Text style={[s.pv, { color: C.success }]}>+${paycheckAmount.toFixed(2)}</Text></View>
+            {fixedCostsRemaining > 0 && <View style={s.row}><Text style={s.pl}>Fixed costs</Text><Text style={[s.pv, { color: C.danger }]}>−${fixedCostsRemaining.toFixed(2)}</Text></View>}
+            {hasDebt && <View style={s.row}><Text style={s.pl}>Debt payoff</Text><Text style={[s.pv, { color: C.danger }]}>−${debtPerPaycheck.toFixed(2)}</Text></View>}
+            {savingsValue > 0 && <View style={s.row}><Text style={s.pl}>Savings</Text><Text style={[s.pv, { color: C.danger }]}>−${savingsValue.toFixed(2)}</Text></View>}
 
-              <View style={styles.previewRow}>
-                <Text style={styles.previewLabel}>Income</Text>
-                <Text style={styles.previewValue}>+${paycheckAmount.toFixed(2)}</Text>
-              </View>
+            <Divider style={{ marginVertical: 10, backgroundColor: '#E5E7EB' }} />
 
-              {fixedCostsRemaining > 0 && (
-                <View style={styles.previewRow}>
-                  <Text style={styles.previewLabel}>Fixed costs</Text>
-                  <Text style={[styles.previewValue, styles.deduction]}>
-                    −${fixedCostsRemaining.toFixed(2)}
-                  </Text>
-                </View>
-              )}
+            <View style={s.row}>
+              <Text style={[s.pl, { fontWeight: '700', color: C.text }]}>Remaining to spend</Text>
+              <Text style={[s.pv, { fontWeight: '800', fontSize: 16, color: finalRemaining >= 0 ? C.success : C.danger }]}>
+                ${finalRemaining.toFixed(2)}
+              </Text>
+            </View>
 
-              {hasDebt && (
-                <View style={styles.previewRow}>
-                  <Text style={styles.previewLabel}>Debt payoff</Text>
-                  <Text style={[styles.previewValue, styles.deduction]}>
-                    −${debtPerPaycheck.toFixed(2)}
-                  </Text>
-                </View>
-              )}
+            {finalRemaining < 0 && (
+              <Text style={{ fontSize: 12, color: C.danger, marginTop: 8, fontStyle: 'italic' }}>
+                ⚠️ Savings amount exceeds your remaining budget.
+              </Text>
+            )}
+          </View>
 
-              {savingsValue > 0 && (
-                <View style={styles.previewRow}>
-                  <Text style={styles.previewLabel}>Savings</Text>
-                  <Text style={[styles.previewValue, styles.deduction]}>
-                    −${savingsValue.toFixed(2)}
-                  </Text>
-                </View>
-              )}
-
-              <Divider style={{ marginVertical: 8 }} />
-
-              <View style={styles.previewRow}>
-                <Text style={[styles.previewLabel, styles.bold]}>Final remaining</Text>
-                <Text style={[
-                  styles.previewValue,
-                  styles.bold,
-                  finalRemaining < 0 && styles.negativeText,
-                ]}>
-                  ${finalRemaining.toFixed(2)}
-                </Text>
-              </View>
-
-              {finalRemaining < 0 && (
-                <Text style={styles.warningNote}>
-                  ⚠️ Savings amount exceeds your remaining budget. Consider a lower amount.
-                </Text>
-              )}
-            </Card.Content>
-          </Card>
-
-          <Button
-            mode="contained"
-            onPress={handleContinue}
-            loading={isSaving}
-            style={styles.button}
-            contentStyle={styles.buttonContent}
-          >
-            {isSaving ? 'Calculating…' : 'See My Final Budget'}
+          <Button mode="contained" onPress={handleContinue} loading={isSaving}
+            style={s.btn} contentStyle={s.btnContent} labelStyle={s.btnLabel} buttonColor={C.primary}>
+            {isSaving ? 'Calculating…' : 'See My Budget →'}
           </Button>
-
-          <Button
-            mode="text"
-            onPress={handleSkip}
-            disabled={isSaving}
-            style={{ marginTop: 4 }}
-          >
-            Skip savings for now ($0)
+          <Button mode="text" onPress={() => handleFinalize(0)} disabled={isSaving}
+            style={{ marginTop: 4 }} textColor={C.muted}>
+            Skip savings ($0)
           </Button>
 
         </ScrollView>
@@ -299,133 +222,47 @@ export default function SavingsOnboardingScreen({ navigation, route }) {
   );
 }
 
-const styles = StyleSheet.create({
-  container: { flex: 1, backgroundColor: '#fff' },
-  scrollContent: { padding: 24, paddingBottom: 48 },
+const s = StyleSheet.create({
+  safe:   { flex: 1, backgroundColor: C.bg },
+  scroll: { padding: 24, paddingBottom: 56 },
 
-  header: {
-    fontSize: 24,
-    fontWeight: 'bold',
-    textAlign: 'center',
-    marginBottom: 20,
-    color: '#1a1a1a',
-  },
+  eyebrow: { fontSize: 11, fontWeight: '700', letterSpacing: 1.5, color: C.primaryLt, marginBottom: 6 },
+  heading: { fontSize: 28, fontWeight: '800', color: C.text, marginBottom: 6, letterSpacing: -0.5 },
+  sub:     { fontSize: 15, color: C.muted, lineHeight: 22, marginBottom: 20 },
 
-  // After-debt banner
-  availableCard: {
-    backgroundColor: '#e8f5e9',
-    borderRadius: 14,
-    marginBottom: 16,
+  availCard: {
+    backgroundColor: C.successBg, borderRadius: 20, padding: 20, marginBottom: 16,
+    borderWidth: 1, borderColor: '#A7F3D0',
   },
-  availableLabel: {
-    fontSize: 13,
-    color: '#444',
-    marginBottom: 4,
-  },
-  availableAmount: {
-    fontSize: 36,
-    fontWeight: 'bold',
-    color: '#2e7d32',
-    letterSpacing: -0.5,
-  },
-  availableNote: {
-    fontSize: 12,
-    color: '#666',
-    marginTop: 4,
-  },
+  availLabel: { fontSize: 12, fontWeight: '600', color: '#065F46', letterSpacing: 0.3, marginBottom: 4 },
+  availAmt:   { fontSize: 36, fontWeight: '800', color: C.success, letterSpacing: -1 },
+  availNote:  { fontSize: 12, color: '#6EE7B7', marginTop: 4 },
 
-  // Debt warning
-  warningCard: {
-    backgroundColor: '#fff8e1',
-    borderRadius: 12,
-    marginBottom: 16,
-    borderLeftWidth: 4,
-    borderLeftColor: '#f59e0b',
+  warnCard: {
+    flexDirection: 'row', alignItems: 'flex-start',
+    backgroundColor: C.warnBg, borderRadius: 16, padding: 16, marginBottom: 20,
+    borderWidth: 1, borderColor: '#FDE68A', gap: 10,
   },
-  warningContent: {
-    flexDirection: 'row',
-    alignItems: 'flex-start',
-  },
-  warningIcon: {
-    fontSize: 18,
-    marginRight: 8,
-    marginTop: 2,
-  },
-  warningText: {
-    fontSize: 13,
-    color: '#78350f',
-    lineHeight: 20,
-    flex: 1,
-  },
+  warnIcon:  { fontSize: 20, marginTop: 1 },
+  warnTitle: { fontSize: 13, fontWeight: '700', color: '#92400E', marginBottom: 4 },
+  warnBody:  { fontSize: 13, color: '#92400E', lineHeight: 19 },
 
-  label: {
-    fontSize: 15,
-    fontWeight: '600',
-    color: '#333',
-    marginBottom: 4,
-  },
-  hint: {
-    fontSize: 13,
-    color: '#888',
-    marginBottom: 12,
-    lineHeight: 18,
-  },
-  input: { marginBottom: 4 },
+  fieldLabel: { fontSize: 13, fontWeight: '600', color: C.text, marginBottom: 4, letterSpacing: 0.2 },
+  hint:       { fontSize: 12, color: C.muted, marginBottom: 10 },
+  input:      { backgroundColor: C.surface },
+  inputOutline: { borderRadius: 12, borderColor: C.border },
+  errorTxt:   { color: C.danger, fontSize: 13, marginTop: 2, marginBottom: 8 },
 
-  error: {
-    color: '#c62828',
-    fontSize: 13,
-    marginTop: 4,
-    marginBottom: 8,
-  },
-
-  // Live preview
   previewCard: {
-    backgroundColor: '#f5f5f5',
-    borderRadius: 12,
-    marginTop: 20,
-    marginBottom: 8,
+    backgroundColor: C.surface, borderRadius: 20, padding: 20, marginTop: 16,
+    borderWidth: 1, borderColor: C.border, marginBottom: 8,
   },
-  previewTitle: {
-    fontSize: 14,
-    fontWeight: '600',
-    color: '#444',
-  },
-  previewRow: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    paddingVertical: 3,
-  },
-  previewLabel: {
-    fontSize: 14,
-    color: '#555',
-    flex: 1,
-  },
-  previewValue: {
-    fontSize: 14,
-    color: '#333',
-    fontVariant: ['tabular-nums'],
-  },
-  warningNote: {
-    fontSize: 12,
-    color: '#b71c1c',
-    marginTop: 8,
-    fontStyle: 'italic',
-  },
-  deduction: {
-    color: '#c62828',
-  },
-  bold: {
-    fontWeight: '700',
-    color: '#1a1a1a',
-  },
-  negative: {
-    color: '#c62828',
-  },
-  negativeText: {
-    color: '#c62828',
-  },
+  previewHead: { fontSize: 13, fontWeight: '700', color: C.muted, letterSpacing: 0.5 },
+  row: { flexDirection: 'row', justifyContent: 'space-between', paddingVertical: 4 },
+  pl:  { fontSize: 14, color: C.muted, flex: 1 },
+  pv:  { fontSize: 14, color: C.text, fontVariant: ['tabular-nums'] },
 
-  button: { marginTop: 24, borderRadius: 10 },
-  buttonContent: { paddingVertical: 6 },
+  btn:        { borderRadius: 16, marginTop: 20 },
+  btnContent: { paddingVertical: 8 },
+  btnLabel:   { fontSize: 16, fontWeight: '700', letterSpacing: 0.3 },
 });
