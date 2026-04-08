@@ -1048,44 +1048,66 @@ app.MapPost("/api/plaid/webhook", async (
     ApiDbContext dbContext,
     PlaidWebhookRequest requestBody) =>
 {
-    // Only care about Transactions webhooks that indicate new/changed data
-    if (requestBody.WebhookType != "TRANSACTIONS" ||
-        (requestBody.WebhookCode != "DEFAULT_UPDATE" &&
-         requestBody.WebhookCode != "INITIAL_UPDATE" &&
-         requestBody.WebhookCode != "TRANSACTIONS_REMOVED"))
+    // 🔍 Log EVERYTHING so we stop guessing
+    Console.WriteLine($"📡 Webhook received:");
+    Console.WriteLine($"   Type: {requestBody.WebhookType}");
+    Console.WriteLine($"   Code: {requestBody.WebhookCode}");
+    Console.WriteLine($"   ItemId: {requestBody.ItemId}");
+
+    SentrySdk.AddBreadcrumb(
+        $"Webhook received: type={requestBody.WebhookType}, code={requestBody.WebhookCode}, itemId={requestBody.ItemId}",
+        level: BreadcrumbLevel.Info
+    );
+
+    // ✅ Only care about TRANSACTIONS webhooks — ignore everything else
+    if (requestBody.WebhookType != "TRANSACTIONS")
     {
-        SentrySdk.AddBreadcrumb(
-            $"Ignoring webhook: type={requestBody.WebhookType}, code={requestBody.WebhookCode}",
-            level: BreadcrumbLevel.Info);
-        return Results.Ok(new { message = "Webhook received, no action needed for this type." });
+        Console.WriteLine("⏭ Ignoring non-transaction webhook");
+        return Results.Ok(new { message = "Ignored non-transaction webhook." });
     }
 
     try
     {
-        // Sync & classify transactions.
-        // TransactionService.SyncAndProcessTransactions handles all per-transaction
-        // push notifications via ExpoNotificationService — no duplicate push needed here.
-        var syncResponse = await transactionService.SyncAndProcessTransactions(requestBody.ItemId);
+        // 🔥 THIS is the important part — ALWAYS run sync
+        Console.WriteLine("➡️ Running transaction sync...");
+        SentrySdk.AddBreadcrumb("Starting transaction sync");
+        SentrySdk.CaptureMessage("STarting transaction sync");
+
+        var syncResponse = await transactionService
+            .SyncAndProcessTransactions(requestBody.ItemId);
+
+        Console.WriteLine($"✅ Sync complete. Added: {syncResponse.Added.Count}");
 
         SentrySdk.AddBreadcrumb(
-            $"Webhook: sync complete, added={syncResponse.Added.Count} itemId={requestBody.ItemId}",
-            level: BreadcrumbLevel.Info);
+            $"Webhook sync complete: added={syncResponse.Added.Count}",
+            level: BreadcrumbLevel.Info
+        );
 
         return Results.Ok(new
         {
-            message = "Webhook processed, sync done.",
+            message = "Webhook processed successfully",
             added = syncResponse.Added.Count
         });
     }
     catch (Exception e)
     {
+        Console.WriteLine("💥 WEBHOOK PROCESSING FAILED");
+        Console.WriteLine(e.ToString());
+        SentrySdk.CaptureMessage("Webhook processing failed");
+
+
         SentrySdk.CaptureException(e, scope =>
         {
             scope.SetTag("webhook.itemId", requestBody.ItemId ?? "unknown");
             scope.SetTag("webhook.type", requestBody.WebhookType ?? "unknown");
             scope.SetTag("webhook.code", requestBody.WebhookCode ?? "unknown");
         });
-        return Results.Ok(new { message = "Processing failed internally, but response sent." });
+
+        // Still return 200 so Plaid doesn't retry forever
+        return Results.Ok(new
+        {
+            message = "Webhook received but processing failed internally"
+        });
     }
 })
 .WithName("PlaidWebhookReceiver")
