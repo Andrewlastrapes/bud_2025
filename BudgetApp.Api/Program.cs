@@ -346,6 +346,7 @@ app.MapPost("/api/plaid/create_link_token", async (PlaidClient plaidClient, ICon
 
     try
     {
+        SentrySdk.CaptureMessage($"Plffffaid webhook URL in create_link_token: {config["Plaid:WebhookUrl"]}");
         var response = await plaidClient.LinkTokenCreateAsync(plaidRequest);
         return Results.Ok(new { linkToken = response.LinkToken });
     }
