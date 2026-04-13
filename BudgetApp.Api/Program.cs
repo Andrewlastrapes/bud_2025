@@ -1054,6 +1054,9 @@ app.MapPost("/api/plaid/webhook", async (
     Console.WriteLine($"   Code: {requestBody.WebhookCode}");
     Console.WriteLine($"   ItemId: {requestBody.ItemId}");
 
+    SentrySdk.CaptureMessage("webhook endpoint hit");
+
+
     SentrySdk.AddBreadcrumb(
         $"Webhook received: type={requestBody.WebhookType}, code={requestBody.WebhookCode}, itemId={requestBody.ItemId}",
         level: BreadcrumbLevel.Info
