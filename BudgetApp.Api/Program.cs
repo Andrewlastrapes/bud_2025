@@ -342,6 +342,8 @@ app.MapPost("/api/plaid/create_link_token", async (PlaidClient plaidClient, ICon
         RedirectUri = "https://plaid-redirect.dynamicbudgetapp.com"
     };
 
+    SentrySdk.CaptureMessage($"Plaid webhook URL in create_link_token: {config["Plaid:WebhookUrl"]}");
+
     try
     {
         var response = await plaidClient.LinkTokenCreateAsync(plaidRequest);
