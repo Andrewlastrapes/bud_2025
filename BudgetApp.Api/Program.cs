@@ -1050,7 +1050,12 @@ app.MapPost("/api/plaid/webhook", async (
     ITransactionService transactionService,
     ApiDbContext dbContext,
     PlaidWebhookRequest requestBody) =>
+    
 {
+
+    SentrySdk.CaptureMessage(
+        $"Plaid webhook received: type={requestBody.WebhookType}, code={requestBody.WebhookCode}, itemId={requestBody.ItemId}"
+    );
     // 🔍 Log EVERYTHING so we stop guessing
     Console.WriteLine($"📡 Webhook received:");
     Console.WriteLine($"   Type: {requestBody.WebhookType}");
@@ -1065,9 +1070,7 @@ app.MapPost("/api/plaid/webhook", async (
         level: BreadcrumbLevel.Info
     );
 
-    SentrySdk.CaptureMessage(
-        $"Plaid webhook received: type={requestBody.WebhookType}, code={requestBody.WebhookCode}, itemId={requestBody.ItemId}"
-    );
+
     // ✅ Only care about TRANSACTIONS webhooks — ignore everything else
     if (requestBody.WebhookType != "TRANSACTIONS")
     {
