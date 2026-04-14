@@ -70,84 +70,89 @@ namespace BudgetApp.Api.Services
                 var newPostedTransactions = new List<Transaction>();
 
                 // 3. Process "Added" transactions
-                foreach (var t in response.Added ?? Enumerable.Empty<Going.Plaid.Transactions.Transaction>())                {
-                    var exists = await _dbContext.Transactions
-                        .AnyAsync(x => x.PlaidTransactionId == t.TransactionId);
-                    if (exists) continue;
-
-                    DateTime txDate = t.Date
-                        .GetValueOrDefault(DateOnly.FromDateTime(DateTime.UtcNow))
-                        .ToDateTime(TimeOnly.MinValue);
-
-                    DateTime txDateUtc = DateTime.SpecifyKind(txDate, DateTimeKind.Utc);
-                    string merchantName = t.MerchantName ?? t.Name;
-
-                    var rawAmount = t.Amount ?? 0m;
-                    bool isCredit = rawAmount < 0m;  // Plaid: negative = inflow
-                    decimal absAmount = Math.Abs(rawAmount);
-
-                    var newTx = new Transaction
+                var addedTransactions = response.Added;
+                if (addedTransactions != null)
+                {
+                    foreach (var t in addedTransactions)
                     {
-                        UserId = user.Id,
-                        PlaidTransactionId = t.TransactionId,
-                        AccountId = t.AccountId,
-                        Amount = absAmount,
-                        Date = txDateUtc,
-#pragma warning disable CS0612
-                        Name = t.Name,
-#pragma warning restore CS0612
-                        MerchantName = t.MerchantName,
-                        Pending = t.Pending ?? false,
-                        CreatedAt = DateTime.UtcNow,
-                        UpdatedAt = DateTime.UtcNow,
-                        IsLargeExpenseCandidate = false,
-                        LargeExpenseHandled = false
-                    };
+                        var exists = await _dbContext.Transactions
+                            .AnyAsync(x => x.PlaidTransactionId == t.TransactionId);
+                        if (exists) continue;
 
-                    if (isCredit)
-                    {
-                        // Deposit: classify only
-                        var ctx = new DepositContext
+                        DateTime txDate = t.Date
+                            .GetValueOrDefault(DateOnly.FromDateTime(DateTime.UtcNow))
+                            .ToDateTime(TimeOnly.MinValue);
+
+                        DateTime txDateUtc = DateTime.SpecifyKind(txDate, DateTimeKind.Utc);
+                        string merchantName = t.MerchantName ?? t.Name;
+
+                        var rawAmount = t.Amount ?? 0m;
+                        bool isCredit = rawAmount < 0m;  // Plaid: negative = inflow
+                        decimal absAmount = Math.Abs(rawAmount);
+
+                        var newTx = new Transaction
                         {
+                            UserId = user.Id,
+                            PlaidTransactionId = t.TransactionId,
+                            AccountId = t.AccountId,
                             Amount = absAmount,
                             Date = txDateUtc,
-                            MerchantName = merchantName,
-                            PayDay1 = user.PayDay1,
-                            PayDay2 = user.PayDay2,
-                            ExpectedPaycheckAmount = user.ExpectedPaycheckAmount
+#pragma warning disable CS0612
+                            Name = t.Name,
+#pragma warning restore CS0612
+                            MerchantName = t.MerchantName,
+                            Pending = t.Pending ?? false,
+                            CreatedAt = DateTime.UtcNow,
+                            UpdatedAt = DateTime.UtcNow,
+                            IsLargeExpenseCandidate = false,
+                            LargeExpenseHandled = false
                         };
 
-                        newTx.SuggestedKind = _budgetEngine.ClassifyDeposit(ctx);
-                    }
-                    else
-                    {
-                        // Outflow – treat as variable spend unless it's a known fixed cost
-                        bool isFixed = fixedCosts.Any(fc =>
-                            !string.IsNullOrEmpty(fc.PlaidMerchantName) &&
-                            fc.PlaidMerchantName.Equals(
-                                merchantName,
-                                StringComparison.OrdinalIgnoreCase
-                            ));
-
-                        if (!isFixed)
+                        if (isCredit)
                         {
-                            variableSpend += absAmount;
-
-                            if (user.ExpectedPaycheckAmount > 0 &&
-                                _budgetEngine.IsLargeExpense(absAmount, user.ExpectedPaycheckAmount))
+                            // Deposit: classify only
+                            var ctx = new DepositContext
                             {
-                                newTx.IsLargeExpenseCandidate = true;
-                                newTx.LargeExpenseHandled = false;
+                                Amount = absAmount,
+                                Date = txDateUtc,
+                                MerchantName = merchantName,
+                                PayDay1 = user.PayDay1,
+                                PayDay2 = user.PayDay2,
+                                ExpectedPaycheckAmount = user.ExpectedPaycheckAmount
+                            };
+
+                            newTx.SuggestedKind = _budgetEngine.ClassifyDeposit(ctx);
+                        }
+                        else
+                        {
+                            // Outflow – treat as variable spend unless it's a known fixed cost
+                            bool isFixed = fixedCosts.Any(fc =>
+                                !string.IsNullOrEmpty(fc.PlaidMerchantName) &&
+                                fc.PlaidMerchantName.Equals(
+                                    merchantName,
+                                    StringComparison.OrdinalIgnoreCase
+                                ));
+
+                            if (!isFixed)
+                            {
+                                variableSpend += absAmount;
+
+                                if (user.ExpectedPaycheckAmount > 0 &&
+                                    _budgetEngine.IsLargeExpense(absAmount, user.ExpectedPaycheckAmount))
+                                {
+                                    newTx.IsLargeExpenseCandidate = true;
+                                    newTx.LargeExpenseHandled = false;
+                                }
                             }
                         }
-                    }
 
-                    await _dbContext.Transactions.AddAsync(newTx);
+                        await _dbContext.Transactions.AddAsync(newTx);
 
-                    // Only push for settled transactions
-                    if (!newTx.Pending)
-                    {
-                        newPostedTransactions.Add(newTx);
+                        // Only push for settled transactions
+                        if (!newTx.Pending)
+                        {
+                            newPostedTransactions.Add(newTx);
+                        }
                     }
                 }
 
