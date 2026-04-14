@@ -70,8 +70,7 @@ namespace BudgetApp.Api.Services
                 var newPostedTransactions = new List<Transaction>();
 
                 // 3. Process "Added" transactions
-                foreach (var t in response.Added)
-                {
+                foreach (var t in response.Added ?? Enumerable.Empty<Going.Plaid.Transactions.Transaction>())                {
                     var exists = await _dbContext.Transactions
                         .AnyAsync(x => x.PlaidTransactionId == t.TransactionId);
                     if (exists) continue;
