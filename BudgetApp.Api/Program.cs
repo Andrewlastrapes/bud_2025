@@ -1065,6 +1065,9 @@ app.MapPost("/api/plaid/webhook", async (
         level: BreadcrumbLevel.Info
     );
 
+    SentrySdk.CaptureMessage(
+        $"Plaid webhook received: type={requestBody.WebhookType}, code={requestBody.WebhookCode}, itemId={requestBody.ItemId}"
+    );
     // ✅ Only care about TRANSACTIONS webhooks — ignore everything else
     if (requestBody.WebhookType != "TRANSACTIONS")
     {
