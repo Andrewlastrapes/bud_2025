@@ -1080,13 +1080,15 @@ app.MapPost("/api/plaid/webhook", async (
 
     try
     {
-        // 🔥 THIS is the important part — ALWAYS run sync
         Console.WriteLine("➡️ Running transaction sync...");
         SentrySdk.AddBreadcrumb("Starting transaction sync");
         SentrySdk.CaptureMessage("STarting transaction sync");
 
-        var syncResponse = await transactionService
-            .SyncAndProcessTransactions(requestBody.ItemId);
+        bool sendNotifications =
+        requestBody.WebhookCode != "INITIAL_UPDATE" &&
+        requestBody.WebhookCode != "HISTORICAL_UPDATE";
+
+        var syncResponse = await transactionService.SyncAndProcessTransactions(requestBody.ItemId, sendNotifications);
 
         Console.WriteLine($"✅ Sync complete. Added: {syncResponse.Added.Count}");
 

@@ -8,7 +8,7 @@ namespace BudgetApp.Api.Services
 {
     public interface ITransactionService
     {
-        Task<TransactionsSyncResponse> SyncAndProcessTransactions(string itemId);
+        Task<TransactionsSyncResponse> SyncAndProcessTransactions(string itemId, bool sendNotifications = true);
     }
 
     public class TransactionService : ITransactionService
@@ -33,7 +33,7 @@ namespace BudgetApp.Api.Services
             _notificationService = notificationService;
         }
 
-        public async Task<TransactionsSyncResponse> SyncAndProcessTransactions(string itemId)
+        public async Task<TransactionsSyncResponse> SyncAndProcessTransactions(string itemId, bool sendNotifications = true)
         {
             try
             {
@@ -148,7 +148,7 @@ namespace BudgetApp.Api.Services
 
                         await _dbContext.Transactions.AddAsync(newTx);
 
-                        // Only push for settled transactions
+                        // Only queue notifications for settled transactions
                         if (!newTx.Pending)
                         {
                             newPostedTransactions.Add(newTx);
@@ -173,16 +173,19 @@ namespace BudgetApp.Api.Services
                 var currentDynamicBalance = balanceRecord?.BalanceAmount ?? 0m;
 
                 // 6. Fire notifications via ExpoNotificationService
-                foreach (var tx in newPostedTransactions)
+                if (sendNotifications)
                 {
-                    try
+                    foreach (var tx in newPostedTransactions)
                     {
-                        await _notificationService
-                            .SendNewTransactionNotification(tx, currentDynamicBalance);
-                    }
-                    catch (Exception ex)
-                    {
-                        SentrySdk.CaptureException(ex);
+                        try
+                        {
+                            await _notificationService
+                                .SendNewTransactionNotification(tx, currentDynamicBalance);
+                        }
+                        catch (Exception ex)
+                        {
+                            SentrySdk.CaptureException(ex);
+                        }
                     }
                 }
 
