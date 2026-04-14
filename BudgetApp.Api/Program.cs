@@ -1090,21 +1090,23 @@ app.MapPost("/api/plaid/webhook", async (
 
         var syncResponse = await transactionService.SyncAndProcessTransactions(requestBody.ItemId, sendNotifications);
 
-        Console.WriteLine($"✅ Sync complete. Added: {syncResponse.Added.Count}");
+        var addedCount = syncResponse.Added?.Count ?? 0;
+
+        Console.WriteLine($"✅ Sync complete. Added: {addedCount}");
 
         SentrySdk.AddBreadcrumb(
-            $"Webhook sync complete: added={syncResponse.Added.Count}",
+            $"Webhook sync complete: added={addedCount}",
             level: BreadcrumbLevel.Info
         );
 
         return Results.Ok(new
         {
             message = "Webhook processed successfully",
-            added = syncResponse.Added.Count
+            added = addedCount
         });
-    }
+        }
     catch (Exception e)
-    {
+        {
         Console.WriteLine("💥 WEBHOOK PROCESSING FAILED");
         Console.WriteLine(e.ToString());
         SentrySdk.CaptureMessage("Webhook processing failed");
