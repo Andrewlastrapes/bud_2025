@@ -4,48 +4,122 @@ import { Text, Button, Card, Checkbox, ActivityIndicator, TextInput, List, IconB
 import { SafeAreaView } from 'react-native-safe-area-context';
 import axios from 'axios';
 import { auth } from '../../firebaseConfig';
-import { useIsFocused } from '@react-navigation/native';
 
 import { API_BASE_URL } from '../../config/api';
-;
 
-// --- Utility: Calculate 1st Day of Next Month ---
+// --- Utility: Calculate 1st Day of Next Month as MM/DD ---
 const getNextMonthFirstDay = () => {
     const today = new Date();
     const date = new Date(today.getFullYear(), today.getMonth() + 1, 1);
-
     const month = (date.getMonth() + 1).toString().padStart(2, '0');
     const day = date.getDate().toString().padStart(2, '0');
-    const year = date.getFullYear();
-    return `${month}/${day}/${year}`;
+    return `${month}/${day}`;
 };
 
+// --- Utility: Infer year for a MM/DD date ---
+// If the MM/DD is today or in the future this calendar year → use this year.
+// If it has already passed → use next year.
+const inferYear = (month, day) => {
+    const today = new Date();
+    const currentYear = today.getFullYear();
+    const candidate = new Date(currentYear, month - 1, day);
+    // If the candidate date is strictly before today, roll to next year.
+    const todayMidnight = new Date(today.getFullYear(), today.getMonth(), today.getDate());
+    return candidate < todayMidnight ? currentYear + 1 : currentYear;
+};
 
-// --- Utility: Safely convert date string to ISO string ---
+// --- Utility: Safely convert any date string to an ISO string ---
+//   Accepts:
+//     • YYYY-MM-DD  (Plaid API format)
+//     • MM/DD       (simplified manual input — year is inferred)
+//     • MM/DD/YYYY  (legacy full manual input — still works)
+//   Returns null for empty / null / undefined input.
+//   Throws a user-friendly Error for malformed input.
 const getISODate = (dateString, fieldName = 'Date') => {
-    if (!dateString || !dateString.trim()) return null;
+    if (!dateString || !String(dateString).trim()) return null;
 
-    const parts = dateString.split('/');
-    if (parts.length !== 3) {
-        throw new Error(`Invalid date format for ${fieldName}. Please use MM/DD/YYYY.`);
+    const trimmed = String(dateString).trim();
+
+    // ── Format 1: YYYY-MM-DD (from Plaid) ──
+    if (/^\d{4}-\d{2}-\d{2}$/.test(trimmed)) {
+        // Construct as local midnight to avoid UTC offset surprises
+        const [y, m, d] = trimmed.split('-').map(Number);
+        const date = new Date(y, m - 1, d);
+        if (
+            date.getFullYear() !== y ||
+            date.getMonth() !== m - 1 ||
+            date.getDate() !== d
+        ) {
+            throw new Error(`Invalid date for ${fieldName}.`);
+        }
+        return date.toISOString();
     }
 
-    const [month, day, year] = parts.map(Number);
+    // ── Format 2: MM/DD or MM/DD/YYYY ──
+    const parts = trimmed.split('/');
+    if (parts.length < 2 || parts.length > 3) {
+        throw new Error(`Invalid date format for ${fieldName}. Please use MM/DD.`);
+    }
+
+    const month = Number(parts[0]);
+    const day   = Number(parts[1]);
+    const year  = parts.length === 3 ? Number(parts[2]) : inferYear(month, day);
+
+    if (isNaN(month) || isNaN(day) || isNaN(year)) {
+        throw new Error(`Invalid date format for ${fieldName}. Please use MM/DD.`);
+    }
 
     const date = new Date(year, month - 1, day);
-
-    // Validate correctness (handles 02/30, etc.)
     if (
         date.getFullYear() !== year ||
         date.getMonth() !== month - 1 ||
         date.getDate() !== day
     ) {
-        throw new Error(`Invalid date format for ${fieldName}. Please use MM/DD/YYYY.`);
+        throw new Error(`Invalid date for ${fieldName}. Please use MM/DD.`);
     }
 
     return date.toISOString();
 };
 
+// --- Utility: Format any date string for display (MM/DD/YYYY) ---
+// Returns 'Unknown' instead of undefined/null/invalid strings.
+const formatDisplayDate = (dateStr) => {
+    if (!dateStr) return 'Unknown';
+    try {
+        const iso = getISODate(dateStr);
+        if (!iso) return 'Unknown';
+        const d = new Date(iso);
+        const m = (d.getMonth() + 1).toString().padStart(2, '0');
+        const day = d.getDate().toString().padStart(2, '0');
+        const y = d.getFullYear();
+        return `${m}/${day}/${y}`;
+    } catch {
+        return 'Unknown';
+    }
+};
+
+// --- Utility: Infer next projected date from last_date + frequency ---
+// Returns a YYYY-MM-DD string or null.
+const inferNextDate = (lastDateStr, frequency) => {
+    if (!lastDateStr) return null;
+    try {
+        const [y, m, d] = lastDateStr.split('-').map(Number);
+        const last = new Date(y, m - 1, d);
+        let next;
+        const freq = (frequency || '').toUpperCase();
+        if (freq === 'WEEKLY')        next = new Date(last); next?.setDate(last.getDate() + 7);
+        if (freq === 'BIWEEKLY')    { next = new Date(last); next.setDate(last.getDate() + 14); }
+        if (freq === 'SEMI_MONTHLY'){ next = new Date(last); next.setDate(last.getDate() + 15); }
+        if (freq === 'MONTHLY')     { next = new Date(last); next.setMonth(last.getMonth() + 1); }
+        if (freq === 'ANNUALLY')    { next = new Date(last); next.setFullYear(last.getFullYear() + 1); }
+        if (!next || isNaN(next.getTime())) return null;
+        const nm = (next.getMonth() + 1).toString().padStart(2, '0');
+        const nd = next.getDate().toString().padStart(2, '0');
+        return `${next.getFullYear()}-${nm}-${nd}`;
+    } catch {
+        return null;
+    }
+};
 
 // --- Helper function to get the auth token ---
 const getAuthHeader = async () => {
@@ -71,7 +145,7 @@ export default function FixedCostsSetupScreen({ navigation, route }) {
     const [manualCar, setManualCar] = useState('');
     const [manualStudentLoan, setManualStudentLoan] = useState('');
 
-    // Date Inputs
+    // Date Inputs (stored as MM/DD — year is inferred on save)
     const [manualRentDueDate, setManualRentDueDate] = useState('');
     const [manualCarDueDate, setManualCarDueDate] = useState('');
     const [manualStudentLoanDueDate, setManualStudentLoanDueDate] = useState('');
@@ -89,27 +163,40 @@ export default function FixedCostsSetupScreen({ navigation, route }) {
 
     // --- Lifecycle: Fetch Plaid Data and Set Initial Date ---
     useEffect(() => {
-        // Pre-populate Rent due date
+        // Pre-populate Rent due date to the 1st of next month (MM/DD, no year)
         setManualRentDueDate(getNextMonthFirstDay());
         fetchPlaidData();
     }, []);
 
     const fetchPlaidData = async () => {
-        // ... (API fetching logic remains the same) ...
         try {
             const config = await getAuthHeader();
             const response = await axios.get(`${API_BASE_URL}/api/plaid/recurring`, config);
 
             const outflow = response.data.outflow_streams || [];
 
-            const initialCosts = outflow.map(stream => ({
-                id: stream.stream_id,
-                name: stream.description,
-                amount: stream.last_amount.amount,
-                frequency: stream.frequency,
-                nextDueDate: stream.next_projected_date,
-                isApproved: stream.confidence_level === 'HIGH' || stream.confidence_level === 'MEDIUM',
-            }));
+            const initialCosts = outflow.map(stream => {
+                // ── Due date: use next_projected_date, fall back to inferring from last_date + frequency
+                const rawNextDate =
+                    stream.next_projected_date ||
+                    inferNextDate(stream.last_date, stream.frequency);
+
+                // ── Confidence: support both old `confidence_level` and new `status` fields
+                const confidenceLevel =
+                    stream.confidence_level ||
+                    (stream.status === 'MATURE'           ? 'HIGH'   :
+                     stream.status === 'EARLY_DETECTION'  ? 'MEDIUM' : 'LOW');
+
+                return {
+                    id: stream.stream_id,
+                    name: stream.description || stream.merchant_name || 'Unknown',
+                    amount: stream.last_amount?.amount ?? 0,
+                    frequency: stream.frequency || 'UNKNOWN',
+                    // Store as YYYY-MM-DD (or null) — formatted for display via formatDisplayDate
+                    nextDueDate: rawNextDate || null,
+                    isApproved: confidenceLevel === 'HIGH' || confidenceLevel === 'MEDIUM',
+                };
+            });
 
             setPlaidRecurrings(initialCosts);
         } catch (e) {
@@ -118,17 +205,22 @@ export default function FixedCostsSetupScreen({ navigation, route }) {
         setIsLoading(false);
     };
 
+    // --- Utility: Remove Item from Dynamic List ---
+    const handleRemoveCost = (id) => {
+        setOtherManualCosts(prev => prev.filter(c => c.id !== id));
+    };
+
     // --- Utility: Add Item to Dynamic List ---
     const handleAddNewCost = () => {
+        if (!newCostName || !newCostAmount) {
+            Alert.alert("Missing Info", "Please enter both a name and an amount.");
+            return;
+        }
+
         try {
             getISODate(newCostDueDate, newCostName);
         } catch (error) {
             Alert.alert("Invalid Date", error.message);
-            return;
-        }
-
-        if (!newCostName || !newCostAmount) {
-            Alert.alert("Missing Info", "Please enter both a name and an amount.");
             return;
         }
 
@@ -155,15 +247,15 @@ export default function FixedCostsSetupScreen({ navigation, route }) {
             const config = await getAuthHeader();
             const costsToSave = [];
 
-            // Helper function to safely add a cost to the array
+            // Helper: validate + push a manual cost entry
             const addManualCost = (name, amount, dueDate, category = 'Other') => {
                 if (amount && parseFloat(amount) > 0) {
                     costsToSave.push({
-                        name: name,
+                        name,
                         amount: parseFloat(amount),
-                        category: category,
+                        category,
                         type: 'manual',
-                        nextDueDate: getISODate(dueDate, name), // SAFE CONVERSION
+                        nextDueDate: getISODate(dueDate, name), // handles MM/DD with year inference
                     });
                 }
             };
@@ -172,15 +264,14 @@ export default function FixedCostsSetupScreen({ navigation, route }) {
             addManualCost('Rent/Mortgage', manualRent, manualRentDueDate, 'Housing');
             addManualCost('Car Payment', manualCar, manualCarDueDate, 'Transportation');
             addManualCost('Student Loan', manualStudentLoan, manualStudentLoanDueDate, 'Loan');
-            // NOTE: Savings is collected in a dedicated screen AFTER debt onboarding.
 
             // 2. Dynamic Manual Costs (from the list)
             otherManualCosts.forEach(cost => {
                 addManualCost(cost.name, cost.amount, cost.nextDueDate);
             });
 
-
             // 3. Save Confirmed Plaid Costs
+            // nextDueDate from Plaid is already YYYY-MM-DD — getISODate handles that format.
             plaidRecurrings.forEach(cost => {
                 if (cost.isApproved) {
                     costsToSave.push({
@@ -189,17 +280,16 @@ export default function FixedCostsSetupScreen({ navigation, route }) {
                         category: 'Subscription',
                         type: 'plaid_discovered',
                         plaidMerchantName: cost.name,
-                        nextDueDate: getISODate(cost.nextDueDate, cost.name), // SAFE CONVERSION FOR PLAID DATE
+                        nextDueDate: getISODate(cost.nextDueDate, cost.name), // handles YYYY-MM-DD or null
                     });
                 }
             });
 
-            // --- API Call: Send all costs to the backend (one-by-one) ---
+            // --- API Call: Send all costs to the backend ---
             for (const cost of costsToSave) {
                 await axios.post(`${API_BASE_URL}/api/fixed-costs`, cost, config);
             }
 
-            // Success! Move to the next step, passing income params through.
             navigation.navigate('DebtOnboarding', incomeParams);
 
         } catch (error) {
@@ -232,7 +322,7 @@ export default function FixedCostsSetupScreen({ navigation, route }) {
                             These are charges that occur for nearly the same amount at the same time each month. We subtract the total of these costs *upfront*.
                         </Text>
 
-                        {/* RENT: Amount and Date on the same row */}
+                        {/* RENT */}
                         <Text style={styles.inputLabel}>Rent or Mortgage</Text>
                         <View style={styles.row}>
                             <TextInput
@@ -243,14 +333,15 @@ export default function FixedCostsSetupScreen({ navigation, route }) {
                                 style={styles.rowInput}
                             />
                             <TextInput
-                                label="Next Due Date (MM/DD/YYYY)"
+                                label="Due Date (MM/DD)"
                                 value={manualRentDueDate}
                                 onChangeText={setManualRentDueDate}
                                 style={styles.rowInput}
+                                placeholder="MM/DD"
                             />
                         </View>
 
-                        {/* CAR PAYMENT: Amount and Date on the same row */}
+                        {/* CAR PAYMENT */}
                         <Text style={styles.inputLabel}>Car Payment</Text>
                         <View style={styles.row}>
                             <TextInput
@@ -261,14 +352,15 @@ export default function FixedCostsSetupScreen({ navigation, route }) {
                                 style={styles.rowInput}
                             />
                             <TextInput
-                                label="Next Due Date (MM/DD/YYYY)"
+                                label="Due Date (MM/DD)"
                                 value={manualCarDueDate}
                                 onChangeText={setManualCarDueDate}
                                 style={styles.rowInput}
+                                placeholder="MM/DD"
                             />
                         </View>
 
-                        {/* STUDENT LOAN: Amount and Date on the same row */}
+                        {/* STUDENT LOAN */}
                         <Text style={styles.inputLabel}>Student Loan Payment</Text>
                         <View style={styles.row}>
                             <TextInput
@@ -279,10 +371,11 @@ export default function FixedCostsSetupScreen({ navigation, route }) {
                                 style={styles.rowInput}
                             />
                             <TextInput
-                                label="Next Due Date (MM/DD/YYYY)"
+                                label="Due Date (MM/DD)"
                                 value={manualStudentLoanDueDate}
                                 onChangeText={setManualStudentLoanDueDate}
                                 style={styles.rowInput}
+                                placeholder="MM/DD"
                             />
                         </View>
 
@@ -298,8 +391,8 @@ export default function FixedCostsSetupScreen({ navigation, route }) {
                             keyExtractor={(item) => item.id.toString()}
                             renderItem={({ item }) => (
                                 <List.Item
-                                    title={`${item.name} - $${item.amount.toFixed(2)}`}
-                                    description={`Due: ${item.nextDueDate}`}
+                                    title={`${item.name} - $${parseFloat(item.amount).toFixed(2)}`}
+                                    description={`Due: ${formatDisplayDate(item.nextDueDate)}`}
                                     right={() => (
                                         <IconButton icon="close" onPress={() => handleRemoveCost(item.id)} />
                                     )}
@@ -313,7 +406,7 @@ export default function FixedCostsSetupScreen({ navigation, route }) {
                 </Card>
 
 
-                {/* --- C. Plaid Discovery (Same as before) --- */}
+                {/* --- C. Plaid Discovery --- */}
                 <Card style={styles.card}>
                     <Card.Title title="Plaid Suggestions" subtitle="Confirm the fixed costs we found in your history." />
                     <Card.Content>
@@ -325,7 +418,7 @@ export default function FixedCostsSetupScreen({ navigation, route }) {
                                     <List.Item
                                         key={cost.id}
                                         title={cost.name}
-                                        description={`$${cost.amount.toFixed(2)} | Due: ${cost.nextDueDate} | ${cost.frequency}`}
+                                        description={`$${parseFloat(cost.amount).toFixed(2)} | Due: ${formatDisplayDate(cost.nextDueDate)} | ${cost.frequency}`}
                                         right={() => (
                                             <Checkbox.Android
                                                 status={cost.isApproved ? 'checked' : 'unchecked'}
@@ -370,10 +463,11 @@ export default function FixedCostsSetupScreen({ navigation, route }) {
                                 style={styles.input}
                             />
                             <TextInput
-                                label="Next Due Date (MM/DD/YYYY)"
+                                label="Due Date (MM/DD)"
                                 value={newCostDueDate}
                                 onChangeText={setNewCostDueDate}
                                 style={styles.input}
+                                placeholder="MM/DD"
                             />
                             <Button mode="contained" onPress={handleAddNewCost}>Add Bill</Button>
                         </Card.Content>

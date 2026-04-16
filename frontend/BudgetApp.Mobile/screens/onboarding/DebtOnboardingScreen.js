@@ -33,6 +33,80 @@ const C = {
 
 const PRESETS = [100, 200, 300, 500];
 
+// ─── Interest-range math ───────────────────────────────────────────────────────
+// Returns [{apr, months, totalInterest}] for 10 %, 20 %, 30 % APR.
+//
+// Assumptions:
+//   • Interest compounds monthly (standard credit-card model)
+//   • monthlyPayment = selectedAmount × 2  (caller converts paychecks → months)
+//   • When monthlyPayment = 0 a 24-month illustration is used instead
+//   • Formula: standard fixed-payment amortization
+//       n = ceil(−ln(1 − P·r / M) / ln(1+r))
+//       totalInterest = n·M − P
+function calcInterestScenarios(principal, monthlyPayment) {
+  return [0.10, 0.20, 0.30].map(apr => {
+    const r = apr / 12; // monthly rate
+
+    if (monthlyPayment > 0) {
+      if (monthlyPayment <= principal * r) {
+        // Payment doesn't cover accruing interest at this rate
+        return { apr: apr * 100, months: null, totalInterest: null, monthlyInterest: principal * r };
+      }
+      const months = Math.ceil(
+        -Math.log(1 - (principal * r) / monthlyPayment) / Math.log(1 + r),
+      );
+      return { apr: apr * 100, months, totalInterest: Math.max(0, months * monthlyPayment - principal) };
+    }
+
+    // No payment selected → 24-month illustration
+    const n   = 24;
+    const pmt = r > 0
+      ? (principal * r * Math.pow(1 + r, n)) / (Math.pow(1 + r, n) - 1)
+      : principal / n;
+    return { apr: apr * 100, months: n, totalInterest: Math.max(0, n * pmt - principal) };
+  });
+}
+
+// ─── InterestRangeCard component ──────────────────────────────────────────────
+function InterestRangeCard({ principal, monthlyPayment }) {
+  if (!principal || principal <= 0) return null;
+
+  const scenarios      = calcInterestScenarios(principal, monthlyPayment);
+  const isIllustrative = !monthlyPayment || monthlyPayment <= 0;
+
+  return (
+    <View style={ir.card}>
+      <Text style={ir.title}>💡 Interest Cost Scenarios</Text>
+      <Text style={ir.sub}>
+        {isIllustrative
+          ? `$${principal.toFixed(0)} balance · 24-month illustration`
+          : `$${(monthlyPayment / 2).toFixed(0)}/paycheck · ~2 paychecks/month`}
+      </Text>
+
+      {scenarios.map(({ apr, months, totalInterest, monthlyInterest }) => (
+        <View key={apr} style={ir.row}>
+          <Text style={ir.aprLabel}>{apr}% APR</Text>
+          {totalInterest !== null ? (
+            <Text style={ir.cost}>
+              ~${totalInterest.toFixed(0)} in interest
+              {'  '}
+              <Text style={ir.months}>({months} mo)</Text>
+            </Text>
+          ) : (
+            <Text style={[ir.cost, ir.tooLow]}>
+              ⚠️ ~${monthlyInterest.toFixed(0)}/mo interest — payment too low
+            </Text>
+          )}
+        </View>
+      ))}
+
+      <Text style={ir.disclaimer}>
+        Estimate only · actual cost depends on your card's real APR.
+      </Text>
+    </View>
+  );
+}
+
 function StepDots({ current, total }) {
   return (
     <View style={dot.row}>
@@ -264,6 +338,12 @@ export default function DebtOnboardingScreen({ navigation, route }) {
         </View>
       )}
 
+      {/* Interest range scenarios — always shown when debt exists */}
+      <InterestRangeCard
+        principal={totalDebt}
+        monthlyPayment={selectedAmount > 0 ? selectedAmount * 2 : 0}
+      />
+
       {/* Live preview */}
       {selectedAmount > 0 && (
         <View style={[s.previewCard, remainAfterDebt < 0 && s.previewCardDanger]}>
@@ -370,7 +450,34 @@ const s = StyleSheet.create({
   noDebtBody:  { fontSize: 15, color: C.muted, textAlign: 'center', lineHeight: 22, marginBottom: 28, paddingHorizontal: 8 },
 
   bold: { fontWeight: '700', color: C.text },
-  btn:         { borderRadius: 16, marginTop: 20 },
+  btn: { borderRadius: 16, marginTop: 20 },
   btnContent:  { paddingVertical: 8 },
   btnLabel:    { fontSize: 16, fontWeight: '700', letterSpacing: 0.3 },
+});
+
+// ─── Styles for InterestRangeCard ──────────────────────────────────────────────
+const ir = StyleSheet.create({
+  card: {
+    backgroundColor: C.warnBg,
+    borderRadius: 18,
+    padding: 18,
+    marginTop: 14,
+    borderWidth: 1,
+    borderColor: '#FDE68A',
+  },
+  title:      { fontSize: 14, fontWeight: '700', color: '#92400E', marginBottom: 4 },
+  sub:        { fontSize: 12, color: '#B45309', marginBottom: 12 },
+  row: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    paddingVertical: 7,
+    borderBottomWidth: 1,
+    borderBottomColor: '#FDE68A',
+  },
+  aprLabel:   { fontSize: 13, fontWeight: '700', color: '#78350F', width: 72 },
+  cost:       { fontSize: 13, color: '#92400E', flex: 1, textAlign: 'right' },
+  months:     { fontSize: 11, color: '#B45309' },
+  tooLow:     { color: C.danger, fontSize: 12 },
+  disclaimer: { fontSize: 11, color: '#B45309', marginTop: 10, fontStyle: 'italic', textAlign: 'center' },
 });

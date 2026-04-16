@@ -843,10 +843,66 @@ app.MapGet("/api/plaid/recurring", async (ApiDbContext dbContext, PlaidClient pl
 
         var response = await plaidClient.TransactionsRecurringGetAsync(request);
 
+        // Map each stream to a stable DTO with explicit snake_case field names.
+        // This ensures:
+        //   • next_projected_date is always populated (inferred from last_date + frequency when Plaid omits it)
+        //   • confidence_level is always a normalised string (maps from older `confidence_level`
+        //     or newer `status` field so the frontend works with both Plaid API versions)
+        // Going.Plaid v6 TransactionStream facts (confirmed via reflection):
+        //   PredictedNextDate  → DateOnly?  (nullable)  — the projected next occurrence
+        //   LastDate           → DateOnly   (non-nullable)
+        //   Frequency          → RecurringTransactionFrequency (non-nullable enum)
+        //   Status             → TransactionStreamStatus       (non-nullable enum)
+        //   LastAmount         → TransactionStreamAmount        (non-nullable)
+        static string? InferNextDate(DateOnly lastDate, string freq)
+        {
+            DateOnly? next = freq.ToUpperInvariant() switch
+            {
+                "WEEKLY"       => lastDate.AddDays(7),
+                "BIWEEKLY"     => lastDate.AddDays(14),
+                "SEMIMONTHLY"  => lastDate.AddDays(15),
+                "SEMI_MONTHLY" => lastDate.AddDays(15),
+                "MONTHLY"      => lastDate.AddMonths(1),
+                "ANNUALLY"     => lastDate.AddYears(1),
+                _              => null
+            };
+            return next?.ToString("yyyy-MM-dd");
+        }
+
+        static object MapStream(TransactionStream s)
+        {
+            var freqStr  = s.Frequency.ToString();
+            // PredictedNextDate is the correct property name in Going.Plaid v6
+            // (not NextProjectedDate). It is nullable, so ?. is correct here.
+            var nextDate = s.PredictedNextDate?.ToString("yyyy-MM-dd")
+                           ?? InferNextDate(s.LastDate, freqStr);
+
+            // Normalise confidence: older Plaid API surfaces `confidence_level`,
+            // newer API uses `status` (MATURE / EARLY_DETECTION / TOMBSTONED).
+            var statusStr  = s.Status.ToString();
+            var confidence =
+                statusStr.Contains("Mature",  StringComparison.OrdinalIgnoreCase) ? "HIGH"   :
+                statusStr.Contains("Early",   StringComparison.OrdinalIgnoreCase) ? "MEDIUM" : "LOW";
+
+            return new
+            {
+                stream_id           = s.StreamId,
+                description         = s.Description ?? s.MerchantName ?? "Unknown",
+                merchant_name       = s.MerchantName,
+                last_amount         = new { amount = s.LastAmount.Amount },
+                frequency           = freqStr,
+                next_projected_date = nextDate,
+                last_date           = s.LastDate.ToString("yyyy-MM-dd"),
+                confidence_level    = confidence,
+                status              = statusStr,
+                is_active           = s.IsActive
+            };
+        }
+
         return Results.Ok(new
         {
-            inflow_streams = response.InflowStreams,
-            outflow_streams = response.OutflowStreams
+            inflow_streams  = response.InflowStreams?.Select(MapStream).ToList(),
+            outflow_streams = response.OutflowStreams?.Select(MapStream).ToList()
         });
     }
     catch (Exception e)
