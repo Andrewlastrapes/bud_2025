@@ -39,6 +39,7 @@ import OnboardingStack from './navigation/OnboardingStack';
 import DepositReviewScreen from './screens/DepositReviewScreen';
 import { createBottomTabNavigator } from '@react-navigation/bottom-tabs';
 import ReviewLargeExpensesScreen from './screens/ReviewLargeExpensesScreen';
+import ReviewSuspiciousHoldsScreen from './screens/ReviewSuspiciousHoldsScreen';
 export const navigationRef = createNavigationContainerRef();
 
 
@@ -244,6 +245,11 @@ function MainContentNavigator({ fbUser }) {
         name="ReviewLargeExpenses"
         component={ReviewLargeExpensesScreen}
         options={{ title: 'Review Large Expenses' }}
+      />
+      <Stack.Screen
+        name="ReviewSuspiciousHolds"
+        component={ReviewSuspiciousHoldsScreen}
+        options={{ headerShown: true, title: 'Review Pending Holds' }}
       />
 
 

@@ -619,6 +619,7 @@ app.MapPost("/api/transactions/sync", async (ITransactionService transactionServ
         var plaidItem = await dbContext.PlaidItems.FirstOrDefaultAsync(p => p.UserId == user.Id);
         if (plaidItem == null) return Results.BadRequest("No Plaid item linked for this user.");
 
+        // Manual sync — not a backfill, so webhookCode = null (live sync, notifications eligible)
         var response = await transactionService.SyncAndProcessTransactions(plaidItem.ItemId);
 
         return Results.Ok(new
@@ -1084,11 +1085,11 @@ app.MapPost("/api/plaid/webhook", async (
         SentrySdk.AddBreadcrumb("Starting transaction sync");
         SentrySdk.CaptureMessage("STarting transaction sync");
 
-        bool sendNotifications =
-        requestBody.WebhookCode != "INITIAL_UPDATE" &&
-        requestBody.WebhookCode != "HISTORICAL_UPDATE";
-
-        var syncResponse = await transactionService.SyncAndProcessTransactions(requestBody.ItemId, sendNotifications);
+        // Pass the webhook code so TransactionService can determine whether this is a
+        // backfill sync (INITIAL_UPDATE / HISTORICAL_UPDATE) and set NotificationsEnabledAt
+        // on first live sync.
+        var syncResponse = await transactionService.SyncAndProcessTransactions(
+            requestBody.ItemId, requestBody.WebhookCode);
 
         var addedCount = syncResponse.Added?.Count ?? 0;
 
@@ -1348,6 +1349,106 @@ app.MapPost("/api/transactions/{id}/decision", async (int id, UpdateTransactionD
 .WithOpenApi();
 
 
+
+// GET: /api/transactions/suspicious-holds
+// Returns pending holds flagged as suspicious (gas, hotel, rental car) that need user review.
+app.MapGet("/api/transactions/suspicious-holds", async (ApiDbContext dbContext, HttpContext httpContext) =>
+{
+    try
+    {
+        string? idToken = httpContext.Request.Headers["Authorization"].FirstOrDefault()?.Split(" ").Last();
+        if (string.IsNullOrEmpty(idToken)) return Results.Unauthorized();
+
+        var decodedToken = await FirebaseAdmin.Auth.FirebaseAuth.DefaultInstance.VerifyIdTokenAsync(idToken);
+        var user = await dbContext.Users.FirstOrDefaultAsync(u => u.FirebaseUuid == decodedToken.Uid);
+        if (user == null) return Results.NotFound("User not found.");
+
+        var holds = await dbContext.Transactions
+            .Where(t => t.UserId == user.Id
+                && t.IsSuspiciousHold
+                && t.Pending
+                && !t.HoldReviewed)
+            .OrderByDescending(t => t.Date)
+            .ToListAsync();
+
+        return Results.Ok(holds);
+    }
+    catch (Exception e)
+    {
+        SentrySdk.CaptureException(e);
+        return Results.Problem(e.Message);
+    }
+})
+.WithName("GetSuspiciousHolds")
+.WithOpenApi();
+
+// POST: /api/transactions/{id}/hold-override
+// Lets the user replace the full hold amount with their expected actual charge.
+// Adjusts the dynamic balance immediately by the difference.
+app.MapPost("/api/transactions/{id}/hold-override",
+    async (int id, HoldOverrideRequest body, ApiDbContext dbContext, HttpContext httpContext) =>
+{
+    try
+    {
+        string? idToken = httpContext.Request.Headers["Authorization"].FirstOrDefault()?.Split(" ").Last();
+        if (string.IsNullOrEmpty(idToken)) return Results.Unauthorized();
+
+        var decodedToken = await FirebaseAdmin.Auth.FirebaseAuth.DefaultInstance.VerifyIdTokenAsync(idToken);
+        var user = await dbContext.Users.FirstOrDefaultAsync(u => u.FirebaseUuid == decodedToken.Uid);
+        if (user == null) return Results.NotFound("User not found.");
+
+        var tx = await dbContext.Transactions
+            .FirstOrDefaultAsync(t => t.Id == id && t.UserId == user.Id);
+        if (tx == null) return Results.NotFound("Transaction not found.");
+
+        if (!tx.IsSuspiciousHold)
+            return Results.BadRequest("Transaction is not a suspicious hold.");
+
+        if (!tx.Pending)
+            return Results.BadRequest("Hold has already posted or been removed; no adjustment needed.");
+
+        if (body.OverrideAmount <= 0)
+            return Results.BadRequest("Override amount must be greater than zero.");
+
+        // Compute how much was previously reserved in the budget for this hold
+        decimal previouslyApplied = tx.BudgetAppliedAmount ?? tx.Amount;
+
+        // Adjust balance: give back the difference between what was reserved and the override
+        decimal delta = previouslyApplied - body.OverrideAmount;
+
+        var balance = await dbContext.Balances.FirstOrDefaultAsync(b => b.UserId == user.Id);
+        if (balance != null && delta != 0)
+        {
+            balance.BalanceAmount += delta;
+            balance.UpdatedAt = DateTime.UtcNow;
+        }
+
+        // Record the override so future reversals (when the pending is removed) use it
+        tx.HoldOverrideAmount    = body.OverrideAmount;
+        tx.BudgetAppliedAmount   = body.OverrideAmount;
+        tx.HoldReviewed          = true;
+        tx.UpdatedAt             = DateTime.UtcNow;
+
+        await dbContext.SaveChangesAsync();
+
+        return Results.Ok(new
+        {
+            message           = "Hold override saved.",
+            transactionId     = tx.Id,
+            originalAmount    = tx.Amount,
+            overrideAmount    = tx.HoldOverrideAmount,
+            balanceAdjustment = delta,
+            newBalance        = balance?.BalanceAmount
+        });
+    }
+    catch (Exception e)
+    {
+        SentrySdk.CaptureException(e);
+        return Results.Problem(e.Message);
+    }
+})
+.WithName("OverrideHoldAmount")
+.WithOpenApi();
 
 // GET: /api/transactions/large-expenses
 app.MapGet("/api/transactions/large-expenses/pending", async (ApiDbContext dbContext, HttpContext httpContext) =>

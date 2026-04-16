@@ -35,6 +35,15 @@ public class PlaidItem
     [Column("cursor")]
     public string? Cursor { get; set; }
 
+    /// <summary>
+    /// Set to UTC now the first time a non-backfill sync completes for this item.
+    /// Null while the initial Plaid backfill (INITIAL_UPDATE / HISTORICAL_UPDATE) is still
+    /// running. Notifications are only sent for transactions whose CreatedAt is on or after
+    /// this timestamp, so backfill transactions never trigger push notifications.
+    /// </summary>
+    [Column("notifications_enabled_at")]
+    public DateTime? NotificationsEnabledAt { get; set; }
+
     [ForeignKey(nameof(UserId))]
     public virtual User? User { get; set; }
 }

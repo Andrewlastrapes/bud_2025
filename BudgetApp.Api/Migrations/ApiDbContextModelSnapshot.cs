@@ -139,6 +139,10 @@ namespace BudgetApp.Api.Migrations
                         .HasColumnType("text")
                         .HasColumnName("cursor");
 
+                    b.Property<DateTime?>("NotificationsEnabledAt")
+                        .HasColumnType("timestamp with time zone")
+                        .HasColumnName("notifications_enabled_at");
+
                     b.Property<string>("InstitutionLogo")
                         .HasColumnType("text")
                         .HasColumnName("institution_logo");
@@ -204,6 +208,22 @@ namespace BudgetApp.Api.Migrations
                     b.Property<bool>("LargeExpenseHandled")
                         .HasColumnType("boolean")
                         .HasColumnName("LargeExpenseHandled");
+
+                    b.Property<decimal?>("BudgetAppliedAmount")
+                        .HasColumnType("numeric")
+                        .HasColumnName("budget_applied_amount");
+
+                    b.Property<decimal?>("HoldOverrideAmount")
+                        .HasColumnType("numeric")
+                        .HasColumnName("hold_override_amount");
+
+                    b.Property<bool>("HoldReviewed")
+                        .HasColumnType("boolean")
+                        .HasColumnName("hold_reviewed");
+
+                    b.Property<bool>("IsSuspiciousHold")
+                        .HasColumnType("boolean")
+                        .HasColumnName("is_suspicious_hold");
 
                     b.Property<string>("MerchantName")
                         .HasColumnType("text")
