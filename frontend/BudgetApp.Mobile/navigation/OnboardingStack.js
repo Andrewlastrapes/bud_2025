@@ -5,6 +5,7 @@ import { auth } from '../firebaseConfig';
 import { signOut } from 'firebase/auth';
 
 import WelcomeScreen from '../screens/onboarding/WelcomeScreen';
+import HowItWorksScreen from '../screens/onboarding/HowItWorksScreen';
 import PlaidConnectScreen from '../screens/onboarding/PlaidConnectScreen';
 import DepositOnboardingScreen from '../screens/onboarding/DepositOnboardingScreen';
 import FixedCostsSetupScreen from '../screens/onboarding/FixedCostsSetupScreen';
@@ -33,6 +34,13 @@ export default function OnboardingStack() {
       <Stack.Screen
         name="Welcome"
         component={WelcomeScreen}
+        options={{ headerShown: false }}
+      />
+
+      {/* How it works: explains the paycheck-by-paycheck approach */}
+      <Stack.Screen
+        name="HowItWorks"
+        component={HowItWorksScreen}
         options={{ headerShown: false }}
       />
 

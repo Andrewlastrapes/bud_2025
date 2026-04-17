@@ -19,6 +19,7 @@ import { View, ActivityIndicator, StyleSheet } from 'react-native';
 import { createNavigationContainerRef, NavigationContainer } from '@react-navigation/native';
 import { createNativeStackNavigator } from '@react-navigation/native-stack';
 import { PaperProvider, DefaultTheme, Button } from 'react-native-paper';
+import { colors } from './config/theme';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
 import MaterialCommunityIcons from 'react-native-vector-icons/MaterialCommunityIcons';
 import axios from 'axios';
@@ -46,6 +47,16 @@ export const navigationRef = createNavigationContainerRef();
 
 // --- API Base URL ---
 import { API_BASE_URL } from './config/api';
+
+// --- Paper theme — modern indigo replaces the default Material purple ---
+const appTheme = {
+  ...DefaultTheme,
+  colors: {
+    ...DefaultTheme.colors,
+    primary: colors.primary,       // #4F46E5
+    accent: colors.primaryLight,   // #6366F1
+  },
+};
 
 // --- Navigators ---
 const Stack = createNativeStackNavigator();
@@ -371,7 +382,7 @@ function App() {
 
   return (
     <SafeAreaProvider>
-      <PaperProvider theme={DefaultTheme}>
+        <PaperProvider theme={appTheme}>
         <NavigationContainer
           ref={navigationRef}
           onStateChange={(state) => {

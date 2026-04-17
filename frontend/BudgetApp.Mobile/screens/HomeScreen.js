@@ -1,5 +1,10 @@
 import React, { useState, useEffect } from 'react';
-import { View, StyleSheet, TouchableOpacity } from 'react-native';
+import {
+    View,
+    StyleSheet,
+    TouchableOpacity,
+    ScrollView,
+} from 'react-native';
 import { Text, Button, TextInput, Modal, Portal, Card } from 'react-native-paper';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import axios from 'axios';
@@ -11,38 +16,36 @@ import { API_BASE_URL } from '../config/api';
 export default function HomeScreen({ navigation }) {
     const [balance, setBalance] = useState(0);
     const [paycheckInput, setPaycheckInput] = useState('');
-    const [visible, setVisible] = useState(false); // Controls the modal
+    const [visible, setVisible] = useState(false);
     const [isLoading, setIsLoading] = useState(false);
-    const [holdCount, setHoldCount] = useState(0); // Suspicious pending holds needing review
-    const isFocused = useIsFocused(); // Refreshes data when tab is opened
+    const [holdCount, setHoldCount] = useState(0);
+    const isFocused = useIsFocused();
 
     // Helper to get auth headers
     const getAuthHeader = async () => {
         const user = auth.currentUser;
-        if (!user) throw new Error("No user logged in.");
+        if (!user) throw new Error('No user logged in.');
         const token = await user.getIdToken();
-        return { headers: { 'Authorization': `Bearer ${token}` } };
+        return { headers: { Authorization: `Bearer ${token}` } };
     };
 
-    // 1. Fetch current balance
     const fetchBalance = async () => {
         try {
             const config = await getAuthHeader();
             const response = await axios.get(`${API_BASE_URL}/api/balance`, config);
             setBalance(response.data.amount);
         } catch (e) {
-            console.error("Failed to fetch balance:", e);
+            console.error('Failed to fetch balance:', e);
         }
     };
 
-    // 2. Fetch count of unreviewed suspicious holds
     const fetchHoldCount = async () => {
         try {
             const config = await getAuthHeader();
             const response = await axios.get(`${API_BASE_URL}/api/transactions/suspicious-holds`, config);
             setHoldCount(response.data.length ?? 0);
         } catch (e) {
-            console.error("Failed to fetch hold count:", e);
+            console.error('Failed to fetch hold count:', e);
         }
     };
 
@@ -53,22 +56,18 @@ export default function HomeScreen({ navigation }) {
         }
     }, [isFocused]);
 
-    // 2. Handle setting the new paycheck
     const handleSetPaycheck = async () => {
         setIsLoading(true);
         try {
             const config = await getAuthHeader();
             const amount = parseFloat(paycheckInput);
-
             await axios.post(`${API_BASE_URL}/api/balance`, { amount }, config);
-
-            // Update UI and close modal
             setBalance(amount);
             setPaycheckInput('');
             setVisible(false);
         } catch (e) {
-            console.error("Failed to set paycheck:", e);
-            alert("Error updating balance.");
+            console.error('Failed to set paycheck:', e);
+            alert('Error updating balance.');
         }
         setIsLoading(false);
     };
@@ -77,89 +76,116 @@ export default function HomeScreen({ navigation }) {
     const absoluteOver = Math.abs(balance);
 
     return (
-        <SafeAreaView style={styles.container}>
-            {/* The Big Dynamic Number */}
-            <View style={styles.balanceContainer}>
-                <Text style={isOverBudget ? styles.labelOver : styles.label}>
-                    {isOverBudget ? 'Over Budget' : 'Dynamic Budget'}
-                </Text>
-
-                <Text style={isOverBudget ? styles.amountOver : styles.amount}>
-                    {isOverBudget
-                        ? `-$${absoluteOver.toFixed(2)}`
-                        : `$${balance.toFixed(2)}`}
-                </Text>
-
-                {isOverBudget && (
-                    <Text style={styles.overBudgetSubtitle}>
-                        You&apos;re currently over budget by ${absoluteOver.toFixed(2)}
-                        {' '}until your next paycheck.
+        <SafeAreaView style={styles.safe}>
+            <ScrollView
+                style={styles.scroll}
+                contentContainerStyle={styles.scrollContent}
+                showsVerticalScrollIndicator={false}
+            >
+                {/* ── Hero balance card ── */}
+                <View style={[styles.balanceCard, isOverBudget && styles.balanceCardDanger]}>
+                    <Text style={styles.balanceEyebrow}>
+                        {isOverBudget ? 'OVER BUDGET' : 'DYNAMIC BUDGET'}
                     </Text>
+
+                    <Text style={[styles.balanceAmount, isOverBudget && styles.balanceAmountDanger]}>
+                        {isOverBudget
+                            ? `-$${absoluteOver.toFixed(2)}`
+                            : `$${balance.toFixed(2)}`}
+                    </Text>
+
+                    {isOverBudget ? (
+                        <Text style={styles.balanceDangerNote}>
+                            You're over budget by ${absoluteOver.toFixed(2)} until your next paycheck.
+                        </Text>
+                    ) : (
+                        <Text style={styles.balanceSafeNote}>
+                            Safe to spend until your next paycheck
+                        </Text>
+                    )}
+                </View>
+
+                {/* ── Hold banner ── */}
+                {holdCount > 0 && (
+                    <TouchableOpacity
+                        style={styles.holdBanner}
+                        onPress={() => navigation.navigate('ReviewSuspiciousHolds')}
+                        activeOpacity={0.8}
+                    >
+                        <Text style={styles.holdIcon}>⚠️</Text>
+                        <View style={styles.holdTextBlock}>
+                            <Text style={styles.holdTitle}>
+                                {holdCount} Pending Hold{holdCount > 1 ? 's' : ''} Need Review
+                            </Text>
+                            <Text style={styles.holdSub}>
+                                Gas / hotel / rental holds may be inflated. Tap to adjust.
+                            </Text>
+                        </View>
+                        <Text style={styles.holdChevron}>›</Text>
+                    </TouchableOpacity>
                 )}
-            </View>
 
-            {/* Button to reset/set paycheck */}
-            <Button
-                mode="contained"
-                onPress={() => setVisible(true)}
-                style={styles.button}
-            >
-                Edit Upcoming Paycheck
-            </Button>
+                {/* ── Actions ── */}
+                <View style={styles.actionsSection}>
+                    <Button
+                        mode="contained"
+                        onPress={() => setVisible(true)}
+                        style={styles.primaryBtn}
+                        contentStyle={styles.btnContent}
+                        labelStyle={styles.btnLabel}
+                    >
+                        Edit Upcoming Paycheck
+                    </Button>
 
-            {/* Deposit Review entry point */}
-            <Button
-                mode="outlined"
-                onPress={() => navigation.navigate('DepositReview')}
-                style={styles.secondaryButton}
-            >
-                Review New Deposits
-            </Button>
-            <Button
-                mode="outlined"
-                style={styles.button}
-                onPress={() => navigation.navigate('ReviewLargeExpenses')}
-                >
-                Review Large Expenses
-                </Button>
+                    <Button
+                        mode="outlined"
+                        onPress={() => navigation.navigate('DepositReview')}
+                        style={styles.outlinedBtn}
+                        contentStyle={styles.btnContent}
+                        labelStyle={styles.outlinedBtnLabel}
+                    >
+                        Review New Deposits
+                    </Button>
 
-            {/* Suspicious hold banner — shown only when unreviewed holds exist */}
-            {holdCount > 0 && (
-                <TouchableOpacity
-                    style={styles.holdBanner}
-                    onPress={() => navigation.navigate('ReviewSuspiciousHolds')}
-                    activeOpacity={0.8}
-                >
-                    <Text style={styles.holdBannerIcon}>⚠️</Text>
-                    <View style={styles.holdBannerText}>
-                        <Text style={styles.holdBannerTitle}>
-                            {holdCount} Pending Hold{holdCount > 1 ? 's' : ''} Need Review
-                        </Text>
-                        <Text style={styles.holdBannerSub}>
-                            Gas / hotel / rental holds may be inflated. Tap to adjust.
-                        </Text>
-                    </View>
-                    <Text style={styles.holdBannerChevron}>›</Text>
-                </TouchableOpacity>
-            )}
+                    <Button
+                        mode="outlined"
+                        onPress={() => navigation.navigate('ReviewLargeExpenses')}
+                        style={styles.outlinedBtn}
+                        contentStyle={styles.btnContent}
+                        labelStyle={styles.outlinedBtnLabel}
+                    >
+                        Review Large Expenses
+                    </Button>
+                </View>
+            </ScrollView>
 
-            {/* Modal for entering amount */}
+            {/* ── Paycheck modal ── */}
             <Portal>
-                <Modal visible={visible} onDismiss={() => setVisible(false)} contentContainerStyle={styles.modal}>
-                    <Card>
-                        <Card.Title title="New Paycheck" />
+                <Modal
+                    visible={visible}
+                    onDismiss={() => setVisible(false)}
+                    contentContainerStyle={styles.modal}
+                >
+                    <Card style={styles.modalCard}>
+                        <Card.Title
+                            title="New Paycheck"
+                            titleStyle={styles.modalTitle}
+                        />
                         <Card.Content>
                             <TextInput
                                 label="Amount ($)"
                                 value={paycheckInput}
                                 onChangeText={setPaycheckInput}
                                 keyboardType="numeric"
-                                style={{ marginBottom: 15 }}
+                                mode="outlined"
+                                style={styles.modalInput}
                             />
                             <Button
                                 mode="contained"
                                 onPress={handleSetPaycheck}
                                 loading={isLoading}
+                                contentStyle={styles.btnContent}
+                                labelStyle={styles.btnLabel}
                             >
                                 Save
                             </Button>
@@ -172,82 +198,149 @@ export default function HomeScreen({ navigation }) {
 }
 
 const styles = StyleSheet.create({
-    container: {
+    safe: {
         flex: 1,
-        padding: 20,
-        justifyContent: 'center',
+        backgroundColor: '#F8FAFC',
     },
-    balanceContainer: {
+    scroll: {
+        flex: 1,
+    },
+    scrollContent: {
+        paddingHorizontal: 20,
+        paddingTop: 24,
+        paddingBottom: 40,
+    },
+
+    // ── Balance card ──────────────────────────────────────────────
+    balanceCard: {
+        backgroundColor: '#FFFFFF',
+        borderRadius: 20,
+        paddingVertical: 32,
+        paddingHorizontal: 28,
         alignItems: 'center',
-        marginBottom: 40,
+        marginBottom: 16,
+        // shadow
+        shadowColor: '#4F46E5',
+        shadowOffset: { width: 0, height: 4 },
+        shadowOpacity: 0.08,
+        shadowRadius: 16,
+        elevation: 4,
+        borderWidth: 1,
+        borderColor: 'rgba(79,70,229,0.06)',
     },
-    label: {
-        fontSize: 18,
-        color: '#666',
+    balanceCardDanger: {
+        shadowColor: '#DC2626',
+        borderColor: 'rgba(220,38,38,0.08)',
+    },
+    balanceEyebrow: {
+        fontSize: 11,
+        fontWeight: '700',
+        letterSpacing: 1.8,
+        color: '#94A3B8',
+        marginBottom: 14,
+        textTransform: 'uppercase',
+    },
+    balanceAmount: {
+        fontSize: 52,
+        fontWeight: '800',
+        color: '#0D9488',   // teal-600 — calm, positive
+        letterSpacing: -1.5,
         marginBottom: 10,
     },
-    labelOver: {
-        fontSize: 18,
-        color: '#b00020', // material-ish error red
-        marginBottom: 10,
-        fontWeight: '600',
+    balanceAmountDanger: {
+        color: '#DC2626',
     },
-    amount: {
-        fontSize: 48,
-        fontWeight: 'bold',
-        color: '#6200ee', // Primary color
+    balanceSafeNote: {
+        fontSize: 13,
+        color: '#94A3B8',
+        fontWeight: '400',
     },
-    amountOver: {
-        fontSize: 48,
-        fontWeight: 'bold',
-        color: '#b00020',
-    },
-    overBudgetSubtitle: {
-        marginTop: 12,
-        fontSize: 14,
-        color: '#b00020',
+    balanceDangerNote: {
+        fontSize: 13,
+        color: '#DC2626',
+        fontWeight: '500',
         textAlign: 'center',
-        paddingHorizontal: 10,
+        paddingHorizontal: 12,
     },
-    button: {
-        marginTop: 20,
-    },
-    secondaryButton: {
-        marginTop: 10,
-    },
-    modal: {
-        padding: 20,
-    },
+
+    // ── Hold banner ───────────────────────────────────────────────
     holdBanner: {
         flexDirection: 'row',
         alignItems: 'center',
-        backgroundColor: '#fff3e0',
+        backgroundColor: '#FFFBEB',
         borderWidth: 1,
-        borderColor: '#ffb300',
-        borderRadius: 10,
-        padding: 14,
-        marginTop: 16,
+        borderColor: '#FDE68A',
+        borderRadius: 14,
+        paddingVertical: 14,
+        paddingHorizontal: 16,
+        marginBottom: 16,
     },
-    holdBannerIcon: {
-        fontSize: 22,
-        marginRight: 10,
+    holdIcon: {
+        fontSize: 20,
+        marginRight: 12,
     },
-    holdBannerText: {
+    holdTextBlock: {
         flex: 1,
     },
-    holdBannerTitle: {
+    holdTitle: {
         fontSize: 14,
         fontWeight: '700',
-        color: '#e65100',
+        color: '#92400E',
     },
-    holdBannerSub: {
+    holdSub: {
         fontSize: 12,
-        color: '#bf360c',
+        color: '#B45309',
         marginTop: 2,
+        lineHeight: 18,
     },
-    holdBannerChevron: {
+    holdChevron: {
         fontSize: 22,
-        color: '#e65100',
-        marginLeft: 6,
+        color: '#D97706',
+        marginLeft: 8,
+        fontWeight: '300',
+    },
+
+    // ── Actions ───────────────────────────────────────────────────
+    actionsSection: {
+        gap: 10,
+    },
+    primaryBtn: {
+        borderRadius: 12,
+    },
+    outlinedBtn: {
+        borderRadius: 12,
+        borderColor: '#4F46E5',
+    },
+    btnContent: {
+        height: 50,
+    },
+    btnLabel: {
+        fontSize: 15,
+        fontWeight: '600',
+        letterSpacing: 0.2,
+    },
+    outlinedBtnLabel: {
+        fontSize: 15,
+        fontWeight: '600',
+        letterSpacing: 0.2,
+        color: '#4F46E5',
+    },
+
+    // ── Modal ─────────────────────────────────────────────────────
+    modal: {
+        paddingHorizontal: 24,
+    },
+    modalCard: {
+        borderRadius: 16,
+        overflow: 'hidden',
+    },
+    modalTitle: {
+        fontSize: 18,
+        fontWeight: '700',
+        color: '#0F172A',
+    },
+    modalInput: {
+        marginBottom: 16,
+        backgroundColor: '#FFFFFF',
     },
 });

@@ -1,31 +1,103 @@
-import React, { useState, useEffect } from 'react';
-import { View, StyleSheet, FlatList } from 'react-native';
+import React, { useState, useEffect, useCallback } from 'react';
+import { View, StyleSheet, FlatList, Platform } from 'react-native';
 import { Text, Button, ActivityIndicator, List } from 'react-native-paper';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import axios from 'axios';
-import { usePlaidLink } from 'react-plaid-link';
 import { auth } from '../firebaseConfig';
-import { useIsFocused } from '@react-navigation/native'; // Import this hook
-
+import { useIsFocused } from '@react-navigation/native';
 import { API_BASE_URL } from '../config/api';
-;
 
+// --- Helper to get auth headers ---
+const getAuthHeader = async () => {
+    const user = auth.currentUser;
+    if (!user) throw new Error('No user is logged in.');
+    const idToken = await user.getIdToken();
+    return { headers: { Authorization: `Bearer ${idToken}` } };
+};
+
+// ─── Web: uses react-plaid-link (iframe-based) ────────────────────────────────
+function WebAddAccountButton({ linkToken, createLinkToken, onPlaidSuccess, isLoading }) {
+    const { usePlaidLink } = require('react-plaid-link');
+
+    const { open, ready } = usePlaidLink({
+        token: linkToken,
+        onSuccess: onPlaidSuccess,
+        onExit: (exit) => console.log('[Settings] Plaid exited:', exit),
+    });
+
+    // Auto-open as soon as the token is loaded and the SDK is ready
+    useEffect(() => {
+        if (linkToken && ready) {
+            open();
+        }
+    }, [linkToken, ready, open]);
+
+    return (
+        <Button
+            mode="contained"
+            onPress={createLinkToken}
+            disabled={isLoading}
+            style={styles.addButton}
+        >
+            {isLoading ? <ActivityIndicator color="white" /> : 'Add New Account'}
+        </Button>
+    );
+}
+
+// ─── Native: uses react-native-plaid-link-sdk ─────────────────────────────────
+function NativeAddAccountButton({ linkToken, setLinkToken, createLinkToken, onPlaidSuccess, isLoading, setError }) {
+    const plaid = require('react-native-plaid-link-sdk');
+    const { create, open } = plaid;
+
+    // Initialise the native SDK whenever we receive a fresh token
+    useEffect(() => {
+        if (!linkToken) return;
+        create({ token: linkToken });
+    }, [linkToken]);
+
+    const handleOpenPlaid = async () => {
+        try {
+            await open({
+                onSuccess: onPlaidSuccess,
+                onExit: (exit) => {
+                    console.log('[Settings] Plaid exited:', exit);
+                    setLinkToken(null);
+                },
+            });
+        } catch (e) {
+            console.error('[Settings] Plaid open failed:', e);
+            setError('Could not open Plaid. Please try again.');
+            setLinkToken(null);
+        }
+    };
+
+    // Once the token is created and create() has been called, auto-open Plaid
+    useEffect(() => {
+        if (!linkToken) return;
+        handleOpenPlaid();
+    }, [linkToken]);
+
+    return (
+        <Button
+            mode="contained"
+            onPress={createLinkToken}
+            disabled={isLoading}
+            style={styles.addButton}
+        >
+            {isLoading ? <ActivityIndicator color="white" /> : 'Add New Account'}
+        </Button>
+    );
+}
+
+// ─── Main screen ──────────────────────────────────────────────────────────────
 export default function SettingsScreen() {
     const [linkToken, setLinkToken] = useState(null);
     const [isLoading, setIsLoading] = useState(false);
     const [error, setError] = useState(null);
-    const [accounts, setAccounts] = useState([]); // State for connected accounts
-    const isFocused = useIsFocused(); // Hook to check if screen is active
+    const [accounts, setAccounts] = useState([]);
+    const isFocused = useIsFocused();
 
-    // --- Helper function to get the auth token ---
-    const getAuthHeader = async () => {
-        const user = auth.currentUser;
-        if (!user) throw new Error("No user is logged in.");
-        const idToken = await user.getIdToken();
-        return { headers: { 'Authorization': `Bearer ${idToken}` } };
-    };
-
-    // --- 1. Function to fetch connected accounts ---
+    // --- Fetch connected accounts ---
     const fetchAccounts = async () => {
         setError(null);
         try {
@@ -33,77 +105,75 @@ export default function SettingsScreen() {
             const response = await axios.get(`${API_BASE_URL}/api/plaid/accounts`, config);
             setAccounts(response.data);
         } catch (e) {
-            console.error('Error fetching accounts:', e.message);
+            console.error('[Settings] Error fetching accounts:', e.message);
             setError('Could not fetch accounts. ' + e.message);
         }
     };
 
-    // --- 2. Fetch accounts when the screen comes into focus ---
     useEffect(() => {
         if (isFocused) {
             fetchAccounts();
         }
-    }, [isFocused]); // Re-run when the screen is focused
+    }, [isFocused]);
 
-    // --- 3. Plaid Success Callback ---
-    const onPlaidSuccess = React.useCallback(async (public_token, metadata) => {
-        console.log('Plaid Link success! Exchanging token...');
+    // --- Plaid success callback ---
+    const onPlaidSuccess = useCallback(async (publicTokenOrSuccess, metadata) => {
+        // Normalise: web SDK passes a string; native SDK passes { publicToken, metadata }
+        const publicToken =
+            typeof publicTokenOrSuccess === 'string'
+                ? publicTokenOrSuccess
+                : publicTokenOrSuccess?.publicToken;
+
         setError(null);
+        setLinkToken(null);
         try {
             const user = auth.currentUser;
-            if (!user) throw new Error("No user logged in.");
-
-            const config = await getAuthHeader(); // Get auth header
-            await axios.post(`${API_BASE_URL}/api/plaid/exchange_public_token`, {
-                publicToken: public_token,
-                firebaseUuid: user.uid
-            }, config); // Send token with request
-
-            console.log("Access token exchanged.");
-            fetchAccounts(); // Refresh the account list
-
+            if (!user) throw new Error('No user logged in.');
+            const config = await getAuthHeader();
+            await axios.post(
+                `${API_BASE_URL}/api/plaid/exchange_public_token`,
+                { publicToken, firebaseUuid: user.uid },
+                config,
+            );
+            console.log('[Settings] Token exchanged successfully.');
+            fetchAccounts();
         } catch (e) {
-            console.error('Error exchanging token:', e.message);
+            console.error('[Settings] Error exchanging token:', e.message);
             setError(e.message);
         }
     }, []);
 
-    const { open, ready } = usePlaidLink({
-        token: linkToken,
-        onSuccess: onPlaidSuccess,
-        onExit: (exit) => console.log('Plaid Link exited:', exit),
-    });
-
-    // --- 4. Create Link Token Function (Updated) ---
+    // --- Create Plaid link token ---
     const createLinkToken = async () => {
         setIsLoading(true);
         setError(null);
         try {
             const user = auth.currentUser;
-            if (!user) throw new Error("No user is logged in.");
-
-            const config = await getAuthHeader(); // Get auth header
-            const response = await axios.post(`${API_BASE_URL}/api/plaid/create_link_token`,
-                { firebaseUserId: user.uid }, // Body
-                config // Auth header
+            if (!user) throw new Error('No user is logged in.');
+            const config = await getAuthHeader();
+            const response = await axios.post(
+                `${API_BASE_URL}/api/plaid/create_link_token`,
+                { firebaseUserId: user.uid },
+                config,
             );
-
-            console.log("Link token created successfully.");
+            console.log('[Settings] Link token created.');
             setLinkToken(response.data.linkToken);
-
         } catch (e) {
-            console.error('Error creating link token:', e.message);
+            console.error('[Settings] Error creating link token:', e.message);
             setError(e.message);
+        } finally {
+            setIsLoading(false);
         }
-        setIsLoading(false);
     };
 
-    useEffect(() => {
-        if (linkToken && ready) {
-            open();
-            setLinkToken(null);
-        }
-    }, [linkToken, ready, open]);
+    const plaidButtonProps = {
+        linkToken,
+        setLinkToken,
+        createLinkToken,
+        onPlaidSuccess,
+        isLoading,
+        setError,
+    };
 
     return (
         <SafeAreaView style={styles.container}>
@@ -116,20 +186,17 @@ export default function SettingsScreen() {
                     <List.Item
                         title={item.institutionName || 'Unknown Institution'}
                         left={() => <List.Icon icon="bank" />}
-                    // We can add a "delete" button here later
                     />
                 )}
                 style={styles.list}
             />
 
-            <Button
-                mode="contained"
-                onPress={createLinkToken}
-                disabled={isLoading}
-                style={{ margin: 20 }}
-            >
-                {isLoading ? <ActivityIndicator color="white" /> : 'Add New Account'}
-            </Button>
+            {Platform.OS === 'web' ? (
+                <WebAddAccountButton {...plaidButtonProps} />
+            ) : (
+                <NativeAddAccountButton {...plaidButtonProps} />
+            )}
+
             {error && <Text style={styles.error}>{error}</Text>}
         </SafeAreaView>
     );
@@ -147,6 +214,9 @@ const styles = StyleSheet.create({
     },
     list: {
         width: '100%',
+    },
+    addButton: {
+        margin: 20,
     },
     error: {
         margin: 20,
