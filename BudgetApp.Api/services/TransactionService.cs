@@ -291,7 +291,7 @@ namespace BudgetApp.Api.Services
                     try
                     {
                         await _notificationService
-                            .SendNewTransactionNotification(tx, currentDynamicBalance);
+                            .SendNewTransactionNotification(tx, currentDynamicBalance, user.Email);
                     }
                     catch (Exception ex)
                     {

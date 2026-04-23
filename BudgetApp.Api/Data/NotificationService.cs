@@ -10,7 +10,7 @@ namespace BudgetApp.Api.Services;
 
 public interface INotificationService
 {
-    Task SendNewTransactionNotification(Transaction tx, decimal dynamicBalance);
+    Task SendNewTransactionNotification(Transaction tx, decimal dynamicBalance, string? userEmail);
     Task SendGenericNotificationForUser(int userId, string title, string body, object? data = null);
 }
 
@@ -32,71 +32,74 @@ public class ExpoNotificationService : INotificationService
         _httpClient = httpClientFactory.CreateClient(nameof(ExpoNotificationService));
     }
 
-    public async Task SendNewTransactionNotification(Transaction tx, decimal dynamicBalance)
+ public async Task SendNewTransactionNotification(Transaction tx, decimal dynamicBalance, string? userEmail)
+{
+    var userDevices = await _dbContext.UserDevices
+        .Where(d => d.UserId == tx.UserId && d.IsActive)
+        .ToListAsync();
+
+    if (!userDevices.Any())
+        return;
+
+    string title;
+    string body;
+    string type;
+
+    // Deposit (paycheck-style)
+    if (tx.SuggestedKind == TransactionSuggestedKind.Paycheck)
     {
-        var userDevices = await _dbContext.UserDevices
-            .Where(d => d.UserId == tx.UserId && d.IsActive)
-            .ToListAsync();
-
-        if (!userDevices.Any())
-            return;
-
-        string title;
-        string body;
-        string type;
-
-        // Deposit (paycheck-style)
-        if (tx.SuggestedKind == TransactionSuggestedKind.Paycheck)
-        {
-            type = "deposit";
-            title = "New paycheck detected";
-            body =
-                $"Your Period Spend Limit is currently ${dynamicBalance:0.00}. " +
-                "Tap to decide how to use this deposit.";
-        }
-        // Large expense path
-        else if (tx.IsLargeExpenseCandidate && !tx.LargeExpenseHandled)
-        {
-            type = "large-expense";
-            title = "Large purchase spotted";
-            body =
-                $"${tx.Amount:0.00} at {tx.MerchantName ?? tx.Name}. " +
-                $"Period Spend Limit is now ${dynamicBalance:0.00}. " +
-                "Tap to choose: pay from savings, convert to fixed cost, or treat as normal spend.";
-        }
-        // Generic spend – ask about recurring
-        else
-        {
-            type = "spend";
-            title = $"New charge: {tx.MerchantName ?? tx.Name}";
-            body =
-                $"-${tx.Amount:0.00}. Period Spend Limit is now ${dynamicBalance:0.00}. " +
-                "Tap to mark this as a recurring bill or review your spending.";
-        }
-
-        // Flag “normal spend” notifications as eligible for the recurring flow
-        bool canMarkRecurring =
-            type == "spend" &&
-            !tx.IsLargeExpenseCandidate &&
-            tx.SuggestedKind == TransactionSuggestedKind.Unknown;
-
-        var payloads = userDevices.Select(d => new
-        {
-            to = d.ExpoPushToken,
-            sound = "default",
-            title,
-            body,
-            data = new
-            {
-                type,
-                transactionId = tx.Id,
-                dynamicBalance,
-                canMarkRecurring
-            }
-        });
-
-        await PostToExpoAsync(payloads);
+        type = "deposit";
+        title = "New paycheck detected";
+        body =
+            $"Your Period Spend Limit is currently ${dynamicBalance:0.00}. " +
+            "Tap to decide how to use this deposit.";
     }
+    // Large expense path
+    else if (tx.IsLargeExpenseCandidate && !tx.LargeExpenseHandled)
+    {
+        type = "large-expense";
+        title = "Large purchase spotted";
+        body =
+            $"${tx.Amount:0.00} at {tx.MerchantName ?? tx.Name}. " +
+            $"Period Spend Limit is now ${dynamicBalance:0.00}. " +
+            "Tap to choose: pay from savings, convert to fixed cost, or treat as normal spend.";
+    }
+    // Generic spend – ask about recurring
+    else
+    {
+        type = "spend";
+        title = $"New charge: {tx.MerchantName ?? tx.Name}";
+        body =
+            $"-${tx.Amount:0.00}. Period Spend Limit is now ${dynamicBalance:0.00}. " +
+            "Tap to mark this as a recurring bill or review your spending.";
+    }
+
+    var emailPrefix = string.IsNullOrWhiteSpace(userEmail) ? "unknown@email" : userEmail;
+    title = $"{emailPrefix} | {title}";
+
+    // Flag “normal spend” notifications as eligible for the recurring flow
+    bool canMarkRecurring =
+        type == "spend" &&
+        !tx.IsLargeExpenseCandidate &&
+        tx.SuggestedKind == TransactionSuggestedKind.Unknown;
+
+    var payloads = userDevices.Select(d => new
+    {
+        to = d.ExpoPushToken,
+        sound = "default",
+        title,
+        body,
+        data = new
+        {
+            type,
+            transactionId = tx.Id,
+            dynamicBalance,
+            canMarkRecurring
+        }
+    });
+
+    await PostToExpoAsync(payloads);
+}
 
     public async Task SendGenericNotificationForUser(
         int userId,
