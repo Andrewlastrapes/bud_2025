@@ -1106,40 +1106,131 @@ app.MapPost("/api/budget/finalize", async (
 app.MapPost("/api/plaid/webhook", async (
     ITransactionService transactionService,
     ApiDbContext dbContext,
-    PlaidWebhookRequest requestBody) =>
-    
+    PlaidWebhookRequest requestBody,
+    ILoggerFactory loggerFactory) =>
 {
+    var logger      = loggerFactory.CreateLogger("PlaidWebhook");
+    var receivedAt  = DateTime.UtcNow;
 
-    SentrySdk.CaptureMessage(
-        $"Plaid webhook received: type={requestBody.WebhookType}, code={requestBody.WebhookCode}, itemId={requestBody.ItemId}"
-    );
-    // 🔍 Log EVERYTHING so we stop guessing
-    Console.WriteLine($"📡 Webhook received:");
-    Console.WriteLine($"   Type: {requestBody.WebhookType}");
-    Console.WriteLine($"   Code: {requestBody.WebhookCode}");
-    Console.WriteLine($"   ItemId: {requestBody.ItemId}");
+    // ── Log every inbound webhook immediately ─────────────────────────────────
+    // These console lines appear in CloudWatch even before any DB or Sentry call.
+    Console.WriteLine(
+        $"[WEBHOOK] receivedAt={receivedAt:O} " +
+        $"type={requestBody.WebhookType} code={requestBody.WebhookCode} itemId={requestBody.ItemId}");
 
-    SentrySdk.CaptureMessage("webhook endpoint hit");
-
+    logger.LogInformation(
+        "Webhook received: type={WebhookType} code={WebhookCode} itemId={ItemId} receivedAt={ReceivedAt}",
+        requestBody.WebhookType, requestBody.WebhookCode, requestBody.ItemId, receivedAt.ToString("O"));
 
     SentrySdk.AddBreadcrumb(
-        $"Webhook received: type={requestBody.WebhookType}, code={requestBody.WebhookCode}, itemId={requestBody.ItemId}",
-        level: BreadcrumbLevel.Info
-    );
+        $"Webhook received: type={requestBody.WebhookType} code={requestBody.WebhookCode} " +
+        $"itemId={requestBody.ItemId} receivedAt={receivedAt:O}",
+        level: BreadcrumbLevel.Info);
 
+    SentrySdk.ConfigureScope(scope =>
+    {
+        scope.SetTag("webhook.type",   requestBody.WebhookType  ?? "unknown");
+        scope.SetTag("webhook.code",   requestBody.WebhookCode  ?? "unknown");
+        scope.SetTag("webhook.itemId", requestBody.ItemId       ?? "unknown");
+        scope.SetExtra("webhook.receivedAt", receivedAt.ToString("O"));
+    });
 
-    // ✅ Only care about TRANSACTIONS webhooks — ignore everything else
+    // ── Best-effort user lookup so every log line includes email + userId ─────
+    // This makes it trivial to grep CloudWatch for a specific user's webhooks.
+    string userEmail = "(unknown)";
+    int    userId    = -1;
+    try
+    {
+        var plaidItem = await dbContext.PlaidItems
+            .FirstOrDefaultAsync(p => p.ItemId == requestBody.ItemId);
+
+        if (plaidItem != null)
+        {
+            var webhookUser = await dbContext.Users
+                .FirstOrDefaultAsync(u => u.Id == plaidItem.UserId);
+
+            if (webhookUser != null)
+            {
+                userEmail = webhookUser.Email ?? "(no email)";
+                userId    = webhookUser.Id;
+            }
+        }
+
+        logger.LogInformation(
+            "Webhook user context resolved: type={WebhookType} code={WebhookCode} " +
+            "itemId={ItemId} userId={UserId} userEmail={UserEmail}",
+            requestBody.WebhookType, requestBody.WebhookCode,
+            requestBody.ItemId, userId, userEmail);
+    }
+    catch (Exception lookupEx)
+    {
+        logger.LogWarning(lookupEx,
+            "Webhook user lookup failed (non-fatal): itemId={ItemId}",
+            requestBody.ItemId);
+    }
+
+    SentrySdk.ConfigureScope(scope =>
+    {
+        scope.SetTag("user.email",         userEmail);
+        scope.SetExtra("webhook.userId",   userId);
+        scope.SetExtra("webhook.userEmail", userEmail);
+    });
+
+    // ── SENTRY: one message per webhook so we can see bursts in Issues ────────
+    // If you see the same itemId firing multiple times within seconds, that is a burst.
+    SentrySdk.CaptureMessage(
+        $"Webhook received: type={requestBody.WebhookType} code={requestBody.WebhookCode} " +
+        $"itemId={requestBody.ItemId} userEmail={userEmail} receivedAt={receivedAt:O}",
+        scope =>
+        {
+            scope.Level = SentryLevel.Info;
+            scope.SetTag("event.type",   "webhook_received");
+            scope.SetTag("webhook.code", requestBody.WebhookCode ?? "unknown");
+            scope.SetTag("user.email",   userEmail);
+        });
+
+    // ── Filter: only TRANSACTIONS type webhooks trigger a sync ────────────────
     if (requestBody.WebhookType != "TRANSACTIONS")
     {
-        Console.WriteLine("⏭ Ignoring non-transaction webhook");
+        logger.LogInformation(
+            "Webhook IGNORED (not TRANSACTIONS type): type={WebhookType} code={WebhookCode} " +
+            "itemId={ItemId} userEmail={UserEmail}",
+            requestBody.WebhookType, requestBody.WebhookCode,
+            requestBody.ItemId, userEmail);
+
+        SentrySdk.AddBreadcrumb(
+            $"Webhook ignored: type={requestBody.WebhookType} is not TRANSACTIONS",
+            level: BreadcrumbLevel.Info);
+
         return Results.Ok(new { message = "Ignored non-transaction webhook." });
+    }
+
+    // ── Warn on unexpected webhook codes so we notice new Plaid codes fast ────
+    var knownTransactionCodes = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+    {
+        "INITIAL_UPDATE", "HISTORICAL_UPDATE", "DEFAULT_UPDATE", "SYNC_UPDATES_AVAILABLE"
+    };
+
+    if (!knownTransactionCodes.Contains(requestBody.WebhookCode ?? ""))
+    {
+        logger.LogWarning(
+            "Webhook has unexpected code — will still attempt sync: " +
+            "type={WebhookType} code={WebhookCode} itemId={ItemId} userEmail={UserEmail}",
+            requestBody.WebhookType, requestBody.WebhookCode,
+            requestBody.ItemId, userEmail);
     }
 
     try
     {
-        Console.WriteLine("➡️ Running transaction sync...");
-        SentrySdk.AddBreadcrumb("Starting transaction sync");
-        SentrySdk.CaptureMessage("STarting transaction sync");
+        logger.LogInformation(
+            "Webhook triggering transaction sync: code={WebhookCode} itemId={ItemId} " +
+            "userEmail={UserEmail} userId={UserId}",
+            requestBody.WebhookCode, requestBody.ItemId, userEmail, userId);
+
+        SentrySdk.AddBreadcrumb(
+            $"Triggering sync: code={requestBody.WebhookCode} itemId={requestBody.ItemId} " +
+            $"userEmail={userEmail}",
+            level: BreadcrumbLevel.Info);
 
         // Pass the webhook code so TransactionService can determine whether this is a
         // backfill sync (INITIAL_UPDATE / HISTORICAL_UPDATE) and set NotificationsEnabledAt
@@ -1147,33 +1238,56 @@ app.MapPost("/api/plaid/webhook", async (
         var syncResponse = await transactionService.SyncAndProcessTransactions(
             requestBody.ItemId, requestBody.WebhookCode);
 
-        var addedCount = syncResponse.Added?.Count ?? 0;
+        var addedCount    = syncResponse.Added?.Count    ?? 0;
+        var modifiedCount = syncResponse.Modified?.Count ?? 0;
+        var removedCount  = syncResponse.Removed?.Count  ?? 0;
+        var syncDuration  = DateTime.UtcNow - receivedAt;
 
-        Console.WriteLine($"✅ Sync complete. Added: {addedCount}");
+        logger.LogInformation(
+            "Webhook sync complete: code={WebhookCode} itemId={ItemId} userEmail={UserEmail} " +
+            "added={Added} modified={Modified} removed={Removed} " +
+            "hasMore={HasMore} durationMs={DurationMs}",
+            requestBody.WebhookCode, requestBody.ItemId, userEmail,
+            addedCount, modifiedCount, removedCount,
+            syncResponse.HasMore, (int)syncDuration.TotalMilliseconds);
+
+        Console.WriteLine(
+            $"[WEBHOOK] sync complete: code={requestBody.WebhookCode} itemId={requestBody.ItemId} " +
+            $"userEmail={userEmail} added={addedCount} modified={modifiedCount} " +
+            $"removed={removedCount} hasMore={syncResponse.HasMore} " +
+            $"durationMs={(int)syncDuration.TotalMilliseconds}");
 
         SentrySdk.AddBreadcrumb(
-            $"Webhook sync complete: added={addedCount}",
-            level: BreadcrumbLevel.Info
-        );
+            $"Webhook sync complete: code={requestBody.WebhookCode} itemId={requestBody.ItemId} " +
+            $"added={addedCount} modified={modifiedCount} removed={removedCount} " +
+            $"hasMore={syncResponse.HasMore} durationMs={(int)syncDuration.TotalMilliseconds}",
+            level: BreadcrumbLevel.Info);
 
         return Results.Ok(new
         {
-            message = "Webhook processed successfully",
-            added = addedCount
+            message  = "Webhook processed successfully",
+            added    = addedCount
         });
-        }
+    }
     catch (Exception e)
-        {
-        Console.WriteLine("💥 WEBHOOK PROCESSING FAILED");
-        Console.WriteLine(e.ToString());
-        SentrySdk.CaptureMessage("Webhook processing failed");
+    {
+        logger.LogError(e,
+            "Webhook processing FAILED: code={WebhookCode} itemId={ItemId} " +
+            "userEmail={UserEmail} userId={UserId}",
+            requestBody.WebhookCode, requestBody.ItemId, userEmail, userId);
 
+        Console.WriteLine(
+            $"[WEBHOOK] FAILED: code={requestBody.WebhookCode} itemId={requestBody.ItemId} " +
+            $"userEmail={userEmail} error={e.Message}");
 
         SentrySdk.CaptureException(e, scope =>
         {
-            scope.SetTag("webhook.itemId", requestBody.ItemId ?? "unknown");
-            scope.SetTag("webhook.type", requestBody.WebhookType ?? "unknown");
-            scope.SetTag("webhook.code", requestBody.WebhookCode ?? "unknown");
+            scope.SetTag("webhook.itemId", requestBody.ItemId  ?? "unknown");
+            scope.SetTag("webhook.type",   requestBody.WebhookType  ?? "unknown");
+            scope.SetTag("webhook.code",   requestBody.WebhookCode  ?? "unknown");
+            scope.SetTag("user.email",     userEmail);
+            scope.SetExtra("webhook.receivedAt", receivedAt.ToString("O"));
+            scope.SetExtra("webhook.userId",     userId);
         });
 
         // Still return 200 so Plaid doesn't retry forever

@@ -1,10 +1,11 @@
-// File: Services/NotificationService.cs
+// File: Data/NotificationService.cs
 
 using System.Net.Http;
 using System.Net.Http.Json;
 using BudgetApp.Api.Data;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Logging;
+using Sentry;
 
 namespace BudgetApp.Api.Services;
 
@@ -32,74 +33,151 @@ public class ExpoNotificationService : INotificationService
         _httpClient = httpClientFactory.CreateClient(nameof(ExpoNotificationService));
     }
 
- public async Task SendNewTransactionNotification(Transaction tx, decimal dynamicBalance, string? userEmail)
-{
-    var userDevices = await _dbContext.UserDevices
-        .Where(d => d.UserId == tx.UserId && d.IsActive)
-        .ToListAsync();
-
-    if (!userDevices.Any())
-        return;
-
-    string title;
-    string body;
-    string type;
-
-    // Deposit (paycheck-style)
-    if (tx.SuggestedKind == TransactionSuggestedKind.Paycheck)
+    public async Task SendNewTransactionNotification(
+        Transaction tx,
+        decimal dynamicBalance,
+        string? userEmail)
     {
-        type = "deposit";
-        title = "New paycheck detected";
-        body =
-            $"Your Period Spend Limit is currently ${dynamicBalance:0.00}. " +
-            "Tap to decide how to use this deposit.";
-    }
-    // Large expense path
-    else if (tx.IsLargeExpenseCandidate && !tx.LargeExpenseHandled)
-    {
-        type = "large-expense";
-        title = "Large purchase spotted";
-        body =
-            $"${tx.Amount:0.00} at {tx.MerchantName ?? tx.Name}. " +
-            $"Period Spend Limit is now ${dynamicBalance:0.00}. " +
-            "Tap to choose: pay from savings, convert to fixed cost, or treat as normal spend.";
-    }
-    // Generic spend – ask about recurring
-    else
-    {
-        type = "spend";
-        title = $"New charge: {tx.MerchantName ?? tx.Name}";
-        body =
-            $"-${tx.Amount:0.00}. Period Spend Limit is now ${dynamicBalance:0.00}. " +
-            "Tap to mark this as a recurring bill or review your spending.";
-    }
+        _logger.LogInformation(
+            "SendNewTransactionNotification called: " +
+            "txId={TxId} plaidTxId={PlaidTxId} userId={UserId} userEmail={UserEmail} " +
+            "amount={Amount} merchant={Merchant} pending={Pending} " +
+            "suggestedKind={SuggestedKind} isLargeExpense={IsLargeExpense} " +
+            "largeExpenseHandled={LargeExpenseHandled} dynamicBalance={DynamicBalance}",
+            tx.Id, tx.PlaidTransactionId, tx.UserId, userEmail ?? "(null)",
+            tx.Amount, tx.MerchantName ?? tx.Name, tx.Pending,
+            tx.SuggestedKind, tx.IsLargeExpenseCandidate, tx.LargeExpenseHandled,
+            dynamicBalance);
 
-    var emailPrefix = string.IsNullOrWhiteSpace(userEmail) ? "unknown@email" : userEmail;
-    title = $"{emailPrefix} | {title}";
+        SentrySdk.AddBreadcrumb(
+            $"Notification attempt: txId={tx.Id} plaidTxId={tx.PlaidTransactionId} " +
+            $"userEmail={userEmail ?? "(null)"} " +
+            $"merchant={tx.MerchantName ?? tx.Name} amount={tx.Amount}",
+            level: BreadcrumbLevel.Info);
 
-    // Flag “normal spend” notifications as eligible for the recurring flow
-    bool canMarkRecurring =
-        type == "spend" &&
-        !tx.IsLargeExpenseCandidate &&
-        tx.SuggestedKind == TransactionSuggestedKind.Unknown;
+        // ── Look up devices ───────────────────────────────────────────────────
+        var userDevices = await _dbContext.UserDevices
+            .Where(d => d.UserId == tx.UserId && d.IsActive)
+            .ToListAsync();
 
-    var payloads = userDevices.Select(d => new
-    {
-        to = d.ExpoPushToken,
-        sound = "default",
-        title,
-        body,
-        data = new
+        _logger.LogInformation(
+            "Device lookup result: txId={TxId} userId={UserId} userEmail={UserEmail} " +
+            "activeDeviceCount={DeviceCount}",
+            tx.Id, tx.UserId, userEmail ?? "(null)", userDevices.Count);
+
+        if (!userDevices.Any())
         {
-            type,
-            transactionId = tx.Id,
-            dynamicBalance,
-            canMarkRecurring
-        }
-    });
+            _logger.LogWarning(
+                "Notification skipped — no active devices: " +
+                "txId={TxId} plaidTxId={PlaidTxId} userId={UserId} userEmail={UserEmail}",
+                tx.Id, tx.PlaidTransactionId, tx.UserId, userEmail ?? "(null)");
 
-    await PostToExpoAsync(payloads);
-}
+            SentrySdk.AddBreadcrumb(
+                $"Notification skipped (no active devices): " +
+                $"txId={tx.Id} userId={tx.UserId} userEmail={userEmail ?? "(null)"}",
+                level: BreadcrumbLevel.Warning);
+            return;
+        }
+
+        // ── Build title / body based on transaction type ──────────────────────
+        string title;
+        string body;
+        string type;
+
+        if (tx.SuggestedKind == TransactionSuggestedKind.Paycheck)
+        {
+            type  = "deposit";
+            title = "New paycheck detected";
+            body  =
+                $"Your Period Spend Limit is currently ${dynamicBalance:0.00}. " +
+                "Tap to decide how to use this deposit.";
+        }
+        else if (tx.IsLargeExpenseCandidate && !tx.LargeExpenseHandled)
+        {
+            type  = "large-expense";
+            title = "Large purchase spotted";
+            body  =
+                $"${tx.Amount:0.00} at {tx.MerchantName ?? tx.Name}. " +
+                $"Period Spend Limit is now ${dynamicBalance:0.00}. " +
+                "Tap to choose: pay from savings, convert to fixed cost, or treat as normal spend.";
+        }
+        else
+        {
+            type  = "spend";
+            title = $"New charge: {tx.MerchantName ?? tx.Name}";
+            body  =
+                $"-${tx.Amount:0.00}. Period Spend Limit is now ${dynamicBalance:0.00}. " +
+                "Tap to mark this as a recurring bill or review your spending.";
+        }
+
+        // Prepend user email so notifications are identifiable during diagnosis
+        var emailPrefix = string.IsNullOrWhiteSpace(userEmail) ? "unknown@email" : userEmail;
+        title = $"{emailPrefix} | {title}";
+
+        bool canMarkRecurring =
+            type == "spend" &&
+            !tx.IsLargeExpenseCandidate &&
+            tx.SuggestedKind == TransactionSuggestedKind.Unknown;
+
+        _logger.LogInformation(
+            "Notification payload built: " +
+            "txId={TxId} type={Type} title={Title} bodyPreview={BodyPreview} " +
+            "canMarkRecurring={CanMarkRecurring} deviceCount={DeviceCount} userEmail={UserEmail}",
+            tx.Id, type, title,
+            body.Length > 80 ? body[..80] + "…" : body,
+            canMarkRecurring, userDevices.Count, userEmail ?? "(null)");
+
+        SentrySdk.AddBreadcrumb(
+            $"Notification sending: txId={tx.Id} type={type} " +
+            $"deviceCount={userDevices.Count} userEmail={userEmail ?? "(null)"} title={title}",
+            level: BreadcrumbLevel.Info);
+
+        // ── SENTRY: capture every notification send as a message ──────────────
+        // This is intentionally aggressive so we can count notification events in Sentry
+        // and correlate with webhook bursts.
+        SentrySdk.CaptureMessage(
+            $"Notification sent: userEmail={userEmail ?? "(null)"} " +
+            $"txId={tx.Id} plaidTxId={tx.PlaidTransactionId} " +
+            $"type={type} title={title} " +
+            $"merchant={tx.MerchantName ?? tx.Name} amount={tx.Amount:0.00} " +
+            $"deviceCount={userDevices.Count}",
+            scope =>
+            {
+                scope.Level = SentryLevel.Info;
+                scope.SetTag("notification.type", type);
+                scope.SetTag("user.email", userEmail ?? "unknown");
+                scope.SetExtra("txId", tx.Id);
+                scope.SetExtra("plaidTxId", tx.PlaidTransactionId);
+                scope.SetExtra("merchant", tx.MerchantName ?? tx.Name ?? "(null)");
+                scope.SetExtra("amount", tx.Amount);
+                scope.SetExtra("title", title);
+                scope.SetExtra("body", body);
+                scope.SetExtra("deviceCount", userDevices.Count);
+                scope.SetExtra("dynamicBalance", dynamicBalance);
+                scope.SetExtra("canMarkRecurring", canMarkRecurring);
+            });
+
+        var payloads = userDevices.Select(d => new
+        {
+            to    = d.ExpoPushToken,
+            sound = "default",
+            title,
+            body,
+            data  = new
+            {
+                type,
+                transactionId  = tx.Id,
+                dynamicBalance,
+                canMarkRecurring
+            }
+        });
+
+        await PostToExpoAsync(
+            payloads,
+            txId:      tx.Id,
+            plaidTxId: tx.PlaidTransactionId,
+            userEmail: userEmail);
+    }
 
     public async Task SendGenericNotificationForUser(
         int userId,
@@ -111,35 +189,101 @@ public class ExpoNotificationService : INotificationService
             .Where(d => d.UserId == userId && d.IsActive)
             .ToListAsync();
 
+        _logger.LogInformation(
+            "SendGenericNotification: userId={UserId} title={Title} deviceCount={DeviceCount}",
+            userId, title, userDevices.Count);
+
         if (!userDevices.Any())
+        {
+            _logger.LogWarning(
+                "Generic notification skipped — no active devices: userId={UserId}",
+                userId);
             return;
+        }
 
         var payloads = userDevices.Select(d => new
         {
-            to = d.ExpoPushToken,
+            to    = d.ExpoPushToken,
             sound = "default",
             title,
             body,
             data
         });
 
-        await PostToExpoAsync(payloads);
+        await PostToExpoAsync(payloads, txId: 0, plaidTxId: null, userEmail: null);
     }
 
-    private async Task PostToExpoAsync(IEnumerable<object> payloads)
+    /// <param name="txId">App transaction ID (0 for generic notifications).</param>
+    /// <param name="plaidTxId">Plaid transaction ID, for correlation in logs.</param>
+    /// <param name="userEmail">User email, for correlation in logs.</param>
+    private async Task PostToExpoAsync(
+        IEnumerable<object> payloads,
+        int txId,
+        string? plaidTxId,
+        string? userEmail)
     {
+        _logger.LogInformation(
+            "Posting to Expo Push API: txId={TxId} plaidTxId={PlaidTxId} userEmail={UserEmail}",
+            txId, plaidTxId ?? "(null)", userEmail ?? "(null)");
+
         try
         {
             using var response = await _httpClient.PostAsJsonAsync(ExpoPushUrl, payloads);
+
             if (!response.IsSuccessStatusCode)
             {
                 var text = await response.Content.ReadAsStringAsync();
-                _logger.LogWarning("Expo push error: {Status} {Body}", response.StatusCode, text);
+
+                _logger.LogWarning(
+                    "Expo push FAILED: txId={TxId} plaidTxId={PlaidTxId} userEmail={UserEmail} " +
+                    "httpStatus={Status} expoResponseBody={Body}",
+                    txId, plaidTxId ?? "(null)", userEmail ?? "(null)",
+                    response.StatusCode, text);
+
+                SentrySdk.CaptureMessage(
+                    $"Expo push failed: txId={txId} userEmail={userEmail ?? "(null)"} " +
+                    $"httpStatus={response.StatusCode} body={text}",
+                    scope =>
+                    {
+                        scope.Level = SentryLevel.Warning;
+                        scope.SetTag("expo.result", "failed");
+                        scope.SetExtra("txId", txId);
+                        scope.SetExtra("plaidTxId", plaidTxId ?? "(null)");
+                        scope.SetExtra("userEmail", userEmail ?? "(null)");
+                        scope.SetExtra("expoHttpStatus", response.StatusCode.ToString());
+                        scope.SetExtra("expoResponseBody", text);
+                    });
+            }
+            else
+            {
+                // Read body even on success — Expo may report per-token errors inside a 200
+                var responseBody = await response.Content.ReadAsStringAsync();
+
+                _logger.LogInformation(
+                    "Expo push succeeded: txId={TxId} plaidTxId={PlaidTxId} userEmail={UserEmail} " +
+                    "httpStatus={Status} expoResponseBody={Body}",
+                    txId, plaidTxId ?? "(null)", userEmail ?? "(null)",
+                    response.StatusCode, responseBody);
+
+                SentrySdk.AddBreadcrumb(
+                    $"Expo push succeeded: txId={txId} userEmail={userEmail ?? "(null)"} " +
+                    $"response={responseBody}",
+                    level: BreadcrumbLevel.Info);
             }
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Failed to send Expo push notification");
+            _logger.LogError(ex,
+                "Expo push EXCEPTION: txId={TxId} plaidTxId={PlaidTxId} userEmail={UserEmail}",
+                txId, plaidTxId ?? "(null)", userEmail ?? "(null)");
+
+            SentrySdk.CaptureException(ex, scope =>
+            {
+                scope.SetTag("expo.result", "exception");
+                scope.SetExtra("txId", txId);
+                scope.SetExtra("plaidTxId", plaidTxId ?? "(null)");
+                scope.SetExtra("userEmail", userEmail ?? "(null)");
+            });
         }
     }
 }
