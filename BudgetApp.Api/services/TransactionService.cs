@@ -175,20 +175,37 @@ namespace BudgetApp.Api.Services
                 // dispatched AFTER SaveChanges so they have valid IDs.
                 var notifyQueue = new List<Transaction>();
 
-                // Cutoff: a transaction must have been created at or after this time
-                // AND within the last 24 hours to be eligible for a push notification.
-                DateTime notifyCutoff    = plaidItem.NotificationsEnabledAt ?? DateTime.MaxValue;
-                DateTime freshnessWindow = DateTime.UtcNow.AddHours(-24);
+                // Cutoff: the transaction's real date (Plaid Date field, in the transaction's
+                // local timezone — effectively Eastern for US accounts) must be on or after
+                // NotificationsEnabledAt AND fall within today or yesterday in America/New_York.
+                // NOTE: We intentionally do NOT use Transaction.CreatedAt for this check —
+                // CreatedAt is when our backend discovered the transaction, not when it occurred.
+                DateTime notifyCutoff = plaidItem.NotificationsEnabledAt ?? DateTime.MaxValue;
+
+                // America/New_York — all "today / yesterday" recency comparisons use this zone.
+                // TimeZoneInfo resolves IANA IDs natively on .NET 8 / Linux (Docker runtime image).
+                var easternZone      = TimeZoneInfo.FindSystemTimeZoneById("America/New_York");
+                var nowEastern       = TimeZoneInfo.ConvertTimeFromUtc(DateTime.UtcNow, easternZone);
+                var todayEastern     = DateOnly.FromDateTime(nowEastern);
+                var yesterdayEastern = todayEastern.AddDays(-1);
+
+                // Registration cutoff: skip any transaction whose real date precedes the moment
+                // the user created their account — prevents flooding new users with history.
+                DateTime userRegisteredAt = user.CreatedAt; // UTC
 
                 _logger.LogInformation(
                     "Notification gate state: itemId={ItemId} " +
-                    "notifyCutoff={NotifyCutoff} freshnessWindow={FreshnessWindow} isBackfill={IsBackfill}",
+                    "notifyCutoff={NotifyCutoff} isBackfill={IsBackfill} " +
+                    "todayEastern={TodayEastern} yesterdayEastern={YesterdayEastern} " +
+                    "userRegisteredAt={UserRegisteredAt}",
                     itemId,
                     notifyCutoff == DateTime.MaxValue
                         ? "(MaxValue — notifications not yet enabled)"
                         : notifyCutoff.ToString("O"),
-                    freshnessWindow.ToString("O"),
-                    isBackfill);
+                    isBackfill,
+                    todayEastern.ToString("yyyy-MM-dd"),
+                    yesterdayEastern.ToString("yyyy-MM-dd"),
+                    userRegisteredAt.ToString("O"));
 
                 // ── 3. Removed ─────────────────────────────────────────────────────────
                 // Plaid removes a pending row when it posts (replaced by an added posted
@@ -394,51 +411,85 @@ namespace BudgetApp.Api.Services
                         // A transaction qualifies for a push notification only when ALL of:
                         //   a) This is NOT a backfill sync
                         //   b) The item's NotificationsEnabledAt cutoff has been set
-                        //   c) The transaction was created at or after that cutoff
-                        //   d) The transaction is within the 24-hour freshness window
-                        //   e) It is a posted (non-pending) transaction
+                        //   c) The transaction's real date (Plaid Date field) is at or after
+                        //      that cutoff  — NOT Transaction.CreatedAt
+                        //   d) The transaction's real date is at or after the user's registration
+                        //      (prevents new users from receiving pre-registration history)
+                        //   e) The transaction's real date (in America/New_York) is today or
+                        //      yesterday  — NOT a rolling 24-hour window from CreatedAt
+                        //   f) It is a posted (non-pending) transaction
+
+                        // Plaid's Date field is a DateOnly in the transaction's local timezone.
+                        // For US accounts this is effectively Eastern / merchant-local time.
+                        // We treat it as an Eastern date for the recency window.
+                        DateOnly? plaidTxDate = t.Date;
+
+                        // Convert the Plaid date to an approximate UTC instant (Eastern midnight)
+                        // for comparisons against UTC-based cutoffs (NotificationsEnabledAt,
+                        // user.CreatedAt). Falls back to CreatedAt only when Plaid sends no date.
+                        DateTime txDateAsEasternMidnightUtc = plaidTxDate.HasValue
+                            ? TimeZoneInfo.ConvertTimeToUtc(
+                                  plaidTxDate.Value.ToDateTime(TimeOnly.MinValue),
+                                  easternZone)
+                            : createdAt; // last resort: backend discovery time
+
                         bool gate_notBackfill          = !isBackfill;
                         bool gate_notificationsEnabled = plaidItem.NotificationsEnabledAt.HasValue;
-                        bool gate_createdAfterCutoff   = createdAt >= notifyCutoff;
-                        bool gate_within24Hours        = createdAt >= freshnessWindow;
+
+                        // Gate c: real tx date ≥ NotificationsEnabledAt
+                        bool gate_realDateAfterCutoff  = txDateAsEasternMidnightUtc >= notifyCutoff;
+
+                        // Gate d: real tx date ≥ user.CreatedAt  (skip pre-registration history)
+                        bool gate_afterRegistration    = txDateAsEasternMidnightUtc >= userRegisteredAt;
+
+                        // Gate e: real tx date is today or yesterday in America/New_York
+                        bool gate_todayOrYesterday     = plaidTxDate.HasValue &&
+                            (plaidTxDate.Value == todayEastern || plaidTxDate.Value == yesterdayEastern);
+
                         bool gate_notPending           = !newTx.Pending;
 
                         bool notifyEligible =
                             gate_notBackfill &&
                             gate_notificationsEnabled &&
-                            gate_createdAfterCutoff &&
-                            gate_within24Hours &&
+                            gate_realDateAfterCutoff &&
+                            gate_afterRegistration &&
+                            gate_todayOrYesterday &&
                             gate_notPending;
 
                         // ── CRITICAL LOG: full eligibility breakdown for every transaction ──
                         _logger.LogInformation(
                             "Transaction notification evaluation: " +
                             "plaidTxId={PlaidTxId} merchant={Merchant} amount={Amount} " +
-                            "createdAt={CreatedAt} txDate={TxDate} pending={Pending} " +
+                            "createdAt={CreatedAt} plaidTxDate={PlaidTxDate} pending={Pending} " +
                             "isBackfill={IsBackfill} " +
                             "notificationsEnabledAt={NotificationsEnabledAt} " +
                             "notifyCutoff={NotifyCutoff} " +
-                            "freshnessWindow={FreshnessWindow} " +
+                            "userRegisteredAt={UserRegisteredAt} " +
+                            "todayEastern={TodayEastern} yesterdayEastern={YesterdayEastern} " +
                             "gate_notBackfill={GateNotBackfill} " +
                             "gate_notificationsEnabled={GateNotificationsEnabled} " +
-                            "gate_createdAfterCutoff={GateCreatedAfterCutoff} " +
-                            "gate_within24Hours={GateWithin24Hours} " +
+                            "gate_realDateAfterCutoff={GateRealDateAfterCutoff} " +
+                            "gate_afterRegistration={GateAfterRegistration} " +
+                            "gate_todayOrYesterday={GateTodayOrYesterday} " +
                             "gate_notPending={GateNotPending} " +
                             "shouldNotify={ShouldNotify}",
                             t.TransactionId, merchantName, absAmount,
                             createdAt.ToString("O"),
-                            txDateUtc.ToString("yyyy-MM-dd"),
+                            plaidTxDate?.ToString("yyyy-MM-dd") ?? "(null)",
                             isPending,
                             isBackfill,
                             plaidItem.NotificationsEnabledAt?.ToString("O") ?? "(null)",
                             notifyCutoff == DateTime.MaxValue
                                 ? "(MaxValue/not-set)"
                                 : notifyCutoff.ToString("O"),
-                            freshnessWindow.ToString("O"),
+                            userRegisteredAt.ToString("O"),
+                            todayEastern.ToString("yyyy-MM-dd"),
+                            yesterdayEastern.ToString("yyyy-MM-dd"),
                             gate_notBackfill,
                             gate_notificationsEnabled,
-                            gate_createdAfterCutoff,
-                            gate_within24Hours,
+                            gate_realDateAfterCutoff,
+                            gate_afterRegistration,
+                            gate_todayOrYesterday,
                             gate_notPending,
                             notifyEligible);
 
@@ -446,7 +497,9 @@ namespace BudgetApp.Api.Services
                             $"Tx eval: plaidTxId={t.TransactionId} merchant={merchantName} " +
                             $"shouldNotify={notifyEligible} " +
                             $"isBackfill={isBackfill} notificationsEnabled={gate_notificationsEnabled} " +
-                            $"createdAfterCutoff={gate_createdAfterCutoff} within24h={gate_within24Hours} " +
+                            $"realDateAfterCutoff={gate_realDateAfterCutoff} " +
+                            $"afterRegistration={gate_afterRegistration} " +
+                            $"todayOrYesterday={gate_todayOrYesterday} " +
                             $"notPending={gate_notPending}",
                             level: notifyEligible ? BreadcrumbLevel.Info : BreadcrumbLevel.Debug);
 
@@ -462,12 +515,13 @@ namespace BudgetApp.Api.Services
                         else
                         {
                             // Identify the first failing gate to give a clear skip reason
-                            string skipReason = !gate_notBackfill          ? "isBackfill"              :
-                                                !gate_notificationsEnabled  ? "notificationsNotEnabled" :
-                                                !gate_createdAfterCutoff    ? "createdBeforeCutoff"     :
-                                                !gate_within24Hours         ? "olderThan24h"            :
-                                                !gate_notPending            ? "isPending"               :
-                                                                              "unknown";
+                            string skipReason = !gate_notBackfill          ? "skipped: backfill"                     :
+                                                !gate_notificationsEnabled  ? "skipped: notifications not enabled"    :
+                                                !gate_realDateAfterCutoff   ? "skipped: backfill (before cutoff)"     :
+                                                !gate_afterRegistration     ? "skipped: before user registration"     :
+                                                !gate_todayOrYesterday      ? "skipped: older than yesterday Eastern" :
+                                                !gate_notPending            ? "skipped: pending"                      :
+                                                                              "skipped: unknown";
 
                             _logger.LogInformation(
                                 "Notification skipped: plaidTxId={PlaidTxId} merchant={Merchant} " +
