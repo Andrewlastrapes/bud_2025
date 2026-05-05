@@ -144,9 +144,9 @@ namespace BudgetApp.Api.Services
 
                 var response = await _plaidClient.TransactionsSyncAsync(request);
 
-                int addedCount    = response.Added?.Count    ?? 0;
+                int addedCount = response.Added?.Count ?? 0;
                 int modifiedCount = response.Modified?.Count ?? 0;
-                int removedCount  = response.Removed?.Count  ?? 0;
+                int removedCount = response.Removed?.Count ?? 0;
 
                 _logger.LogInformation(
                     "Plaid sync response: itemId={ItemId} webhookCode={WebhookCode} " +
@@ -163,10 +163,10 @@ namespace BudgetApp.Api.Services
 
                 SentrySdk.ConfigureScope(scope =>
                 {
-                    scope.SetExtra("sync.addedCount",    addedCount);
+                    scope.SetExtra("sync.addedCount", addedCount);
                     scope.SetExtra("sync.modifiedCount", modifiedCount);
-                    scope.SetExtra("sync.removedCount",  removedCount);
-                    scope.SetExtra("sync.hasMore",       response.HasMore);
+                    scope.SetExtra("sync.removedCount", removedCount);
+                    scope.SetExtra("sync.hasMore", response.HasMore);
                 });
 
                 decimal balanceDelta = 0m;
@@ -184,9 +184,9 @@ namespace BudgetApp.Api.Services
 
                 // America/New_York — all "today / yesterday" recency comparisons use this zone.
                 // TimeZoneInfo resolves IANA IDs natively on .NET 8 / Linux (Docker runtime image).
-                var easternZone      = TimeZoneInfo.FindSystemTimeZoneById("America/New_York");
-                var nowEastern       = TimeZoneInfo.ConvertTimeFromUtc(DateTime.UtcNow, easternZone);
-                var todayEastern     = DateOnly.FromDateTime(nowEastern);
+                var easternZone = TimeZoneInfo.FindSystemTimeZoneById("America/New_York");
+                var nowEastern = TimeZoneInfo.ConvertTimeFromUtc(DateTime.UtcNow, easternZone);
+                var todayEastern = DateOnly.FromDateTime(nowEastern);
                 var yesterdayEastern = todayEastern.AddDays(-1);
 
                 // Registration cutoff: skip any transaction whose real date precedes the moment
@@ -257,8 +257,8 @@ namespace BudgetApp.Api.Services
                             continue;
                         }
 
-                        var rawAmount  = modified.Amount ?? 0m;
-                        bool isCredit  = rawAmount < 0m;
+                        var rawAmount = modified.Amount ?? 0m;
+                        bool isCredit = rawAmount < 0m;
                         decimal newAbs = Math.Abs(rawAmount);
 
                         _logger.LogInformation(
@@ -274,8 +274,8 @@ namespace BudgetApp.Api.Services
                             existing.BudgetAppliedAmount = newAbs;
                         }
 
-                        existing.Amount    = newAbs;
-                        existing.Pending   = modified.Pending ?? existing.Pending;
+                        existing.Amount = newAbs;
+                        existing.Pending = modified.Pending ?? existing.Pending;
                         existing.UpdatedAt = DateTime.UtcNow;
                     }
                 }
@@ -306,13 +306,30 @@ namespace BudgetApp.Api.Services
                             .GetValueOrDefault(DateOnly.FromDateTime(DateTime.UtcNow))
                             .ToDateTime(TimeOnly.MinValue);
 
-                        DateTime txDateUtc    = DateTime.SpecifyKind(txDate, DateTimeKind.Utc);
-                        string   merchantName = t.MerchantName ?? t.Name ?? "(unknown)";
+                        DateTime txDateUtc = DateTime.SpecifyKind(txDate, DateTimeKind.Utc);
 
-                        var     rawAmount  = t.Amount ?? 0m;
-                        bool    isCredit   = rawAmount < 0m;
-                        decimal absAmount  = Math.Abs(rawAmount);
-                        bool    isPending  = t.Pending ?? false;
+                        var userCreatedDateUtc = DateOnly.FromDateTime(user.CreatedAt.ToUniversalTime());
+                        var txDateOnlyUtc = DateOnly.FromDateTime(txDateUtc);
+
+                        if (txDateOnlyUtc < userCreatedDateUtc)
+                        {
+                            _logger.LogInformation(
+                                "Skipping pre-registration transaction: plaidTxId={PlaidTxId} txDate={TxDate} userCreatedAt={UserCreatedAt} userId={UserId} userEmail={UserEmail}",
+                                t.TransactionId,
+                                txDateOnlyUtc.ToString("yyyy-MM-dd"),
+                                user.CreatedAt.ToString("O"),
+                                user.Id,
+                                user.Email);
+
+                            continue;
+                        }
+
+                        string merchantName = t.MerchantName ?? t.Name ?? "(unknown)";
+
+                        var rawAmount = t.Amount ?? 0m;
+                        bool isCredit = rawAmount < 0m;
+                        decimal absAmount = Math.Abs(rawAmount);
+                        bool isPending = t.Pending ?? false;
                         DateTime createdAt = DateTime.UtcNow;
 
                         _logger.LogInformation(
@@ -326,31 +343,31 @@ namespace BudgetApp.Api.Services
 
                         var newTx = new Transaction
                         {
-                            UserId             = user.Id,
+                            UserId = user.Id,
                             PlaidTransactionId = t.TransactionId,
-                            AccountId          = t.AccountId,
-                            Amount             = absAmount,
-                            Date               = txDateUtc,
+                            AccountId = t.AccountId,
+                            Amount = absAmount,
+                            Date = txDateUtc,
 #pragma warning disable CS0612
-                            Name               = t.Name,
+                            Name = t.Name,
 #pragma warning restore CS0612
-                            MerchantName       = t.MerchantName,
-                            Pending            = isPending,
-                            CreatedAt          = createdAt,
-                            UpdatedAt          = createdAt,
+                            MerchantName = t.MerchantName,
+                            Pending = isPending,
+                            CreatedAt = createdAt,
+                            UpdatedAt = createdAt,
                             IsLargeExpenseCandidate = false,
-                            LargeExpenseHandled     = false
+                            LargeExpenseHandled = false
                         };
 
                         if (isCredit)
                         {
                             var ctx = new DepositContext
                             {
-                                Amount                 = absAmount,
-                                Date                   = txDateUtc,
-                                MerchantName           = merchantName,
-                                PayDay1                = user.PayDay1,
-                                PayDay2                = user.PayDay2,
+                                Amount = absAmount,
+                                Date = txDateUtc,
+                                MerchantName = merchantName,
+                                PayDay1 = user.PayDay1,
+                                PayDay2 = user.PayDay2,
                                 ExpectedPaycheckAmount = user.ExpectedPaycheckAmount
                             };
 
@@ -382,7 +399,7 @@ namespace BudgetApp.Api.Services
                                 if (isSuspiciousHold)
                                 {
                                     newTx.IsSuspiciousHold = true;
-                                    newTx.HoldReviewed     = false;
+                                    newTx.HoldReviewed = false;
                                     _logger.LogInformation(
                                         "Transaction flagged as suspicious hold: " +
                                         "plaidTxId={PlaidTxId} merchant={Merchant} amount={Amount}",
@@ -396,7 +413,7 @@ namespace BudgetApp.Api.Services
                                     _budgetEngine.IsLargeExpense(absAmount, user.ExpectedPaycheckAmount))
                                 {
                                     newTx.IsLargeExpenseCandidate = true;
-                                    newTx.LargeExpenseHandled     = false;
+                                    newTx.LargeExpenseHandled = false;
                                     _logger.LogInformation(
                                         "Transaction flagged as large expense candidate: " +
                                         "plaidTxId={PlaidTxId} amount={Amount}",
@@ -433,20 +450,23 @@ namespace BudgetApp.Api.Services
                                   easternZone)
                             : createdAt; // last resort: backend discovery time
 
-                        bool gate_notBackfill          = !isBackfill;
+                        bool gate_notBackfill = !isBackfill;
                         bool gate_notificationsEnabled = plaidItem.NotificationsEnabledAt.HasValue;
 
                         // Gate c: real tx date ≥ NotificationsEnabledAt
-                        bool gate_realDateAfterCutoff  = txDateAsEasternMidnightUtc >= notifyCutoff;
+                        bool gate_realDateAfterCutoff = txDateAsEasternMidnightUtc >= notifyCutoff;
 
                         // Gate d: real tx date ≥ user.CreatedAt  (skip pre-registration history)
-                        bool gate_afterRegistration    = txDateAsEasternMidnightUtc >= userRegisteredAt;
+                        var userRegisteredDate = DateOnly.FromDateTime(user.CreatedAt.ToUniversalTime());
+
+                        bool gate_afterRegistration = plaidTxDate.HasValue &&
+                        plaidTxDate.Value >= userRegisteredDate;
 
                         // Gate e: real tx date is today or yesterday in America/New_York
-                        bool gate_todayOrYesterday     = plaidTxDate.HasValue &&
+                        bool gate_todayOrYesterday = plaidTxDate.HasValue &&
                             (plaidTxDate.Value == todayEastern || plaidTxDate.Value == yesterdayEastern);
 
-                        bool gate_notPending           = !newTx.Pending;
+                        bool gate_notPending = !newTx.Pending;
 
                         bool notifyEligible =
                             gate_notBackfill &&
@@ -515,12 +535,12 @@ namespace BudgetApp.Api.Services
                         else
                         {
                             // Identify the first failing gate to give a clear skip reason
-                            string skipReason = !gate_notBackfill          ? "skipped: backfill"                     :
-                                                !gate_notificationsEnabled  ? "skipped: notifications not enabled"    :
-                                                !gate_realDateAfterCutoff   ? "skipped: backfill (before cutoff)"     :
-                                                !gate_afterRegistration     ? "skipped: before user registration"     :
-                                                !gate_todayOrYesterday      ? "skipped: older than yesterday Eastern" :
-                                                !gate_notPending            ? "skipped: pending"                      :
+                            string skipReason = !gate_notBackfill ? "skipped: backfill" :
+                                                !gate_notificationsEnabled ? "skipped: notifications not enabled" :
+                                                !gate_realDateAfterCutoff ? "skipped: backfill (before cutoff)" :
+                                                !gate_afterRegistration ? "skipped: before user registration" :
+                                                !gate_todayOrYesterday ? "skipped: older than yesterday Eastern" :
+                                                !gate_notPending ? "skipped: pending" :
                                                                               "skipped: unknown";
 
                             _logger.LogInformation(
@@ -546,7 +566,7 @@ namespace BudgetApp.Api.Services
                         balanceRecord.BalanceAmount + balanceDelta);
 
                     balanceRecord.BalanceAmount += balanceDelta;
-                    balanceRecord.UpdatedAt      = DateTime.UtcNow;
+                    balanceRecord.UpdatedAt = DateTime.UtcNow;
                 }
 
                 // ── 7. Advance the cursor ──────────────────────────────────────────────
@@ -557,7 +577,7 @@ namespace BudgetApp.Api.Services
                     "Cursor advanced: itemId={ItemId} cursorBefore={CursorBefore} cursorAfter={CursorAfter}",
                     itemId,
                     cursorBeforeSync ?? "(null)",
-                    cursorAfterSync  ?? "(null)");
+                    cursorAfterSync ?? "(null)");
 
                 // ── 8. Set NotificationsEnabledAt on first live sync ───────────────────
                 // Done after processing so backfill runs never set this field.

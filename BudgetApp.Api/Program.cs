@@ -858,20 +858,20 @@ app.MapGet("/api/plaid/recurring", async (ApiDbContext dbContext, PlaidClient pl
         {
             DateOnly? next = freq.ToUpperInvariant() switch
             {
-                "WEEKLY"       => lastDate.AddDays(7),
-                "BIWEEKLY"     => lastDate.AddDays(14),
-                "SEMIMONTHLY"  => lastDate.AddDays(15),
+                "WEEKLY" => lastDate.AddDays(7),
+                "BIWEEKLY" => lastDate.AddDays(14),
+                "SEMIMONTHLY" => lastDate.AddDays(15),
                 "SEMI_MONTHLY" => lastDate.AddDays(15),
-                "MONTHLY"      => lastDate.AddMonths(1),
-                "ANNUALLY"     => lastDate.AddYears(1),
-                _              => null
+                "MONTHLY" => lastDate.AddMonths(1),
+                "ANNUALLY" => lastDate.AddYears(1),
+                _ => null
             };
             return next?.ToString("yyyy-MM-dd");
         }
 
         static object MapStream(TransactionStream s)
         {
-            var freqStr  = s.Frequency.ToString();
+            var freqStr = s.Frequency.ToString();
             // PredictedNextDate is the correct property name in Going.Plaid v6
             // (not NextProjectedDate). It is nullable, so ?. is correct here.
             var nextDate = s.PredictedNextDate?.ToString("yyyy-MM-dd")
@@ -879,29 +879,29 @@ app.MapGet("/api/plaid/recurring", async (ApiDbContext dbContext, PlaidClient pl
 
             // Normalise confidence: older Plaid API surfaces `confidence_level`,
             // newer API uses `status` (MATURE / EARLY_DETECTION / TOMBSTONED).
-            var statusStr  = s.Status.ToString();
+            var statusStr = s.Status.ToString();
             var confidence =
-                statusStr.Contains("Mature",  StringComparison.OrdinalIgnoreCase) ? "HIGH"   :
-                statusStr.Contains("Early",   StringComparison.OrdinalIgnoreCase) ? "MEDIUM" : "LOW";
+                statusStr.Contains("Mature", StringComparison.OrdinalIgnoreCase) ? "HIGH" :
+                statusStr.Contains("Early", StringComparison.OrdinalIgnoreCase) ? "MEDIUM" : "LOW";
 
             return new
             {
-                stream_id           = s.StreamId,
-                description         = s.Description ?? s.MerchantName ?? "Unknown",
-                merchant_name       = s.MerchantName,
-                last_amount         = new { amount = s.LastAmount.Amount },
-                frequency           = freqStr,
+                stream_id = s.StreamId,
+                description = s.Description ?? s.MerchantName ?? "Unknown",
+                merchant_name = s.MerchantName,
+                last_amount = new { amount = s.LastAmount.Amount },
+                frequency = freqStr,
                 next_projected_date = nextDate,
-                last_date           = s.LastDate.ToString("yyyy-MM-dd"),
-                confidence_level    = confidence,
-                status              = statusStr,
-                is_active           = s.IsActive
+                last_date = s.LastDate.ToString("yyyy-MM-dd"),
+                confidence_level = confidence,
+                status = statusStr,
+                is_active = s.IsActive
             };
         }
 
         return Results.Ok(new
         {
-            inflow_streams  = response.InflowStreams?.Select(MapStream).ToList(),
+            inflow_streams = response.InflowStreams?.Select(MapStream).ToList(),
             outflow_streams = response.OutflowStreams?.Select(MapStream).ToList()
         });
     }
@@ -960,17 +960,17 @@ app.MapPost("/api/budget/base", async (
         // Calculate base budget: paycheck - fixedCosts only (NO debt, NO savings)
         var baseResult = budgetEngine.CalculateBaseBudget(new BaseBudgetRequest
         {
-            PaycheckAmount   = request.PaycheckAmount,
-            Today            = today,
+            PaycheckAmount = request.PaycheckAmount,
+            Today = today,
             NextPaycheckDate = nextPaycheck,
-            TotalFixedBills  = totalFixedBills
+            TotalFixedBills = totalFixedBills
         });
 
         return Results.Ok(new
         {
-            paycheckAmount      = baseResult.PaycheckAmount,
+            paycheckAmount = baseResult.PaycheckAmount,
             fixedCostsRemaining = baseResult.FixedCostsRemaining,
-            baseRemaining       = baseResult.BaseRemaining
+            baseRemaining = baseResult.BaseRemaining
         });
     }
     catch (Exception e)
@@ -1040,12 +1040,12 @@ app.MapPost("/api/budget/finalize", async (
         // Formula: remainingToSpend = paycheckAmount - fixedBills - savings - debt
         var calcRequest = new BudgetCalculationRequest
         {
-            PaycheckAmount      = request.PaycheckAmount,
-            Today               = today,
-            NextPaycheckDate    = nextPaycheck,
-            TotalFixedBills     = totalFixedBills,
+            PaycheckAmount = request.PaycheckAmount,
+            Today = today,
+            NextPaycheckDate = nextPaycheck,
+            TotalFixedBills = totalFixedBills,
             SavingsContribution = savingsContribution,
-            DebtPerPaycheck     = debtPerPaycheck
+            DebtPerPaycheck = debtPerPaycheck
         };
 
         var result = budgetEngine.CalculateDynamicBudget(calcRequest);
@@ -1056,41 +1056,41 @@ app.MapPost("/api/budget/finalize", async (
         {
             balanceRecord = new Balance
             {
-                UserId        = user.Id,
+                UserId = user.Id,
                 BalanceAmount = result.RemainingToSpend,
-                CreatedAt     = DateTime.UtcNow,
-                UpdatedAt     = DateTime.UtcNow
+                CreatedAt = DateTime.UtcNow,
+                UpdatedAt = DateTime.UtcNow
             };
             await dbContext.Balances.AddAsync(balanceRecord);
         }
         else
         {
             balanceRecord.BalanceAmount = result.RemainingToSpend;
-            balanceRecord.UpdatedAt     = DateTime.UtcNow;
+            balanceRecord.UpdatedAt = DateTime.UtcNow;
         }
 
         // Persist user settings
-        user.OnboardingComplete      = true;
-        user.PayDay1                 = request.PayDay1;
-        user.PayDay2                 = request.PayDay2;
-        user.ExpectedPaycheckAmount  = request.PaycheckAmount;
-        user.DebtPerPaycheck         = request.DebtPerPaycheck;
+        user.OnboardingComplete = true;
+        user.PayDay1 = request.PayDay1;
+        user.PayDay2 = request.PayDay2;
+        user.ExpectedPaycheckAmount = request.PaycheckAmount;
+        user.DebtPerPaycheck = request.DebtPerPaycheck;
 
         await dbContext.SaveChangesAsync();
 
         // Return structured response — no proration fields
         return Results.Ok(new
         {
-            message                = "Setup complete.",
-            paycheckAmount         = result.PaycheckAmount,
-            fixedCostsRemaining    = result.FixedCostsRemaining,
-            debtPerPaycheck        = result.DebtPerPaycheck,
-            savingsContribution    = result.SavingsContribution,
-            remainingToSpend       = result.RemainingToSpend,
+            message = "Setup complete.",
+            paycheckAmount = result.PaycheckAmount,
+            fixedCostsRemaining = result.FixedCostsRemaining,
+            debtPerPaycheck = result.DebtPerPaycheck,
+            savingsContribution = result.SavingsContribution,
+            remainingToSpend = result.RemainingToSpend,
             // Legacy alias kept so older clients still work
             dynamicSpendableAmount = result.DynamicSpendableAmount,
-            dynamicBalance         = result.RemainingToSpend.ToString("0.00"),
-            explanation            = result.Explanation
+            dynamicBalance = result.RemainingToSpend.ToString("0.00"),
+            explanation = result.Explanation
         });
     }
     catch (Exception e)
@@ -1103,42 +1103,45 @@ app.MapPost("/api/budget/finalize", async (
 .WithOpenApi();
 
 // POST: /api/plaid/webhook
+// POST: /api/plaid/webhook
 app.MapPost("/api/plaid/webhook", async (
     ITransactionService transactionService,
     ApiDbContext dbContext,
     PlaidWebhookRequest requestBody,
     ILoggerFactory loggerFactory) =>
 {
-    var logger      = loggerFactory.CreateLogger("PlaidWebhook");
-    var receivedAt  = DateTime.UtcNow;
+    var logger = loggerFactory.CreateLogger("PlaidWebhook");
+    var receivedAt = DateTime.UtcNow;
 
-    // ── Log every inbound webhook immediately ─────────────────────────────────
-    // These console lines appear in CloudWatch even before any DB or Sentry call.
+    // ── Log every inbound webhook immediately ────────────────────────────────
+    // These console lines appear in CloudWatch even if Sentry scrubs PII.
     Console.WriteLine(
         $"[WEBHOOK] receivedAt={receivedAt:O} " +
         $"type={requestBody.WebhookType} code={requestBody.WebhookCode} itemId={requestBody.ItemId}");
 
     logger.LogInformation(
         "Webhook received: type={WebhookType} code={WebhookCode} itemId={ItemId} receivedAt={ReceivedAt}",
-        requestBody.WebhookType, requestBody.WebhookCode, requestBody.ItemId, receivedAt.ToString("O"));
-
-    SentrySdk.AddBreadcrumb(
-        $"Webhook received: type={requestBody.WebhookType} code={requestBody.WebhookCode} " +
-        $"itemId={requestBody.ItemId} receivedAt={receivedAt:O}",
-        level: BreadcrumbLevel.Info);
+        requestBody.WebhookType,
+        requestBody.WebhookCode,
+        requestBody.ItemId,
+        receivedAt.ToString("O"));
 
     SentrySdk.ConfigureScope(scope =>
     {
-        scope.SetTag("webhook.type",   requestBody.WebhookType  ?? "unknown");
-        scope.SetTag("webhook.code",   requestBody.WebhookCode  ?? "unknown");
-        scope.SetTag("webhook.itemId", requestBody.ItemId       ?? "unknown");
+        scope.SetTag("webhook.type", requestBody.WebhookType ?? "unknown");
+        scope.SetTag("webhook.code", requestBody.WebhookCode ?? "unknown");
+        scope.SetTag("webhook.itemId", requestBody.ItemId ?? "unknown");
         scope.SetExtra("webhook.receivedAt", receivedAt.ToString("O"));
     });
 
-    // ── Best-effort user lookup so every log line includes email + userId ─────
-    // This makes it trivial to grep CloudWatch for a specific user's webhooks.
+    SentrySdk.AddBreadcrumb(
+        $"Webhook received: type={requestBody.WebhookType} code={requestBody.WebhookCode} itemId={requestBody.ItemId} receivedAt={receivedAt:O}",
+        level: BreadcrumbLevel.Info);
+
+    // ── Best-effort user lookup so CloudWatch/Sentry can identify the user ───
     string userEmail = "(unknown)";
-    int    userId    = -1;
+    int userId = -1;
+
     try
     {
         var plaidItem = await dbContext.PlaidItems
@@ -1152,51 +1155,75 @@ app.MapPost("/api/plaid/webhook", async (
             if (webhookUser != null)
             {
                 userEmail = webhookUser.Email ?? "(no email)";
-                userId    = webhookUser.Id;
+                userId = webhookUser.Id;
             }
         }
 
         logger.LogInformation(
-            "Webhook user context resolved: type={WebhookType} code={WebhookCode} " +
-            "itemId={ItemId} userId={UserId} userEmail={UserEmail}",
-            requestBody.WebhookType, requestBody.WebhookCode,
-            requestBody.ItemId, userId, userEmail);
+            "Webhook user context resolved: type={WebhookType} code={WebhookCode} itemId={ItemId} userId={UserId} userEmail={UserEmail}",
+            requestBody.WebhookType,
+            requestBody.WebhookCode,
+            requestBody.ItemId,
+            userId,
+            userEmail);
+
+        Console.WriteLine(
+            $"[WEBHOOK] user resolved: itemId={requestBody.ItemId} userId={userId} userEmail={userEmail}");
     }
     catch (Exception lookupEx)
     {
-        logger.LogWarning(lookupEx,
-            "Webhook user lookup failed (non-fatal): itemId={ItemId}",
+        logger.LogWarning(
+            lookupEx,
+            "Webhook user lookup failed non-fatally: itemId={ItemId}",
             requestBody.ItemId);
+
+        Console.WriteLine(
+            $"[WEBHOOK] user lookup failed: itemId={requestBody.ItemId} error={lookupEx.Message}");
     }
 
+    // ── Sentry user context ──────────────────────────────────────────────────
+    // This is cleaner than setting a tag named user.email.
+    // If Sentry still filters Email, your org-level scrubbers are still winning.
     SentrySdk.ConfigureScope(scope =>
     {
-        scope.SetTag("user.email",         userEmail);
-        scope.SetExtra("webhook.userId",   userId);
+        if (userId > 0)
+        {
+            scope.User = new SentryUser
+            {
+                Id = userId.ToString(),
+                Email = userEmail
+            };
+        }
+
+        scope.SetTag("budget.userId", userId.ToString());
+        scope.SetExtra("debug.rawUserEmail", userEmail);
+        scope.SetExtra("webhook.userId", userId);
         scope.SetExtra("webhook.userEmail", userEmail);
     });
 
-    // ── SENTRY: one message per webhook so we can see bursts in Issues ────────
-    // If you see the same itemId firing multiple times within seconds, that is a burst.
+    // Do NOT put userEmail directly in the Sentry message string.
+    // Sentry is much more likely to scrub raw email patterns inside message text.
     SentrySdk.CaptureMessage(
-        $"Webhook received: type={requestBody.WebhookType} code={requestBody.WebhookCode} " +
-        $"itemId={requestBody.ItemId} userEmail={userEmail} receivedAt={receivedAt:O}",
+        $"Webhook received: type={requestBody.WebhookType} code={requestBody.WebhookCode} itemId={requestBody.ItemId} receivedAt={receivedAt:O}",
         scope =>
         {
             scope.Level = SentryLevel.Info;
-            scope.SetTag("event.type",   "webhook_received");
+            scope.SetTag("event.type", "webhook_received");
             scope.SetTag("webhook.code", requestBody.WebhookCode ?? "unknown");
-            scope.SetTag("user.email",   userEmail);
+            scope.SetTag("budget.userId", userId.ToString());
+            scope.SetExtra("debug.rawUserEmail", userEmail);
         });
 
-    // ── Filter: only TRANSACTIONS type webhooks trigger a sync ────────────────
+    // ── Filter: only TRANSACTIONS webhooks trigger sync ───────────────────────
     if (requestBody.WebhookType != "TRANSACTIONS")
     {
         logger.LogInformation(
-            "Webhook IGNORED (not TRANSACTIONS type): type={WebhookType} code={WebhookCode} " +
-            "itemId={ItemId} userEmail={UserEmail}",
-            requestBody.WebhookType, requestBody.WebhookCode,
-            requestBody.ItemId, userEmail);
+            "Webhook ignored because type is not TRANSACTIONS: type={WebhookType} code={WebhookCode} itemId={ItemId} userId={UserId} userEmail={UserEmail}",
+            requestBody.WebhookType,
+            requestBody.WebhookCode,
+            requestBody.ItemId,
+            userId,
+            userEmail);
 
         SentrySdk.AddBreadcrumb(
             $"Webhook ignored: type={requestBody.WebhookType} is not TRANSACTIONS",
@@ -1205,92 +1232,137 @@ app.MapPost("/api/plaid/webhook", async (
         return Results.Ok(new { message = "Ignored non-transaction webhook." });
     }
 
-    // ── Warn on unexpected webhook codes so we notice new Plaid codes fast ────
+    // ── Warn on unexpected transaction webhook codes ─────────────────────────
     var knownTransactionCodes = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
     {
-        "INITIAL_UPDATE", "HISTORICAL_UPDATE", "DEFAULT_UPDATE", "SYNC_UPDATES_AVAILABLE"
+        "INITIAL_UPDATE",
+        "HISTORICAL_UPDATE",
+        "DEFAULT_UPDATE",
+        "SYNC_UPDATES_AVAILABLE",
+        "TRANSACTIONS_REMOVED"
     };
 
     if (!knownTransactionCodes.Contains(requestBody.WebhookCode ?? ""))
     {
         logger.LogWarning(
-            "Webhook has unexpected code — will still attempt sync: " +
-            "type={WebhookType} code={WebhookCode} itemId={ItemId} userEmail={UserEmail}",
-            requestBody.WebhookType, requestBody.WebhookCode,
-            requestBody.ItemId, userEmail);
+            "Webhook has unexpected transaction code, but sync will still run: type={WebhookType} code={WebhookCode} itemId={ItemId} userId={UserId} userEmail={UserEmail}",
+            requestBody.WebhookType,
+            requestBody.WebhookCode,
+            requestBody.ItemId,
+            userId,
+            userEmail);
+
+        SentrySdk.CaptureMessage(
+            $"Unexpected Plaid transaction webhook code: {requestBody.WebhookCode ?? "unknown"}",
+            scope =>
+            {
+                scope.Level = SentryLevel.Warning;
+                scope.SetTag("event.type", "unexpected_webhook_code");
+                scope.SetTag("webhook.code", requestBody.WebhookCode ?? "unknown");
+                scope.SetTag("webhook.itemId", requestBody.ItemId ?? "unknown");
+                scope.SetTag("budget.userId", userId.ToString());
+                scope.SetExtra("debug.rawUserEmail", userEmail);
+            });
     }
 
     try
     {
         logger.LogInformation(
-            "Webhook triggering transaction sync: code={WebhookCode} itemId={ItemId} " +
-            "userEmail={UserEmail} userId={UserId}",
-            requestBody.WebhookCode, requestBody.ItemId, userEmail, userId);
+            "Webhook triggering transaction sync: code={WebhookCode} itemId={ItemId} userId={UserId} userEmail={UserEmail}",
+            requestBody.WebhookCode,
+            requestBody.ItemId,
+            userId,
+            userEmail);
 
         SentrySdk.AddBreadcrumb(
-            $"Triggering sync: code={requestBody.WebhookCode} itemId={requestBody.ItemId} " +
-            $"userEmail={userEmail}",
+            $"Triggering sync: code={requestBody.WebhookCode} itemId={requestBody.ItemId} userId={userId}",
             level: BreadcrumbLevel.Info);
 
-        // Pass the webhook code so TransactionService can determine whether this is a
-        // backfill sync (INITIAL_UPDATE / HISTORICAL_UPDATE) and set NotificationsEnabledAt
-        // on first live sync.
-        var syncResponse = await transactionService.SyncAndProcessTransactions(
-            requestBody.ItemId, requestBody.WebhookCode);
+        // Current uploaded ITransactionService only takes itemId.
+        // If you later update TransactionService to accept webhookCode, change this to:
+        // var syncResponse = await transactionService.SyncAndProcessTransactions(requestBody.ItemId, requestBody.WebhookCode);
+        var syncResponse = await transactionService.SyncAndProcessTransactions(requestBody.ItemId);
 
-        var addedCount    = syncResponse.Added?.Count    ?? 0;
+        var addedCount = syncResponse.Added?.Count ?? 0;
         var modifiedCount = syncResponse.Modified?.Count ?? 0;
-        var removedCount  = syncResponse.Removed?.Count  ?? 0;
-        var syncDuration  = DateTime.UtcNow - receivedAt;
+        var removedCount = syncResponse.Removed?.Count ?? 0;
+        var syncDuration = DateTime.UtcNow - receivedAt;
 
         logger.LogInformation(
-            "Webhook sync complete: code={WebhookCode} itemId={ItemId} userEmail={UserEmail} " +
-            "added={Added} modified={Modified} removed={Removed} " +
-            "hasMore={HasMore} durationMs={DurationMs}",
-            requestBody.WebhookCode, requestBody.ItemId, userEmail,
-            addedCount, modifiedCount, removedCount,
-            syncResponse.HasMore, (int)syncDuration.TotalMilliseconds);
+            "Webhook sync complete: code={WebhookCode} itemId={ItemId} userId={UserId} userEmail={UserEmail} added={Added} modified={Modified} removed={Removed} hasMore={HasMore} durationMs={DurationMs}",
+            requestBody.WebhookCode,
+            requestBody.ItemId,
+            userId,
+            userEmail,
+            addedCount,
+            modifiedCount,
+            removedCount,
+            syncResponse.HasMore,
+            (int)syncDuration.TotalMilliseconds);
 
         Console.WriteLine(
             $"[WEBHOOK] sync complete: code={requestBody.WebhookCode} itemId={requestBody.ItemId} " +
-            $"userEmail={userEmail} added={addedCount} modified={modifiedCount} " +
-            $"removed={removedCount} hasMore={syncResponse.HasMore} " +
-            $"durationMs={(int)syncDuration.TotalMilliseconds}");
+            $"userId={userId} userEmail={userEmail} added={addedCount} modified={modifiedCount} " +
+            $"removed={removedCount} hasMore={syncResponse.HasMore} durationMs={(int)syncDuration.TotalMilliseconds}");
 
         SentrySdk.AddBreadcrumb(
             $"Webhook sync complete: code={requestBody.WebhookCode} itemId={requestBody.ItemId} " +
-            $"added={addedCount} modified={modifiedCount} removed={removedCount} " +
+            $"userId={userId} added={addedCount} modified={modifiedCount} removed={removedCount} " +
             $"hasMore={syncResponse.HasMore} durationMs={(int)syncDuration.TotalMilliseconds}",
             level: BreadcrumbLevel.Info);
 
+        SentrySdk.CaptureMessage(
+            $"Webhook sync complete: code={requestBody.WebhookCode} itemId={requestBody.ItemId}",
+            scope =>
+            {
+                scope.Level = SentryLevel.Info;
+                scope.SetTag("event.type", "webhook_sync_complete");
+                scope.SetTag("webhook.code", requestBody.WebhookCode ?? "unknown");
+                scope.SetTag("webhook.itemId", requestBody.ItemId ?? "unknown");
+                scope.SetTag("budget.userId", userId.ToString());
+                scope.SetExtra("debug.rawUserEmail", userEmail);
+                scope.SetExtra("sync.added", addedCount);
+                scope.SetExtra("sync.modified", modifiedCount);
+                scope.SetExtra("sync.removed", removedCount);
+                scope.SetExtra("sync.hasMore", syncResponse.HasMore);
+                scope.SetExtra("sync.durationMs", (int)syncDuration.TotalMilliseconds);
+            });
+
         return Results.Ok(new
         {
-            message  = "Webhook processed successfully",
-            added    = addedCount
+            message = "Webhook processed successfully",
+            added = addedCount,
+            modified = modifiedCount,
+            removed = removedCount,
+            hasMore = syncResponse.HasMore
         });
     }
     catch (Exception e)
     {
-        logger.LogError(e,
-            "Webhook processing FAILED: code={WebhookCode} itemId={ItemId} " +
-            "userEmail={UserEmail} userId={UserId}",
-            requestBody.WebhookCode, requestBody.ItemId, userEmail, userId);
+        logger.LogError(
+            e,
+            "Webhook processing failed: code={WebhookCode} itemId={ItemId} userId={UserId} userEmail={UserEmail}",
+            requestBody.WebhookCode,
+            requestBody.ItemId,
+            userId,
+            userEmail);
 
         Console.WriteLine(
             $"[WEBHOOK] FAILED: code={requestBody.WebhookCode} itemId={requestBody.ItemId} " +
-            $"userEmail={userEmail} error={e.Message}");
+            $"userId={userId} userEmail={userEmail} error={e.Message}");
 
         SentrySdk.CaptureException(e, scope =>
         {
-            scope.SetTag("webhook.itemId", requestBody.ItemId  ?? "unknown");
-            scope.SetTag("webhook.type",   requestBody.WebhookType  ?? "unknown");
-            scope.SetTag("webhook.code",   requestBody.WebhookCode  ?? "unknown");
-            scope.SetTag("user.email",     userEmail);
+            scope.SetTag("webhook.itemId", requestBody.ItemId ?? "unknown");
+            scope.SetTag("webhook.type", requestBody.WebhookType ?? "unknown");
+            scope.SetTag("webhook.code", requestBody.WebhookCode ?? "unknown");
+            scope.SetTag("budget.userId", userId.ToString());
             scope.SetExtra("webhook.receivedAt", receivedAt.ToString("O"));
-            scope.SetExtra("webhook.userId",     userId);
+            scope.SetExtra("webhook.userId", userId);
+            scope.SetExtra("debug.rawUserEmail", userEmail);
         });
 
-        // Still return 200 so Plaid doesn't retry forever
+        // Still return 200 so Plaid does not retry forever.
         return Results.Ok(new
         {
             message = "Webhook received but processing failed internally"
@@ -1594,21 +1666,21 @@ app.MapPost("/api/transactions/{id}/hold-override",
         }
 
         // Record the override so future reversals (when the pending is removed) use it
-        tx.HoldOverrideAmount    = body.OverrideAmount;
-        tx.BudgetAppliedAmount   = body.OverrideAmount;
-        tx.HoldReviewed          = true;
-        tx.UpdatedAt             = DateTime.UtcNow;
+        tx.HoldOverrideAmount = body.OverrideAmount;
+        tx.BudgetAppliedAmount = body.OverrideAmount;
+        tx.HoldReviewed = true;
+        tx.UpdatedAt = DateTime.UtcNow;
 
         await dbContext.SaveChangesAsync();
 
         return Results.Ok(new
         {
-            message           = "Hold override saved.",
-            transactionId     = tx.Id,
-            originalAmount    = tx.Amount,
-            overrideAmount    = tx.HoldOverrideAmount,
+            message = "Hold override saved.",
+            transactionId = tx.Id,
+            originalAmount = tx.Amount,
+            overrideAmount = tx.HoldOverrideAmount,
             balanceAdjustment = delta,
-            newBalance        = balance?.BalanceAmount
+            newBalance = balance?.BalanceAmount
         });
     }
     catch (Exception e)
