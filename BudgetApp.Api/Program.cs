@@ -881,6 +881,62 @@ app.MapDelete("/api/fixed-costs/{id}", async (ApiDbContext dbContext, HttpContex
 .WithName("DeleteFixedCost")
 .WithOpenApi();
 
+// PUT: /api/fixed-costs/{id}
+// Updates name, amount, category, nextDueDate, and optionally type of an existing fixed cost.
+// Only the authenticated owner may update their own fixed costs.
+app.MapPut("/api/fixed-costs/{id}", async (ApiDbContext dbContext, HttpContext httpContext, int id, FixedCost requestBody) =>
+{
+    try
+    {
+        string? idToken = httpContext.Request.Headers["Authorization"].FirstOrDefault()?.Split(" ").Last();
+        if (string.IsNullOrEmpty(idToken)) return Results.Unauthorized();
+
+        var decodedToken = await FirebaseAdmin.Auth.FirebaseAuth.DefaultInstance.VerifyIdTokenAsync(idToken);
+        var user = await dbContext.Users.FirstOrDefaultAsync(u => u.FirebaseUuid == decodedToken.Uid);
+        if (user == null) return Results.NotFound("User not found.");
+
+        var cost = await dbContext.FixedCosts
+            .FirstOrDefaultAsync(fc => fc.Id == id && fc.UserId == user.Id);
+
+        if (cost == null)
+            return Results.NotFound("Fixed cost not found or you do not have permission.");
+
+        // Update user-editable fields — only overwrite if the caller provided a value.
+        if (!string.IsNullOrWhiteSpace(requestBody.Name))
+            cost.Name = requestBody.Name;
+
+        if (requestBody.Amount > 0)
+            cost.Amount = requestBody.Amount;
+
+        if (!string.IsNullOrWhiteSpace(requestBody.Category))
+            cost.Category = requestBody.Category;
+
+        if (!string.IsNullOrWhiteSpace(requestBody.Type))
+            cost.Type = requestBody.Type;
+
+        // NextDueDate: accept null (clears the date) or any valid DateTime from caller.
+        cost.NextDueDate = requestBody.NextDueDate;
+
+        cost.UpdatedAt = DateTime.UtcNow;
+
+        await dbContext.SaveChangesAsync();
+
+        SentrySdk.AddBreadcrumb(
+            $"FixedCost updated: id={cost.Id} name={cost.Name} amount={cost.Amount} " +
+            $"category={cost.Category} nextDueDate={cost.NextDueDate?.ToString("yyyy-MM-dd") ?? "(null)"} userId={user.Id}",
+            level: BreadcrumbLevel.Info);
+
+        return Results.Ok(cost);
+    }
+    catch (Exception e)
+    {
+        SentrySdk.CaptureException(e);
+        return Results.Problem(e.Message);
+    }
+})
+.WithName("UpdateFixedCost")
+.WithOpenApi();
+
 // GET: /api/users/profile
 app.MapGet("/api/users/profile", async (ApiDbContext dbContext, HttpContext httpContext) =>
 {
@@ -1020,8 +1076,11 @@ app.MapPost("/api/budget/base", async (
     ApiDbContext dbContext,
     HttpContext httpContext,
     IDynamicBudgetEngine budgetEngine,
-    BaseBudgetHttpRequest request) =>
+    BaseBudgetHttpRequest request,
+    ILoggerFactory loggerFactory) =>
 {
+    var logger = loggerFactory.CreateLogger("BudgetBase");
+
     try
     {
         string? idToken = httpContext.Request.Headers["Authorization"].FirstOrDefault()?.Split(" ").Last();
@@ -1045,16 +1104,49 @@ app.MapPost("/api/budget/base", async (
         if (payCycleDays <= 0)
             return Results.BadRequest("Invalid pay cycle detected.");
 
-        // Filter fixed costs in this period (exclude Savings category — debt/savings not applied yet)
-        var fixedBillsThisPeriod = await dbContext.FixedCosts
-            .Where(fc => fc.UserId == user.Id
-                && fc.NextDueDate.HasValue
-                && fc.NextDueDate.Value.Date >= today
-                && fc.NextDueDate.Value.Date <= nextPaycheck
-                && fc.Category != "Savings")
+        // ── Load all fixed costs for the user so we can log inclusion/exclusion ──
+        var allFixedCosts = await dbContext.FixedCosts
+            .Where(fc => fc.UserId == user.Id)
             .ToListAsync();
 
+        // Apply the same filter used by the budget engine
+        var fixedBillsThisPeriod = allFixedCosts
+            .Where(fc => fc.NextDueDate.HasValue
+                && fc.NextDueDate.Value.Date >= today
+                && fc.NextDueDate.Value.Date <= nextPaycheck
+                && !string.Equals(fc.Category, "Savings", StringComparison.OrdinalIgnoreCase))
+            .ToList();
+
         decimal totalFixedBills = fixedBillsThisPeriod.Sum(fc => fc.Amount);
+
+        // ── Log the fixed-cost filter results ──────────────────────────────────
+        logger.LogInformation(
+            "BudgetBase fixed-cost filter: userId={UserId} today={Today} nextPaycheck={NextPaycheck} " +
+            "totalCosts={Total} includedCosts={Included} excludedCosts={Excluded} totalFixedBills={TotalFixedBills}",
+            user.Id,
+            today.ToString("yyyy-MM-dd"),
+            nextPaycheck.ToString("yyyy-MM-dd"),
+            allFixedCosts.Count,
+            fixedBillsThisPeriod.Count,
+            allFixedCosts.Count - fixedBillsThisPeriod.Count,
+            totalFixedBills);
+
+        foreach (var fc in allFixedCosts)
+        {
+            bool included = fixedBillsThisPeriod.Contains(fc);
+            string excludeReason = included ? "" :
+                !fc.NextDueDate.HasValue ? "no-due-date" :
+                string.Equals(fc.Category, "Savings", StringComparison.OrdinalIgnoreCase) ? "savings-category" :
+                fc.NextDueDate.Value.Date < today ? "before-today" :
+                                                                         "after-next-paycheck";
+
+            logger.LogInformation(
+                "BudgetBase FixedCost: id={Id} name={Name} amount={Amount} category={Category} " +
+                "nextDueDate={NextDueDate} included={Included} excludeReason={ExcludeReason}",
+                fc.Id, fc.Name, fc.Amount, fc.Category,
+                fc.NextDueDate?.ToString("yyyy-MM-dd") ?? "(null)",
+                included, excludeReason);
+        }
 
         // Calculate base budget: paycheck - fixedCosts only (NO debt, NO savings)
         var baseResult = budgetEngine.CalculateBaseBudget(new BaseBudgetRequest
@@ -1086,8 +1178,11 @@ app.MapPost("/api/budget/finalize", async (
     ApiDbContext dbContext,
     HttpContext httpContext,
     IDynamicBudgetEngine budgetEngine,
-    FinalizeBudgetRequest request) =>
+    FinalizeBudgetRequest request,
+    ILoggerFactory loggerFactory) =>
 {
+    var logger = loggerFactory.CreateLogger("BudgetFinalize");
+
     try
     {
         string? idToken = httpContext.Request.Headers["Authorization"].FirstOrDefault()?.Split(" ").Last();
@@ -1117,22 +1212,61 @@ app.MapPost("/api/budget/finalize", async (
         if (daysUntilNextPaycheck < 0 || daysUntilNextPaycheck > payCycleDays)
             return Results.BadRequest("Next paycheck date is inconsistent with pay days / current date.");
 
-        // Step 2 — Filter fixed costs that occur BEFORE the next paycheck
-        // (savings are excluded from the date filter — always included per paycheck)
-        var fixedBillsThisPeriod = await dbContext.FixedCosts
-            .Where(fc => fc.UserId == user.Id
-                && fc.NextDueDate.HasValue
-                && fc.NextDueDate.Value.Date >= today
-                && fc.NextDueDate.Value.Date <= nextPaycheck
-                && fc.Category != "Savings")
+        // Step 2 — Load ALL fixed costs so we can log inclusion/exclusion detail,
+        // then apply the same filter logic in memory.
+        var allFixedCosts = await dbContext.FixedCosts
+            .Where(fc => fc.UserId == user.Id)
             .ToListAsync();
 
-        var savingsThisPeriod = await dbContext.FixedCosts
-            .Where(fc => fc.UserId == user.Id && fc.Category == "Savings")
-            .ToListAsync();
+        // Bills filter: must have a due date in [today, nextPaycheck] and not be Savings
+        var fixedBillsThisPeriod = allFixedCosts
+            .Where(fc => fc.NextDueDate.HasValue
+                && fc.NextDueDate.Value.Date >= today
+                && fc.NextDueDate.Value.Date <= nextPaycheck
+                && !string.Equals(fc.Category, "Savings", StringComparison.OrdinalIgnoreCase))
+            .ToList();
+
+        // Savings: always included per paycheck (no date filter)
+        var savingsThisPeriod = allFixedCosts
+            .Where(fc => string.Equals(fc.Category, "Savings", StringComparison.OrdinalIgnoreCase))
+            .ToList();
 
         decimal totalFixedBills = fixedBillsThisPeriod.Sum(fc => fc.Amount);
         decimal savingsContribution = savingsThisPeriod.Sum(fc => fc.Amount);
+
+        // ── Log the fixed-cost filter results ──────────────────────────────────
+        logger.LogInformation(
+            "BudgetFinalize fixed-cost filter: userId={UserId} today={Today} nextPaycheck={NextPaycheck} " +
+            "totalCosts={Total} includedBills={IncludedBills} savingsCosts={Savings} " +
+            "excludedCosts={Excluded} totalFixedBills={TotalFixedBills} savingsContribution={SavingsContribution}",
+            user.Id,
+            today.ToString("yyyy-MM-dd"),
+            nextPaycheck.ToString("yyyy-MM-dd"),
+            allFixedCosts.Count,
+            fixedBillsThisPeriod.Count,
+            savingsThisPeriod.Count,
+            allFixedCosts.Count - fixedBillsThisPeriod.Count - savingsThisPeriod.Count,
+            totalFixedBills,
+            savingsContribution);
+
+        foreach (var fc in allFixedCosts)
+        {
+            bool isSavings = string.Equals(fc.Category, "Savings", StringComparison.OrdinalIgnoreCase);
+            bool includedAsBill = fixedBillsThisPeriod.Contains(fc);
+            string role = isSavings ? "savings" : includedAsBill ? "included-bill" : "excluded-bill";
+
+            string excludeReason = (isSavings || includedAsBill) ? "" :
+                !fc.NextDueDate.HasValue ? "no-due-date" :
+                fc.NextDueDate.Value.Date < today ? "before-today" :
+                                                    "after-next-paycheck";
+
+            logger.LogInformation(
+                "BudgetFinalize FixedCost: id={Id} name={Name} amount={Amount} category={Category} " +
+                "nextDueDate={NextDueDate} role={Role} excludeReason={ExcludeReason}",
+                fc.Id, fc.Name, fc.Amount, fc.Category,
+                fc.NextDueDate?.ToString("yyyy-MM-dd") ?? "(null)",
+                role, excludeReason);
+        }
         decimal debtPerPaycheck = request.DebtPerPaycheck ?? 0m;
 
         // Step 3 — Delegate to the pure budget engine (NO proration)
