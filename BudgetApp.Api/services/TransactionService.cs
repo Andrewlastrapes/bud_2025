@@ -124,10 +124,12 @@ namespace BudgetApp.Api.Services
                 SentrySdk.ConfigureScope(scope =>
                 {
                     scope.SetTag("sync.itemId", itemId);
+                    scope.SetTag("sync.plaidItemDbId", plaidItem.Id.ToString());
                     scope.SetTag("sync.webhookCode", webhookCode ?? "(manual)");
                     scope.SetTag("sync.isBackfill", isBackfill.ToString());
                     scope.SetTag("user.email", user.Email ?? "unknown");
                     scope.SetExtra("sync.userId", user.Id);
+                    scope.SetExtra("sync.plaidItemDbId", plaidItem.Id);
                     scope.SetExtra("sync.cursorBefore", cursorBeforeSync ?? "(null)");
                     scope.SetExtra("sync.notificationsEnabledAtBefore",
                         notificationsEnabledAtBefore?.ToString("O") ?? "(null)");
@@ -168,6 +170,48 @@ namespace BudgetApp.Api.Services
                     scope.SetExtra("sync.removedCount", removedCount);
                     scope.SetExtra("sync.hasMore", response.HasMore);
                 });
+
+                // ── DIAGNOSTIC: NextCursor null/empty check ────────────────────────────
+                // Determines whether Plaid returned a valid cursor or null/empty.
+                // If null, the EF change tracker may silently skip updating the cursor
+                // column (null → null is not a detected change), leaving cursor = null in DB.
+                bool nextCursorIsNull = string.IsNullOrEmpty(response.NextCursor);
+                int nextCursorLength = response.NextCursor?.Length ?? 0;
+
+                _logger.LogInformation(
+                    "Plaid sync cursor check: itemId={ItemId} plaidItemDbId={PlaidItemDbId} " +
+                    "nextCursorIsNull={NextCursorIsNull} nextCursorLength={NextCursorLength} " +
+                    "hasMore={HasMore}",
+                    itemId, plaidItem.Id, nextCursorIsNull, nextCursorLength, response.HasMore);
+
+                if (nextCursorIsNull)
+                {
+                    _logger.LogWarning(
+                        "CURSOR_NULL_FROM_PLAID: Plaid returned null/empty NextCursor. " +
+                        "itemId={ItemId} plaidItemDbId={PlaidItemDbId} userId={UserId} " +
+                        "webhookCode={WebhookCode} hasMore={HasMore} " +
+                        "added={Added} modified={Modified} removed={Removed}",
+                        itemId, plaidItem.Id, user.Id, webhookCode ?? "(manual)", response.HasMore,
+                        addedCount, modifiedCount, removedCount);
+
+                    SentrySdk.CaptureMessage(
+                        $"CURSOR_NULL_FROM_PLAID: itemId={itemId} plaidItemDbId={plaidItem.Id} " +
+                        $"hasMore={response.HasMore}",
+                        scope =>
+                        {
+                            scope.Level = SentryLevel.Warning;
+                            scope.SetTag("event.type", "cursor_null_from_plaid");
+                            scope.SetTag("sync.itemId", itemId);
+                            scope.SetTag("sync.plaidItemDbId", plaidItem.Id.ToString());
+                            scope.SetTag("sync.webhookCode", webhookCode ?? "(manual)");
+                            scope.SetExtra("sync.userId", user.Id);
+                            scope.SetExtra("sync.hasMore", response.HasMore);
+                            scope.SetExtra("sync.addedCount", addedCount);
+                            scope.SetExtra("sync.modifiedCount", modifiedCount);
+                            scope.SetExtra("sync.removedCount", removedCount);
+                            scope.SetExtra("sync.cursorBefore", cursorBeforeSync ?? "(null)");
+                        });
+                }
 
                 decimal balanceDelta = 0m;
 
@@ -579,6 +623,46 @@ namespace BudgetApp.Api.Services
                     cursorBeforeSync ?? "(null)",
                     cursorAfterSync ?? "(null)");
 
+                // ── DIAGNOSTIC: EF change tracker state for cursor ──────────────────────
+                // If cursor_is_modified=False and efEntityState=Unchanged, EF will not
+                // generate an UPDATE for the cursor column — even if we assigned a new value.
+                // This happens when old value == new value (both null, or same string).
+                var cursorEntryState = _dbContext.Entry(plaidItem).State.ToString();
+                var cursorIsModified = _dbContext.Entry(plaidItem).Property(p => p.Cursor).IsModified;
+
+                _logger.LogInformation(
+                    "PRE-SAVE cursor state: itemId={ItemId} plaidItemDbId={PlaidItemDbId} " +
+                    "cursorBefore={CursorBefore} cursorAfterSync={CursorAfterSync} " +
+                    "efEntityState={EfEntityState} cursor_is_modified={CursorIsModified}",
+                    itemId, plaidItem.Id,
+                    cursorBeforeSync ?? "(null)", cursorAfterSync ?? "(null)",
+                    cursorEntryState, cursorIsModified);
+
+                if (!cursorIsModified)
+                {
+                    _logger.LogWarning(
+                        "CURSOR_NOT_MARKED_MODIFIED: EF change tracker does not detect cursor change. " +
+                        "itemId={ItemId} plaidItemDbId={PlaidItemDbId} userId={UserId} " +
+                        "cursorBefore={CursorBefore} cursorAfterSync={CursorAfterSync} " +
+                        "efEntityState={EfEntityState}",
+                        itemId, plaidItem.Id, user.Id,
+                        cursorBeforeSync ?? "(null)", cursorAfterSync ?? "(null)", cursorEntryState);
+
+                    SentrySdk.CaptureMessage(
+                        $"CURSOR_NOT_MARKED_MODIFIED: itemId={itemId} plaidItemDbId={plaidItem.Id}",
+                        scope =>
+                        {
+                            scope.Level = SentryLevel.Warning;
+                            scope.SetTag("event.type", "cursor_not_marked_modified");
+                            scope.SetTag("sync.itemId", itemId);
+                            scope.SetTag("sync.plaidItemDbId", plaidItem.Id.ToString());
+                            scope.SetExtra("sync.userId", user.Id);
+                            scope.SetExtra("sync.cursorBefore", cursorBeforeSync ?? "(null)");
+                            scope.SetExtra("sync.cursorAfterSync", cursorAfterSync ?? "(null)");
+                            scope.SetExtra("sync.efEntityState", cursorEntryState);
+                        });
+                }
+
                 // ── 8. Set NotificationsEnabledAt on first live sync ───────────────────
                 // Done after processing so backfill runs never set this field.
                 // Once set it is never cleared or changed.
@@ -626,6 +710,49 @@ namespace BudgetApp.Api.Services
                     itemId, webhookCode ?? "(manual)",
                     notifyQueue.Count, notificationsJustEnabled,
                     currentDynamicBalance, cursorAfterSync ?? "(null)");
+
+                // ── DIAGNOSTIC: Re-read cursor from DB to confirm persistence ───────────
+                // After SaveChanges, re-query the PlaidItem row (AsNoTracking to bypass
+                // the in-memory cache) to verify whether the cursor column was actually
+                // written to the database.
+                var savedCursor = await _dbContext.PlaidItems
+                    .AsNoTracking()
+                    .Where(p => p.Id == plaidItem.Id)
+                    .Select(p => p.Cursor)
+                    .FirstOrDefaultAsync();
+
+                bool savedCursorIsNull = string.IsNullOrEmpty(savedCursor);
+
+                _logger.LogInformation(
+                    "POST-SAVE cursor verification: itemId={ItemId} plaidItemDbId={PlaidItemDbId} " +
+                    "savedCursor={SavedCursor} savedCursorIsNull={SavedCursorIsNull}",
+                    itemId, plaidItem.Id,
+                    savedCursor ?? "(null)", savedCursorIsNull);
+
+                if (savedCursorIsNull)
+                {
+                    _logger.LogWarning(
+                        "CURSOR_STILL_NULL_AFTER_SAVE: cursor remains null after SaveChanges. " +
+                        "itemId={ItemId} plaidItemDbId={PlaidItemDbId} userId={UserId} " +
+                        "webhookCode={WebhookCode} cursorBeforeSync={CursorBeforeSync} " +
+                        "cursorAfterSync={CursorAfterSync}",
+                        itemId, plaidItem.Id, user.Id, webhookCode ?? "(manual)",
+                        cursorBeforeSync ?? "(null)", cursorAfterSync ?? "(null)");
+
+                    SentrySdk.CaptureMessage(
+                        $"CURSOR_STILL_NULL_AFTER_SAVE: itemId={itemId} plaidItemDbId={plaidItem.Id}",
+                        scope =>
+                        {
+                            scope.Level = SentryLevel.Warning;
+                            scope.SetTag("event.type", "cursor_still_null_after_save");
+                            scope.SetTag("sync.itemId", itemId);
+                            scope.SetTag("sync.plaidItemDbId", plaidItem.Id.ToString());
+                            scope.SetExtra("sync.userId", user.Id);
+                            scope.SetExtra("sync.webhookCode", webhookCode ?? "(manual)");
+                            scope.SetExtra("sync.cursorBeforeSync", cursorBeforeSync ?? "(null)");
+                            scope.SetExtra("sync.cursorAfterSync", cursorAfterSync ?? "(null)");
+                        });
+                }
 
                 SentrySdk.CaptureMessage(
                     $"Sync complete: itemId={itemId} userEmail={user.Email} " +

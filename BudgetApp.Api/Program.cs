@@ -603,8 +603,16 @@ app.MapPost("/api/balance", async (ApiDbContext dbContext, HttpContext httpConte
 .WithOpenApi();
 
 // POST: /api/transactions/sync
-app.MapPost("/api/transactions/sync", async (ITransactionService transactionService, ApiDbContext dbContext, HttpContext httpContext) =>
+// Syncs ALL PlaidItems for the authenticated user. Each item is wrapped in its own
+// try/catch so a single failed item does not block the remaining items from syncing.
+app.MapPost("/api/transactions/sync", async (
+    ITransactionService transactionService,
+    ApiDbContext dbContext,
+    HttpContext httpContext,
+    ILoggerFactory loggerFactory) =>
 {
+    var logger = loggerFactory.CreateLogger("ManualTransactionsSync");
+
     try
     {
         string? idToken = httpContext.Request.Headers["Authorization"].FirstOrDefault()?.Split(" ").Last();
@@ -616,17 +624,108 @@ app.MapPost("/api/transactions/sync", async (ITransactionService transactionServ
         var user = await dbContext.Users.FirstOrDefaultAsync(u => u.FirebaseUuid == firebaseUuid);
         if (user == null) return Results.NotFound("User not found.");
 
-        var plaidItem = await dbContext.PlaidItems.FirstOrDefaultAsync(p => p.UserId == user.Id);
-        if (plaidItem == null) return Results.BadRequest("No Plaid item linked for this user.");
+        // Load ALL PlaidItems for this user — previously only FirstOrDefault was synced.
+        var plaidItems = await dbContext.PlaidItems
+            .Where(p => p.UserId == user.Id)
+            .ToListAsync();
 
-        // Manual sync — not a backfill, so webhookCode = null (live sync, notifications eligible)
-        var response = await transactionService.SyncAndProcessTransactions(plaidItem.ItemId);
+        if (!plaidItems.Any()) return Results.BadRequest("No Plaid item linked for this user.");
+
+        logger.LogInformation(
+            "Manual sync: userId={UserId} totalPlaidItems={Count} items=[{Items}]",
+            user.Id, plaidItems.Count,
+            string.Join("; ", plaidItems.Select(p =>
+                $"dbId={p.Id} itemId={p.ItemId} cursor={p.Cursor ?? "(null)"}")));
+
+        SentrySdk.AddBreadcrumb(
+            $"Manual sync: userId={user.Id} plaidItemCount={plaidItems.Count} " +
+            $"itemIds=[{string.Join(",", plaidItems.Select(p => p.ItemId))}]",
+            level: BreadcrumbLevel.Info);
+
+        var results = new List<object>();
+        int successCount = 0;
+        int failureCount = 0;
+
+        foreach (var plaidItem in plaidItems)
+        {
+            try
+            {
+                logger.LogInformation(
+                    "Manual sync starting item: userId={UserId} plaidItemDbId={PlaidItemDbId} " +
+                    "itemId={ItemId} cursorBefore={Cursor}",
+                    user.Id, plaidItem.Id, plaidItem.ItemId, plaidItem.Cursor ?? "(null)");
+
+                // webhookCode = null → live sync, notifications eligible
+                var response = await transactionService.SyncAndProcessTransactions(plaidItem.ItemId);
+
+                int addedCount = response.Added?.Count ?? 0;
+                int modifiedCount = response.Modified?.Count ?? 0;
+                int removedCount = response.Removed?.Count ?? 0;
+
+                logger.LogInformation(
+                    "Manual sync item complete: userId={UserId} plaidItemDbId={PlaidItemDbId} " +
+                    "itemId={ItemId} added={Added} modified={Modified} removed={Removed} hasMore={HasMore}",
+                    user.Id, plaidItem.Id, plaidItem.ItemId,
+                    addedCount, modifiedCount, removedCount, response.HasMore);
+
+                successCount++;
+                results.Add(new
+                {
+                    plaidItemDbId = plaidItem.Id,
+                    itemId = plaidItem.ItemId,
+                    success = true,
+                    added = addedCount,
+                    modified = modifiedCount,
+                    removed = removedCount,
+                    hasMore = response.HasMore,
+                    error = (string?)null
+                });
+            }
+            catch (Exception itemEx)
+            {
+                failureCount++;
+
+                logger.LogError(itemEx,
+                    "Manual sync item FAILED: userId={UserId} plaidItemDbId={PlaidItemDbId} " +
+                    "itemId={ItemId}",
+                    user.Id, plaidItem.Id, plaidItem.ItemId);
+
+                SentrySdk.CaptureException(itemEx, scope =>
+                {
+                    scope.SetTag("endpoint", "manual_transactions_sync");
+                    scope.SetTag("sync.itemId", plaidItem.ItemId);
+                    scope.SetTag("sync.plaidItemDbId", plaidItem.Id.ToString());
+                    scope.SetTag("sync.userId", user.Id.ToString());
+                    scope.SetExtra("sync.itemId", plaidItem.ItemId);
+                    scope.SetExtra("sync.plaidItemDbId", plaidItem.Id);
+                    scope.SetExtra("sync.userId", user.Id);
+                });
+
+                results.Add(new
+                {
+                    plaidItemDbId = plaidItem.Id,
+                    itemId = plaidItem.ItemId,
+                    success = false,
+                    added = 0,
+                    modified = 0,
+                    removed = 0,
+                    hasMore = false,
+                    error = itemEx.Message
+                });
+            }
+        }
+
+        logger.LogInformation(
+            "Manual sync complete: userId={UserId} totalItems={Total} succeeded={Succeeded} failed={Failed}",
+            user.Id, plaidItems.Count, successCount, failureCount);
 
         return Results.Ok(new
         {
             message = "Sync complete",
-            added = response.Added.Count,
-            hasMore = response.HasMore
+            totalItems = plaidItems.Count,
+            succeeded = successCount,
+            failed = failureCount,
+            results
         });
     }
     catch (UnauthorizedAccessException e)
@@ -1149,6 +1248,17 @@ app.MapPost("/api/plaid/webhook", async (
 
         if (plaidItem != null)
         {
+            logger.LogInformation(
+                "Webhook PlaidItem found: itemId={ItemId} plaidItemDbId={PlaidItemDbId} " +
+                "plaidUserId={PlaidUserId} cursor={Cursor}",
+                requestBody.ItemId, plaidItem.Id,
+                plaidItem.UserId, plaidItem.Cursor ?? "(null)");
+
+            SentrySdk.AddBreadcrumb(
+                $"Webhook PlaidItem found: itemId={requestBody.ItemId} " +
+                $"plaidItemDbId={plaidItem.Id} cursor={plaidItem.Cursor ?? "(null)"}",
+                level: BreadcrumbLevel.Info);
+
             var webhookUser = await dbContext.Users
                 .FirstOrDefaultAsync(u => u.Id == plaidItem.UserId);
 
@@ -1157,6 +1267,22 @@ app.MapPost("/api/plaid/webhook", async (
                 userEmail = webhookUser.Email ?? "(no email)";
                 userId = webhookUser.Id;
             }
+        }
+        else
+        {
+            logger.LogWarning(
+                "Webhook PlaidItem NOT FOUND: itemId={ItemId} webhookCode={WebhookCode} — sync will fail",
+                requestBody.ItemId, requestBody.WebhookCode);
+
+            SentrySdk.CaptureMessage(
+                $"Webhook PlaidItem NOT FOUND: itemId={requestBody.ItemId ?? "(null)"}",
+                scope =>
+                {
+                    scope.Level = SentryLevel.Warning;
+                    scope.SetTag("event.type", "webhook_item_not_found");
+                    scope.SetTag("webhook.itemId", requestBody.ItemId ?? "unknown");
+                    scope.SetTag("webhook.code", requestBody.WebhookCode ?? "unknown");
+                });
         }
 
         logger.LogInformation(
@@ -1278,10 +1404,8 @@ app.MapPost("/api/plaid/webhook", async (
             $"Triggering sync: code={requestBody.WebhookCode} itemId={requestBody.ItemId} userId={userId}",
             level: BreadcrumbLevel.Info);
 
-        // Current uploaded ITransactionService only takes itemId.
-        // If you later update TransactionService to accept webhookCode, change this to:
-        // var syncResponse = await transactionService.SyncAndProcessTransactions(requestBody.ItemId, requestBody.WebhookCode);
-        var syncResponse = await transactionService.SyncAndProcessTransactions(requestBody.ItemId);
+        var syncResponse = await transactionService.SyncAndProcessTransactions(
+            requestBody.ItemId, requestBody.WebhookCode);
 
         var addedCount = syncResponse.Added?.Count ?? 0;
         var modifiedCount = syncResponse.Modified?.Count ?? 0;
