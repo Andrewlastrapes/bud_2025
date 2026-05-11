@@ -2296,6 +2296,289 @@ app.MapGet("/api/debt/snapshot", async (ApiDbContext dbContext, PlaidClient plai
 
 
 
+// ─── AUDIT ENDPOINT ──────────────────────────────────────────────────────────
+// GET /api/admin/debug/users/{userId}/transaction-balance-audit
+//
+// READ-ONLY: no writes to any table. Requires X-Debug-Secret header.
+// Secret is read from config key "Debug:Secret" or env var DEBUG_SECRET.
+// Returns 401 if header is missing, wrong, or if no secret is configured.
+// ─────────────────────────────────────────────────────────────────────────────
+app.MapGet("/api/admin/debug/users/{userId}/transaction-balance-audit",
+    async (int userId, HttpContext httpContext, ApiDbContext dbContext, IConfiguration config) =>
+    {
+        // ── 1. Security gate ──────────────────────────────────────────────────
+        var configuredSecret =
+            config["Debug:Secret"] ??
+            System.Environment.GetEnvironmentVariable("DEBUG_SECRET");
+
+        // Deny outright if no secret is configured — prevents accidental exposure.
+        if (string.IsNullOrWhiteSpace(configuredSecret))
+            return Results.Unauthorized();
+
+        var providedSecret = httpContext.Request.Headers["X-Debug-Secret"].FirstOrDefault();
+        if (string.IsNullOrWhiteSpace(providedSecret) ||
+            !string.Equals(providedSecret, configuredSecret, StringComparison.Ordinal))
+            return Results.Unauthorized();
+
+        // ── 2. Load user ──────────────────────────────────────────────────────
+        var user = await dbContext.Users.FirstOrDefaultAsync(u => u.Id == userId);
+        if (user == null)
+            return Results.NotFound(new { error = $"User {userId} not found." });
+
+        // ── 3. Load balance (single row per user) ─────────────────────────────
+        var balance = await dbContext.Balances.FirstOrDefaultAsync(b => b.UserId == userId);
+
+        // ── 4. Load all transactions, sorted oldest-first ────────────────────
+        var transactions = await dbContext.Transactions
+            .Where(t => t.UserId == userId)
+            .OrderBy(t => t.Date)
+            .ThenBy(t => t.CreatedAt)
+            .ThenBy(t => t.Id)
+            .ToListAsync();
+
+        // ── 5. Load all fixed costs for matching ─────────────────────────────
+        var fixedCosts = await dbContext.FixedCosts
+            .Where(fc => fc.UserId == userId)
+            .ToListAsync();
+
+        // ── 6. Per-transaction audit ──────────────────────────────────────────
+        // Running balance starts at $0. The onboarding balance is NOT included
+        // because it is not recorded in the transaction history. We derive the
+        // implied initial balance from: storedBalance - netTransactionEffect.
+        decimal runningBalance = 0m;
+
+        var auditRows = new List<object>();
+
+        int totalPending = 0;
+        int totalPosted = 0;
+        int totalBeforeReg = 0;
+        int totalDepositsCountedAsIncome = 0;
+        int totalVariableSpend = 0;
+        int totalFixedCostMatches = 0;
+        int totalLargeExpenseHandled = 0;
+        int totalNoImpact = 0;
+
+        var userRegisteredDate = DateOnly.FromDateTime(user.CreatedAt.ToUniversalTime());
+
+        foreach (var tx in transactions)
+        {
+            if (tx.Pending) totalPending++; else totalPosted++;
+
+            // ── Deposit classification ────────────────────────────────────────
+            bool isConsideredDeposit =
+                tx.SuggestedKind != TransactionSuggestedKind.Unknown;
+
+            // ── Large expense classification ──────────────────────────────────
+            bool isConsideredLargeExpense = tx.IsLargeExpenseCandidate;
+
+            // ── Fixed-cost / recurring match (same logic as TransactionService)─
+            string? merchantName = tx.MerchantName ?? tx.Name;
+            FixedCost? matchedFc = fixedCosts.FirstOrDefault(fc =>
+                !string.IsNullOrEmpty(fc.PlaidMerchantName) &&
+                fc.PlaidMerchantName.Equals(merchantName, StringComparison.OrdinalIgnoreCase));
+
+            bool isConsideredRecurring = matchedFc != null;
+
+            // ── Before-registration check ─────────────────────────────────────
+            var txDateOnly = DateOnly.FromDateTime(tx.Date.Date);
+            bool isBeforeUserRegistration = txDateOnly < userRegisteredDate;
+            if (isBeforeUserRegistration) totalBeforeReg++;
+
+            // ── Net effect on dynamic balance ─────────────────────────────────
+            // Priority order:
+            //   1. Deposit counted as income  → +Amount
+            //   2. Large expense refunded     → net $0 (BudgetApplied was reversed)
+            //   3. BudgetAppliedAmount set    → -BudgetAppliedAmount
+            //   4. Everything else            → $0
+
+            decimal effect = 0m;
+            string reason;
+
+            if (isBeforeUserRegistration)
+            {
+                effect = 0m;
+                reason = "before-user-registration";
+                totalNoImpact++;
+            }
+            else if (isConsideredDeposit)
+            {
+                if (tx.CountedAsIncome)
+                {
+                    effect = tx.Amount;
+                    reason = $"deposit-counted-as-income (suggestedKind={tx.SuggestedKind})";
+                    totalDepositsCountedAsIncome++;
+                }
+                else
+                {
+                    effect = 0m;
+                    reason = $"deposit-not-counted (decision={tx.UserDecision})";
+                    totalNoImpact++;
+                }
+            }
+            else if (tx.IsLargeExpenseCandidate && tx.LargeExpenseHandled &&
+                     (tx.UserDecision == TransactionUserDecision.LargeExpenseFromSavings ||
+                      tx.UserDecision == TransactionUserDecision.LargeExpenseToFixedCost))
+            {
+                // The balance was first debited (BudgetAppliedAmount), then refunded (+Amount).
+                // Net = -BudgetApplied + Amount. If they're equal (the common case) net = $0.
+                decimal applied = tx.BudgetAppliedAmount ?? 0m;
+                effect = tx.Amount - applied; // typically $0
+                reason = $"large-expense-refunded (decision={tx.UserDecision}, applied={applied:0.00}, refunded={tx.Amount:0.00})";
+                totalLargeExpenseHandled++;
+            }
+            else if (tx.IsLargeExpenseCandidate && tx.LargeExpenseHandled &&
+                     tx.UserDecision == TransactionUserDecision.TreatAsVariableSpend)
+            {
+                // User chose to keep it as normal spend — BudgetAppliedAmount is the impact.
+                effect = -(tx.BudgetAppliedAmount ?? 0m);
+                reason = $"large-expense-treated-as-variable-spend (applied={tx.BudgetAppliedAmount:0.00})";
+                totalVariableSpend++;
+            }
+            else if (isConsideredRecurring && tx.BudgetAppliedAmount == null)
+            {
+                effect = 0m;
+                reason = $"matched-fixed-cost — excluded from dynamic budget (fixedCost='{matchedFc!.Name}' id={matchedFc.Id})";
+                totalFixedCostMatches++;
+            }
+            else if (tx.BudgetAppliedAmount.HasValue)
+            {
+                effect = -tx.BudgetAppliedAmount.Value;
+                reason = tx.Pending
+                    ? $"pending-variable-spend (budgetApplied={tx.BudgetAppliedAmount.Value:0.00})"
+                    : $"variable-spend (budgetApplied={tx.BudgetAppliedAmount.Value:0.00})";
+                totalVariableSpend++;
+            }
+            else
+            {
+                effect = 0m;
+                string noImpactDetail =
+                    tx.Pending ? "pending — no budget impact recorded yet" :
+                    isConsideredRecurring ? "matched fixed-cost but BudgetAppliedAmount already null" :
+                    "no budget impact (not a deposit, not variable spend)";
+                reason = $"no-impact: {noImpactDetail}";
+                totalNoImpact++;
+            }
+
+            decimal balanceBefore = runningBalance;
+            runningBalance += effect;
+            decimal balanceAfter = runningBalance;
+
+            // ── Matched fixed cost summary (no access tokens) ─────────────────
+            object? matchedFcSummary = matchedFc == null ? null : new
+            {
+                id = matchedFc.Id,
+                name = matchedFc.Name,
+                amount = matchedFc.Amount,
+                category = matchedFc.Category,
+                type = matchedFc.Type,
+                nextDueDate = matchedFc.NextDueDate?.ToString("yyyy-MM-dd"),
+                plaidMerchantName = matchedFc.PlaidMerchantName,
+                plaidAccountId = matchedFc.PlaidAccountId
+            };
+
+            auditRows.Add(new
+            {
+                // ── Identity ──
+                id = tx.Id,
+                plaidTransactionId = tx.PlaidTransactionId,
+                name = tx.Name,
+                merchantName = tx.MerchantName,
+                amount = tx.Amount,
+                accountId = tx.AccountId,
+
+                // ── Timing / status ──
+                date = tx.Date.ToString("yyyy-MM-dd"),
+                pending = tx.Pending,
+                createdAt = tx.CreatedAt.ToString("O"),
+                updatedAt = tx.UpdatedAt.ToString("O"),
+                isBeforeUserRegistration,
+
+                // ── Decision flags ──
+                suggestedKind = tx.SuggestedKind.ToString(),
+                userDecision = tx.UserDecision.ToString(),
+                countedAsIncome = tx.CountedAsIncome,
+                isLargeExpenseCandidate = tx.IsLargeExpenseCandidate,
+                largeExpenseHandled = tx.LargeExpenseHandled,
+                isSuspiciousHold = tx.IsSuspiciousHold,
+                holdReviewed = tx.HoldReviewed,
+                holdOverrideAmount = tx.HoldOverrideAmount,
+                budgetAppliedAmount = tx.BudgetAppliedAmount,
+
+                // ── Classification ──
+                isConsideredDeposit,
+                isConsideredVariableSpend = !isConsideredDeposit && tx.BudgetAppliedAmount.HasValue,
+                isConsideredLargeExpense,
+                isConsideredRecurring,
+                matchedFixedCost = matchedFcSummary,
+
+                // ── Balance reconstruction ──
+                balanceBefore = Math.Round(balanceBefore, 2),
+                effect = Math.Round(effect, 2),
+                balanceAfter = Math.Round(balanceAfter, 2),
+                reason,
+                reconstructionNote = "reconstructed-estimate — excludes onboarding initial balance; see impliedInitialBalance in summary"
+            });
+        }
+
+        // ── 7. Build summary ──────────────────────────────────────────────────
+        decimal storedBalance = balance?.BalanceAmount ?? 0m;
+        decimal netTransactionEffect = Math.Round(runningBalance, 2);
+        // impliedInitial = what the balance must have been right after onboarding
+        // for the stored balance to be correct:
+        //   storedBalance = impliedInitial + netTransactionEffect
+        //   impliedInitial = storedBalance - netTransactionEffect
+        decimal impliedInitialBalance = Math.Round(storedBalance - netTransactionEffect, 2);
+
+        var summary = new
+        {
+            totalTransactions = transactions.Count,
+            totalPending,
+            totalPosted,
+            totalBeforeUserRegistration = totalBeforeReg,
+            totalDepositsCountedAsIncome,
+            totalVariableSpend,
+            totalFixedCostMatches,
+            totalLargeExpenseHandled,
+            totalNoImpact,
+            netTransactionEffect,
+            storedBalance,
+            impliedInitialBalance,
+            reconstructedEndingBalanceFromTransactionsOnly = netTransactionEffect,
+            storedVsReconstructedDiff = Math.Round(storedBalance - netTransactionEffect, 2),
+            balanceLastUpdated = balance?.UpdatedAt.ToString("O") ?? "(no balance record)",
+            reconstructionLimitations = new[]
+            {
+                "1. The initial onboarding balance (set by /api/budget/finalize) is not stored in transaction history. " +
+                "impliedInitialBalance = storedBalance - netTransactionEffect.",
+                "2. Transactions removed by Plaid are hard-deleted. Their reversed impact is not visible here. " +
+                "This can cause storedVsReconstructedDiff to be non-zero.",
+                "3. Large-expense refunds are estimated: effect = Amount - BudgetAppliedAmount. " +
+                "If the user changed a decision multiple times, the balance history is not reconstructable."
+            }
+        };
+
+        return Results.Ok(new
+        {
+            generatedAt = DateTime.UtcNow.ToString("O"),
+            user = new
+            {
+                id = user.Id,
+                email = user.Email,
+                name = user.Name,
+                createdAt = user.CreatedAt.ToString("O"),
+                onboardingComplete = user.OnboardingComplete,
+                payDay1 = user.PayDay1,
+                payDay2 = user.PayDay2,
+                expectedPaycheckAmount = user.ExpectedPaycheckAmount,
+                debtPerPaycheck = user.DebtPerPaycheck
+                // firebaseUuid intentionally omitted
+            },
+            summary,
+            transactions = auditRows
+        });
+    })
+    .WithName("TransactionBalanceAudit");
+
 app.Lifetime.ApplicationStarted.Register(() =>
 {
     SentrySdk.AddBreadcrumb("BOOT: ApplicationStarted fired", level: BreadcrumbLevel.Info);
