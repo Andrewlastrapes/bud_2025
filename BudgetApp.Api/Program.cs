@@ -2607,61 +2607,106 @@ app.MapGet("/api/admin/debug/users/{userId}/transaction-balance-audit",
         // ── 8. Simple format branch ───────────────────────────────────────────
         if (string.Equals(format, "simple", StringComparison.OrdinalIgnoreCase))
         {
-            // Apply from/to date range first (balance already accumulated for all rows)
-            var windowedRows = simpleRowsData.AsEnumerable();
-            if (fromDate.HasValue)
-                windowedRows = windowedRows.Where(r =>
-                    DateOnly.FromDateTime(r.Date.Date) >= fromDate.Value);
-            if (toDate.HasValue)
-                windowedRows = windowedRows.Where(r =>
-                    DateOnly.FromDateTime(r.Date.Date) <= toDate.Value);
-
-            var windowedList = windowedRows.ToList();
-
-            // Counts of rows that WOULD be hidden — computed inside the date window
-            int hiddenBeforeReg = !includeBeforeRegistration
-                ? windowedList.Count(r => r.IsBeforeUserRegistration)
-                : 0;
-            int hiddenNoImpact = !includeNoImpact
-                ? windowedList.Count(r => r.Effect == 0m && !r.IsBeforeUserRegistration)
-                : 0;
-
-            // Apply hide filters
-            var displayedRows = windowedList.AsEnumerable();
-            if (!includeBeforeRegistration)
-                displayedRows = displayedRows.Where(r => !r.IsBeforeUserRegistration);
-            if (!includeNoImpact)
-                displayedRows = displayedRows.Where(r => r.Effect != 0m);
-
-            var simpleList = displayedRows.ToList();
-
-            var simpleRows = simpleList.Select(r => new
+            try
             {
-                user = user.Email,
-                preTransactionDynamicBudget = Usd(r.BalanceBefore),
-                date = r.Date.ToString("MM/dd/yyyy"),
-                vendor = r.MerchantName ?? (string.IsNullOrEmpty(r.Name) ? "Unknown vendor" : r.Name),
-                charge = Usd(r.Amount),
-                status = r.Pending ? "Pending" : "Complete",
-                isRecurring = r.IsConsideredRecurring,
-                postTransactionDynamicBudget = Usd(r.BalanceAfter),
-                reason = r.Reason
-            }).ToList();
+                // Apply from/to date range first (balance already accumulated for ALL rows,
+                // so preTransactionDynamicBudget is correct even for the first row in range)
+                var windowedRows = simpleRowsData.AsEnumerable();
+                if (fromDate.HasValue)
+                    windowedRows = windowedRows.Where(r =>
+                        DateOnly.FromDateTime(r.Date.Date) >= fromDate.Value);
+                if (toDate.HasValue)
+                    windowedRows = windowedRows.Where(r =>
+                        DateOnly.FromDateTime(r.Date.Date) <= toDate.Value);
 
-            return Results.Ok(new
-            {
-                generatedAt = DateTime.UtcNow.ToString("O"),
-                user = user.Email,
-                summary = new
+                var windowedList = windowedRows.ToList();
+
+                // Hidden counts computed inside the date window, before the hide filters
+                int hiddenBeforeReg = !includeBeforeRegistration
+                    ? windowedList.Count(r => r.IsBeforeUserRegistration)
+                    : 0;
+                int hiddenNoImpact = !includeNoImpact
+                    ? windowedList.Count(r => r.Effect == 0m && !r.IsBeforeUserRegistration)
+                    : 0;
+
+                // Apply hide filters
+                var displayedRows = windowedList.AsEnumerable();
+                if (!includeBeforeRegistration)
+                    displayedRows = displayedRows.Where(r => !r.IsBeforeUserRegistration);
+                if (!includeNoImpact)
+                    displayedRows = displayedRows.Where(r => r.Effect != 0m);
+
+                var simpleList = displayedRows.ToList();
+
+                // ── Empty-result guard: return 200 with null budgets, no transactions ──
+                if (simpleList.Count == 0)
                 {
-                    transactionCount = simpleList.Count,
-                    startingDynamicBudget = simpleList.Count > 0 ? Usd(simpleList.First().BalanceBefore) : Usd(0m),
-                    endingDynamicBudget = simpleList.Count > 0 ? Usd(simpleList.Last().BalanceAfter) : Usd(0m),
-                    hiddenBeforeRegistrationCount = hiddenBeforeReg,
-                    hiddenNoImpactCount = hiddenNoImpact
-                },
-                transactions = simpleRows
-            });
+                    return Results.Ok(new
+                    {
+                        generatedAt = DateTime.UtcNow.ToString("O"),
+                        user = user.Email,
+                        summary = new
+                        {
+                            transactionCount = 0,
+                            startingDynamicBudget = (string?)null,
+                            endingDynamicBudget = (string?)null,
+                            hiddenBeforeRegistrationCount = hiddenBeforeReg,
+                            hiddenNoImpactCount = hiddenNoImpact
+                        },
+                        transactions = Array.Empty<object>()
+                    });
+                }
+
+                // simpleList.Count > 0 from here — First() and Last() are safe
+                var simpleRows = simpleList.Select(r => new
+                {
+                    user = user.Email,
+                    preTransactionDynamicBudget = Usd(r.BalanceBefore),
+                    date = r.Date.ToString("MM/dd/yyyy"),
+                    vendor = r.MerchantName ?? (string.IsNullOrEmpty(r.Name) ? "Unknown vendor" : r.Name),
+                    charge = Usd(r.Amount),
+                    status = r.Pending ? "Pending" : "Complete",
+                    isRecurring = r.IsConsideredRecurring,
+                    postTransactionDynamicBudget = Usd(r.BalanceAfter),
+                    reason = r.Reason
+                }).ToList();
+
+                return Results.Ok(new
+                {
+                    generatedAt = DateTime.UtcNow.ToString("O"),
+                    user = user.Email,
+                    summary = new
+                    {
+                        transactionCount = simpleList.Count,
+                        startingDynamicBudget = Usd(simpleList.First().BalanceBefore),
+                        endingDynamicBudget = Usd(simpleList.Last().BalanceAfter),
+                        hiddenBeforeRegistrationCount = hiddenBeforeReg,
+                        hiddenNoImpactCount = hiddenNoImpact
+                    },
+                    transactions = simpleRows
+                });
+            }
+            catch (Exception simpleEx)
+            {
+                SentrySdk.CaptureMessage(
+                    $"audit simple-format error: userId={userId} " +
+                    $"from={from ?? "(null)"} to={to ?? "(null)"}: " +
+                    $"{simpleEx.GetType().Name}: {simpleEx.Message}",
+                    scope =>
+                    {
+                        scope.Level = SentryLevel.Error;
+                        scope.SetTag("event.type", "audit_simple_format_error");
+                        scope.SetTag("audit.userId", userId.ToString());
+                        scope.SetExtra("audit.from", from ?? "(null)");
+                        scope.SetExtra("audit.to", to ?? "(null)");
+                        scope.SetExtra("audit.includeBeforeRegistration", includeBeforeRegistration);
+                        scope.SetExtra("audit.includeNoImpact", includeNoImpact);
+                    });
+
+                return Results.Problem(
+                    $"Error generating simple audit (userId={userId}): " +
+                    $"{simpleEx.GetType().Name}. Check Sentry event.type=audit_simple_format_error.");
+            }
         }
 
         // ── 9. Full / debug format (default) ─────────────────────────────────
