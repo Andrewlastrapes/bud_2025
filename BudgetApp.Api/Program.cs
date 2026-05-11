@@ -14,6 +14,7 @@ using System.Linq;
 using FirebaseAdmin.Auth;
 using System.Text;
 using System.Text.Json;
+using System.Globalization;
 using Npgsql;
 using Sentry;
 
@@ -2304,7 +2305,12 @@ app.MapGet("/api/debt/snapshot", async (ApiDbContext dbContext, PlaidClient plai
 // Returns 401 if header is missing, wrong, or if no secret is configured.
 // ─────────────────────────────────────────────────────────────────────────────
 app.MapGet("/api/admin/debug/users/{userId}/transaction-balance-audit",
-    async (int userId, HttpContext httpContext, ApiDbContext dbContext, IConfiguration config) =>
+    async (int userId, HttpContext httpContext, ApiDbContext dbContext, IConfiguration config,
+           string? format,
+           string? from,
+           string? to,
+           bool includeBeforeRegistration = false,
+           bool includeNoImpact = false) =>
     {
         // ── 1. Security gate ──────────────────────────────────────────────────
         var configuredSecret =
@@ -2319,6 +2325,35 @@ app.MapGet("/api/admin/debug/users/{userId}/transaction-balance-audit",
         if (string.IsNullOrWhiteSpace(providedSecret) ||
             !string.Equals(providedSecret, configuredSecret, StringComparison.Ordinal))
             return Results.Unauthorized();
+
+        // ── 1b. Parse from/to date filters ────────────────────────────────────
+        // Both are optional YYYY-MM-DD inclusive bounds. Invalid values → 400.
+        DateOnly? fromDate = null;
+        DateOnly? toDate = null;
+
+        if (!string.IsNullOrEmpty(from))
+        {
+            if (!DateOnly.TryParseExact(from, "yyyy-MM-dd",
+                    System.Globalization.CultureInfo.InvariantCulture,
+                    System.Globalization.DateTimeStyles.None, out var parsedFrom))
+                return Results.BadRequest(new
+                {
+                    error = $"Invalid 'from' value '{from}'. Expected YYYY-MM-DD (e.g. 2026-05-01)."
+                });
+            fromDate = parsedFrom;
+        }
+
+        if (!string.IsNullOrEmpty(to))
+        {
+            if (!DateOnly.TryParseExact(to, "yyyy-MM-dd",
+                    System.Globalization.CultureInfo.InvariantCulture,
+                    System.Globalization.DateTimeStyles.None, out var parsedTo))
+                return Results.BadRequest(new
+                {
+                    error = $"Invalid 'to' value '{to}'. Expected YYYY-MM-DD (e.g. 2026-05-31)."
+                });
+            toDate = parsedTo;
+        }
 
         // ── 2. Load user ──────────────────────────────────────────────────────
         var user = await dbContext.Users.FirstOrDefaultAsync(u => u.Id == userId);
@@ -2345,9 +2380,14 @@ app.MapGet("/api/admin/debug/users/{userId}/transaction-balance-audit",
         // Running balance starts at $0. The onboarding balance is NOT included
         // because it is not recorded in the transaction history. We derive the
         // implied initial balance from: storedBalance - netTransactionEffect.
+        // USD formatter used by the simple format branch.
+        static string Usd(decimal v) =>
+            v.ToString("C2", CultureInfo.GetCultureInfo("en-US"));
+
         decimal runningBalance = 0m;
 
         var auditRows = new List<object>();
+        var simpleRowsData = new List<AuditSimpleRowData>();
 
         int totalPending = 0;
         int totalPosted = 0;
@@ -2463,6 +2503,13 @@ app.MapGet("/api/admin/debug/users/{userId}/transaction-balance-audit",
             runningBalance += effect;
             decimal balanceAfter = runningBalance;
 
+            // ── Parallel simple-format row ────────────────────────────────────
+            simpleRowsData.Add(new AuditSimpleRowData(
+                tx.Id, tx.Date, tx.MerchantName, tx.Name ?? string.Empty,
+                tx.Amount, tx.Pending, isBeforeUserRegistration, isConsideredRecurring,
+                Math.Round(balanceBefore, 2), Math.Round(effect, 2), Math.Round(balanceAfter, 2),
+                reason));
+
             // ── Matched fixed cost summary (no access tokens) ─────────────────
             object? matchedFcSummary = matchedFc == null ? null : new
             {
@@ -2557,6 +2604,67 @@ app.MapGet("/api/admin/debug/users/{userId}/transaction-balance-audit",
             }
         };
 
+        // ── 8. Simple format branch ───────────────────────────────────────────
+        if (string.Equals(format, "simple", StringComparison.OrdinalIgnoreCase))
+        {
+            // Apply from/to date range first (balance already accumulated for all rows)
+            var windowedRows = simpleRowsData.AsEnumerable();
+            if (fromDate.HasValue)
+                windowedRows = windowedRows.Where(r =>
+                    DateOnly.FromDateTime(r.Date.Date) >= fromDate.Value);
+            if (toDate.HasValue)
+                windowedRows = windowedRows.Where(r =>
+                    DateOnly.FromDateTime(r.Date.Date) <= toDate.Value);
+
+            var windowedList = windowedRows.ToList();
+
+            // Counts of rows that WOULD be hidden — computed inside the date window
+            int hiddenBeforeReg = !includeBeforeRegistration
+                ? windowedList.Count(r => r.IsBeforeUserRegistration)
+                : 0;
+            int hiddenNoImpact = !includeNoImpact
+                ? windowedList.Count(r => r.Effect == 0m && !r.IsBeforeUserRegistration)
+                : 0;
+
+            // Apply hide filters
+            var displayedRows = windowedList.AsEnumerable();
+            if (!includeBeforeRegistration)
+                displayedRows = displayedRows.Where(r => !r.IsBeforeUserRegistration);
+            if (!includeNoImpact)
+                displayedRows = displayedRows.Where(r => r.Effect != 0m);
+
+            var simpleList = displayedRows.ToList();
+
+            var simpleRows = simpleList.Select(r => new
+            {
+                user = user.Email,
+                preTransactionDynamicBudget = Usd(r.BalanceBefore),
+                date = r.Date.ToString("MM/dd/yyyy"),
+                vendor = r.MerchantName ?? (string.IsNullOrEmpty(r.Name) ? "Unknown vendor" : r.Name),
+                charge = Usd(r.Amount),
+                status = r.Pending ? "Pending" : "Complete",
+                isRecurring = r.IsConsideredRecurring,
+                postTransactionDynamicBudget = Usd(r.BalanceAfter),
+                reason = r.Reason
+            }).ToList();
+
+            return Results.Ok(new
+            {
+                generatedAt = DateTime.UtcNow.ToString("O"),
+                user = user.Email,
+                summary = new
+                {
+                    transactionCount = simpleList.Count,
+                    startingDynamicBudget = simpleList.Count > 0 ? Usd(simpleList.First().BalanceBefore) : Usd(0m),
+                    endingDynamicBudget = simpleList.Count > 0 ? Usd(simpleList.Last().BalanceAfter) : Usd(0m),
+                    hiddenBeforeRegistrationCount = hiddenBeforeReg,
+                    hiddenNoImpactCount = hiddenNoImpact
+                },
+                transactions = simpleRows
+            });
+        }
+
+        // ── 9. Full / debug format (default) ─────────────────────────────────
         return Results.Ok(new
         {
             generatedAt = DateTime.UtcNow.ToString("O"),
@@ -2610,3 +2718,22 @@ public record MarkRecurringFromTransactionRequest(
 
 
 public record RegisterDeviceRequest(string ExpoPushToken, string? Platform);
+
+/// <summary>
+/// Typed row used by the simple format branch of the transaction-balance-audit endpoint.
+/// Avoids anonymous-type boxing issues when filtering/mapping after the main audit loop.
+/// </summary>
+internal record AuditSimpleRowData(
+    int Id,
+    DateTime Date,
+    string? MerchantName,
+    string Name,
+    decimal Amount,
+    bool Pending,
+    bool IsBeforeUserRegistration,
+    bool IsConsideredRecurring,
+    decimal BalanceBefore,
+    decimal Effect,
+    decimal BalanceAfter,
+    string Reason
+);
