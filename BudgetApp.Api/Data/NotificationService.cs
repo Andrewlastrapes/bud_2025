@@ -12,6 +12,18 @@ namespace BudgetApp.Api.Services;
 public interface INotificationService
 {
     Task SendNewTransactionNotification(Transaction tx, decimal dynamicBalance, string? userEmail);
+
+    /// <summary>
+    /// Sends a notification for a transaction that was classified as a recurring/fixed-cost match
+    /// and therefore did NOT reduce the dynamic budget. The user can tap to override.
+    /// </summary>
+    Task SendRecurringTransactionNotification(
+        Transaction tx,
+        int? matchedFixedCostId,
+        string? matchedFixedCostName,
+        decimal currentBalance,
+        string? userEmail);
+
     Task SendGenericNotificationForUser(int userId, string title, string body, object? data = null);
 }
 
@@ -86,26 +98,26 @@ public class ExpoNotificationService : INotificationService
 
         if (tx.SuggestedKind == TransactionSuggestedKind.Paycheck)
         {
-            type  = "deposit";
+            type = "deposit";
             title = "New paycheck detected";
-            body  =
+            body =
                 $"Your Period Spend Limit is currently ${dynamicBalance:0.00}. " +
                 "Tap to decide how to use this deposit.";
         }
         else if (tx.IsLargeExpenseCandidate && !tx.LargeExpenseHandled)
         {
-            type  = "large-expense";
+            type = "large-expense";
             title = "Large purchase spotted";
-            body  =
+            body =
                 $"${tx.Amount:0.00} at {tx.MerchantName ?? tx.Name}. " +
                 $"Period Spend Limit is now ${dynamicBalance:0.00}. " +
                 "Tap to choose: pay from savings, convert to fixed cost, or treat as normal spend.";
         }
         else
         {
-            type  = "spend";
+            type = "spend";
             title = $"New charge: {tx.MerchantName ?? tx.Name}";
-            body  =
+            body =
                 $"-${tx.Amount:0.00}. Period Spend Limit is now ${dynamicBalance:0.00}. " +
                 "Tap to mark this as a recurring bill or review your spending.";
         }
@@ -159,14 +171,14 @@ public class ExpoNotificationService : INotificationService
 
         var payloads = userDevices.Select(d => new
         {
-            to    = d.ExpoPushToken,
+            to = d.ExpoPushToken,
             sound = "default",
             title,
             body,
-            data  = new
+            data = new
             {
                 type,
-                transactionId  = tx.Id,
+                transactionId = tx.Id,
                 dynamicBalance,
                 canMarkRecurring
             }
@@ -174,7 +186,102 @@ public class ExpoNotificationService : INotificationService
 
         await PostToExpoAsync(
             payloads,
-            txId:      tx.Id,
+            txId: tx.Id,
+            plaidTxId: tx.PlaidTransactionId,
+            userEmail: userEmail);
+    }
+
+    public async Task SendRecurringTransactionNotification(
+        Transaction tx,
+        int? matchedFixedCostId,
+        string? matchedFixedCostName,
+        decimal currentBalance,
+        string? userEmail)
+    {
+        _logger.LogInformation(
+            "SendRecurringTransactionNotification: txId={TxId} userId={UserId} " +
+            "notificationType=recurring_transaction_detected " +
+            "amount={Amount} balanceAfterTransaction={Balance} " +
+            "matchedFixedCostId={FixedCostId}",
+            tx.Id, tx.UserId, tx.Amount, currentBalance,
+            matchedFixedCostId?.ToString() ?? "(none)");
+
+        SentrySdk.AddBreadcrumb(
+            $"Recurring notification attempt: txId={tx.Id} userId={tx.UserId} " +
+            $"notificationType=recurring_transaction_detected " +
+            $"amount={tx.Amount} balanceAfterTransaction={currentBalance} " +
+            $"matchedFixedCostId={matchedFixedCostId?.ToString() ?? "(none)"}",
+            level: BreadcrumbLevel.Info);
+
+        var userDevices = await _dbContext.UserDevices
+            .Where(d => d.UserId == tx.UserId && d.IsActive)
+            .ToListAsync();
+
+        if (!userDevices.Any())
+        {
+            _logger.LogWarning(
+                "Recurring notification skipped — no active devices: " +
+                "txId={TxId} userId={UserId} skipReason=no_active_devices",
+                tx.Id, tx.UserId);
+            return;
+        }
+
+        var merchantOrName = tx.MerchantName ?? tx.Name ?? "Unknown";
+        var emailPrefix = string.IsNullOrWhiteSpace(userEmail) ? "unknown@email" : userEmail;
+
+        var title = $"{emailPrefix} | {merchantOrName} matched your recurring bills";
+        var body =
+            $"${tx.Amount:0.00} was treated as recurring and did not reduce your " +
+            "Period Spend Limit. Tap if this should count as regular spending instead.";
+
+        _logger.LogInformation(
+            "Recurring notification payload built: txId={TxId} notificationType=recurring_transaction_detected " +
+            "matchedFixedCostId={FixedCostId} matchedFixedCostName={FixedCostName} " +
+            "balanceAfterTransaction={Balance} deviceCount={DeviceCount}",
+            tx.Id, matchedFixedCostId?.ToString() ?? "(none)",
+            matchedFixedCostName ?? "(none)", currentBalance, userDevices.Count);
+
+        SentrySdk.CaptureMessage(
+            $"Recurring notification sent: txId={tx.Id} userId={tx.UserId} " +
+            $"notificationType=recurring_transaction_detected " +
+            $"matchedFixedCostId={matchedFixedCostId?.ToString() ?? "(none)"} " +
+            $"balanceAfterTransaction={currentBalance}",
+            scope =>
+            {
+                scope.Level = SentryLevel.Info;
+                scope.SetTag("notification.type", "recurring_transaction_detected");
+                scope.SetExtra("txId", tx.Id);
+                scope.SetExtra("notificationType", "recurring_transaction_detected");
+                scope.SetExtra("amount", tx.Amount);
+                scope.SetExtra("balanceAfterTransaction", currentBalance);
+                scope.SetExtra("matchedFixedCostId", matchedFixedCostId?.ToString() ?? "(none)");
+                scope.SetExtra("matchedFixedCostName", matchedFixedCostName ?? "(none)");
+                scope.SetExtra("deviceCount", userDevices.Count);
+            });
+
+        var payloads = userDevices.Select(d => new
+        {
+            to = d.ExpoPushToken,
+            sound = "default",
+            title,
+            body,
+            data = new
+            {
+                type = "recurring_transaction_detected",
+                transactionId = tx.Id,
+                transactionName = tx.Name,
+                merchantName = tx.MerchantName,
+                amount = tx.Amount,
+                fixedCostId = matchedFixedCostId,
+                fixedCostName = matchedFixedCostName,
+                dynamicBalance = currentBalance,
+                action = "review_recurring_match"
+            }
+        });
+
+        await PostToExpoAsync(
+            payloads,
+            txId: tx.Id,
             plaidTxId: tx.PlaidTransactionId,
             userEmail: userEmail);
     }
@@ -203,7 +310,7 @@ public class ExpoNotificationService : INotificationService
 
         var payloads = userDevices.Select(d => new
         {
-            to    = d.ExpoPushToken,
+            to = d.ExpoPushToken,
             sound = "default",
             title,
             body,

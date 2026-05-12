@@ -215,9 +215,21 @@ namespace BudgetApp.Api.Services
 
                 decimal balanceDelta = 0m;
 
+                // ── Load balance record early for per-transaction notification balance ──
+                // Needed to pass the correct post-transaction balance to each notification,
+                // not the final post-batch balance.
+                var balanceRecord = await _dbContext.Balances
+                    .FirstOrDefaultAsync(b => b.UserId == user.Id);
+                decimal notifyRunningBalance = balanceRecord?.BalanceAmount ?? 0m;
+
                 // Transactions eligible for notifications are collected here and
                 // dispatched AFTER SaveChanges so they have valid IDs.
-                var notifyQueue = new List<Transaction>();
+                // Each entry stores the transaction and the balance immediately after it was applied.
+                var notifyQueue = new List<(Transaction tx, decimal balanceAfterTx)>();
+
+                // Recurring/fixed-cost matches: no budget impact but user can override.
+                // Each entry stores the balance at the time the transaction was classified.
+                var recurringNotifyQueue = new List<(Transaction tx, int? fixedCostId, string? fixedCostName, decimal balanceAfterTx)>();
 
                 // Cutoff: the transaction's real date (Plaid Date field, in the transaction's
                 // local timezone — effectively Eastern for US accounts) must be on or after
@@ -279,6 +291,7 @@ namespace BudgetApp.Api.Services
                         if (existing.BudgetAppliedAmount.HasValue && existing.BudgetAppliedAmount.Value != 0)
                         {
                             balanceDelta += existing.BudgetAppliedAmount.Value;
+                            notifyRunningBalance += existing.BudgetAppliedAmount.Value;
                         }
 
                         _dbContext.Transactions.Remove(existing);
@@ -315,6 +328,7 @@ namespace BudgetApp.Api.Services
                         {
                             decimal delta = existing.BudgetAppliedAmount.Value - newAbs;
                             balanceDelta += delta;
+                            notifyRunningBalance += delta;
                             existing.BudgetAppliedAmount = newAbs;
                         }
 
@@ -403,6 +417,11 @@ namespace BudgetApp.Api.Services
                             LargeExpenseHandled = false
                         };
 
+                        // Outer-scope variables so the notification eligibility block
+                        // (which is outside the isCredit/isFixed branches) can use them.
+                        FixedCost? matchedFcForNotification = null;
+                        bool isFixedCostMatch = false;
+
                         if (isCredit)
                         {
                             var ctx = new DepositContext
@@ -430,10 +449,18 @@ namespace BudgetApp.Api.Services
 
                             if (isFixed)
                             {
+                                matchedFcForNotification = fixedCosts.FirstOrDefault(fc =>
+                                    !string.IsNullOrEmpty(fc.PlaidMerchantName) &&
+                                    fc.PlaidMerchantName.Equals(merchantName, StringComparison.OrdinalIgnoreCase));
+                                isFixedCostMatch = true;
+
                                 _logger.LogInformation(
                                     "Transaction is a known fixed cost (no budget impact): " +
-                                    "plaidTxId={PlaidTxId} merchant={Merchant}",
-                                    t.TransactionId, merchantName);
+                                    "plaidTxId={PlaidTxId} merchant={Merchant} " +
+                                    "matchedFixedCostId={FixedCostId} matchedFixedCostName={FixedCostName}",
+                                    t.TransactionId, merchantName,
+                                    matchedFcForNotification?.Id.ToString() ?? "(none)",
+                                    matchedFcForNotification?.Name ?? "(none)");
                             }
                             else
                             {
@@ -452,6 +479,7 @@ namespace BudgetApp.Api.Services
 
                                 newTx.BudgetAppliedAmount = absAmount;
                                 balanceDelta -= absAmount;
+                                notifyRunningBalance -= absAmount;
 
                                 if (user.ExpectedPaycheckAmount > 0 &&
                                     _budgetEngine.IsLargeExpense(absAmount, user.ExpectedPaycheckAmount))
@@ -569,12 +597,27 @@ namespace BudgetApp.Api.Services
 
                         if (notifyEligible)
                         {
-                            notifyQueue.Add(newTx);
-                            _logger.LogInformation(
-                                "Transaction queued for notification: " +
-                                "plaidTxId={PlaidTxId} merchant={Merchant} amount={Amount} " +
-                                "itemId={ItemId}",
-                                t.TransactionId, merchantName, absAmount, itemId);
+                            if (isFixedCostMatch)
+                            {
+                                recurringNotifyQueue.Add((newTx, matchedFcForNotification?.Id, matchedFcForNotification?.Name, notifyRunningBalance));
+                                _logger.LogInformation(
+                                    "Transaction queued for recurring notification: " +
+                                    "plaidTxId={PlaidTxId} merchant={Merchant} amount={Amount} " +
+                                    "matchedFixedCostId={FixedCostId} balanceAtClassification={Balance} itemId={ItemId}",
+                                    t.TransactionId, merchantName, absAmount,
+                                    matchedFcForNotification?.Id.ToString() ?? "(none)",
+                                    notifyRunningBalance, itemId);
+                            }
+                            else
+                            {
+                                notifyQueue.Add((newTx, notifyRunningBalance));
+                                _logger.LogInformation(
+                                    "Transaction queued for notification: " +
+                                    "plaidTxId={PlaidTxId} merchant={Merchant} amount={Amount} " +
+                                    "balanceAfterTx={BalanceAfterTx} itemId={ItemId}",
+                                    t.TransactionId, merchantName, absAmount,
+                                    notifyRunningBalance, itemId);
+                            }
                         }
                         else
                         {
@@ -596,8 +639,7 @@ namespace BudgetApp.Api.Services
                 }
 
                 // ── 6. Apply net balance delta ─────────────────────────────────────────
-                var balanceRecord = await _dbContext.Balances
-                    .FirstOrDefaultAsync(b => b.UserId == user.Id);
+                // (balanceRecord was loaded earlier for per-transaction notification balance tracking)
 
                 if (balanceDelta != 0m && balanceRecord != null)
                 {
@@ -774,37 +816,31 @@ namespace BudgetApp.Api.Services
                     });
 
                 // ── 9. Fire push notifications ─────────────────────────────────────────
-                if (notifyQueue.Count == 0)
-                {
-                    _logger.LogInformation(
-                        "No notifications to send: itemId={ItemId} webhookCode={WebhookCode} " +
-                        "userEmail={UserEmail}",
-                        itemId, webhookCode ?? "(manual)", user.Email);
-                }
-                else
-                {
-                    _logger.LogInformation(
-                        "Firing {Count} notification(s): itemId={ItemId} webhookCode={WebhookCode} " +
-                        "userEmail={UserEmail}",
-                        notifyQueue.Count, itemId, webhookCode ?? "(manual)", user.Email);
-                }
+                _logger.LogInformation(
+                    "Notifications to send: itemId={ItemId} webhookCode={WebhookCode} " +
+                    "userEmail={UserEmail} variableSpendCount={VarCount} recurringMatchCount={RecurringCount}",
+                    itemId, webhookCode ?? "(manual)", user.Email,
+                    notifyQueue.Count, recurringNotifyQueue.Count);
 
-                foreach (var tx in notifyQueue)
+                // ── 9a. Variable-spend / deposit / large-expense notifications ─────────
+                // Each notification uses the balance captured at the moment the transaction
+                // was applied — not the final post-batch balance.
+                foreach (var (tx, balanceAfterTx) in notifyQueue)
                 {
                     _logger.LogInformation(
                         "Sending notification: txId={TxId} plaidTxId={PlaidTxId} " +
-                        "merchant={Merchant} amount={Amount} " +
-                        "userId={UserId} userEmail={UserEmail} itemId={ItemId} " +
+                        "merchant={Merchant} amount={Amount} balanceAfterTransaction={Balance} " +
+                        "notificationType=spend userId={UserId} userEmail={UserEmail} itemId={ItemId} " +
                         "webhookCode={WebhookCode}",
                         tx.Id, tx.PlaidTransactionId,
-                        tx.MerchantName ?? tx.Name, tx.Amount,
+                        tx.MerchantName ?? tx.Name, tx.Amount, balanceAfterTx,
                         user.Id, user.Email, itemId,
                         webhookCode ?? "(manual)");
 
                     try
                     {
                         await _notificationService
-                            .SendNewTransactionNotification(tx, currentDynamicBalance, user.Email);
+                            .SendNewTransactionNotification(tx, balanceAfterTx, user.Email);
                     }
                     catch (Exception ex)
                     {
@@ -816,12 +852,44 @@ namespace BudgetApp.Api.Services
                     }
                 }
 
+                // ── 9b. Recurring / fixed-cost match notifications ────────────────────
+                // Balance shown is the balance at the moment the transaction was classified
+                // (before any subsequent variable-spend transactions in this batch).
+                foreach (var (tx, fixedCostId, fixedCostName, balanceAfterTx) in recurringNotifyQueue)
+                {
+                    _logger.LogInformation(
+                        "Sending recurring notification: txId={TxId} plaidTxId={PlaidTxId} " +
+                        "merchant={Merchant} amount={Amount} balanceAfterTransaction={Balance} " +
+                        "notificationType=recurring_transaction_detected " +
+                        "matchedFixedCostId={FixedCostId} userId={UserId} userEmail={UserEmail} itemId={ItemId}",
+                        tx.Id, tx.PlaidTransactionId,
+                        tx.MerchantName ?? tx.Name, tx.Amount, balanceAfterTx,
+                        fixedCostId?.ToString() ?? "(none)",
+                        user.Id, user.Email, itemId);
+
+                    try
+                    {
+                        await _notificationService.SendRecurringTransactionNotification(
+                            tx, fixedCostId, fixedCostName, balanceAfterTx, user.Email);
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogError(ex,
+                            "Recurring notification send failed: txId={TxId} plaidTxId={PlaidTxId} " +
+                            "userEmail={UserEmail} itemId={ItemId}",
+                            tx.Id, tx.PlaidTransactionId, user.Email, itemId);
+                        SentrySdk.CaptureException(ex);
+                    }
+                }
+
                 var syncDuration = DateTime.UtcNow - syncStartedAt;
                 _logger.LogInformation(
                     "Sync finished: itemId={ItemId} webhookCode={WebhookCode} userEmail={UserEmail} " +
-                    "durationMs={DurationMs} notificationsSent={NotificationsSent}",
+                    "durationMs={DurationMs} variableSpendNotificationsSent={VarCount} " +
+                    "recurringNotificationsSent={RecurringCount}",
                     itemId, webhookCode ?? "(manual)", user.Email,
-                    (int)syncDuration.TotalMilliseconds, notifyQueue.Count);
+                    (int)syncDuration.TotalMilliseconds,
+                    notifyQueue.Count, recurringNotifyQueue.Count);
 
                 return response;
             }
