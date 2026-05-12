@@ -334,7 +334,7 @@ app.MapPost("/api/plaid/create_link_token", async (PlaidClient plaidClient, ICon
 
     var plaidRequest = new LinkTokenCreateRequest
     {
-        ClientName = "Dynamic Budget App",
+        ClientName = "NearPath",
         Language = Language.English,
         CountryCodes = countryCodes,
         User = user,

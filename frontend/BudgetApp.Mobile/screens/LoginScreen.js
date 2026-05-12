@@ -1,17 +1,17 @@
-import React, { useState, useEffect } from 'react';
-import { View, ScrollView, StyleSheet, Platform } from 'react-native';
-import { SafeAreaView } from 'react-native-safe-area-context';
-import { Text, TextInput, Button, ActivityIndicator } from 'react-native-paper';
-import { auth } from '../firebaseConfig';
+import React, { useState, useEffect } from "react";
+import { View, ScrollView, StyleSheet, Platform } from "react-native";
+import { SafeAreaView } from "react-native-safe-area-context";
+import { Text, TextInput, Button, ActivityIndicator } from "react-native-paper";
+import { auth } from "../firebaseConfig";
 import {
   createUserWithEmailAndPassword,
   signInWithEmailAndPassword,
-} from 'firebase/auth';
-import { subscribeToLogs } from '../config/debugLog';
+} from "firebase/auth";
+import { subscribeToLogs } from "../config/debugLog";
 
 export default function LoginScreen() {
-  const [email, setEmail] = useState('');
-  const [password, setPassword] = useState('');
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState(null);
   const [logs, setLogs] = useState([]);
@@ -27,9 +27,9 @@ export default function LoginScreen() {
     try {
       console.log(`[Login] signIn: ${email}`);
       await signInWithEmailAndPassword(auth, email, password);
-      console.log('[Login] signIn OK — waiting for onAuthStateChanged');
+      console.log("[Login] signIn OK — waiting for onAuthStateChanged");
     } catch (e) {
-      console.error('[Login] signIn error:', e.message);
+      console.error("[Login] signIn error:", e.message);
       setError(e.message);
     }
     setIsLoading(false);
@@ -45,13 +45,13 @@ export default function LoginScreen() {
       // 1. Create Firebase user — this fires onAuthStateChanged, but
       //    MainContentNavigator will retry fetching the profile while
       //    we simultaneously register in the backend below.
-      console.log('[Register] Step 1: createUserWithEmailAndPassword...');
+      console.log("[Register] Step 1: createUserWithEmailAndPassword...");
       const cred = await createUserWithEmailAndPassword(auth, email, password);
       fbUser = cred.user;
       console.log(`[Register] Step 1 OK uid=${fbUser.uid}`);
 
       // 2. Get ID token to pass as Bearer
-      console.log('[Register] Step 2: getIdToken...');
+      console.log("[Register] Step 2: getIdToken...");
       const idToken = await fbUser.getIdToken();
       console.log(`[Register] Step 2 OK token length=${idToken.length}`);
 
@@ -60,20 +60,24 @@ export default function LoginScreen() {
       const apiUrl = process.env.EXPO_PUBLIC_API_URL;
       const registerUrl = `${apiUrl}/api/users/register`;
       console.log(`[Register] Step 3: POST ${registerUrl}`);
-      console.log(`[Register]   headers: Authorization=Bearer [${idToken.length} chars]`);
-      console.log(`[Register]   body: { email: "${email}", name: "${email.split('@')[0]}" }`);
+      console.log(
+        `[Register]   headers: Authorization=Bearer [${idToken.length} chars]`,
+      );
+      console.log(
+        `[Register]   body: { email: "${email}", name: "${email.split("@")[0]}" }`,
+      );
 
       let response;
       try {
         response = await fetch(registerUrl, {
-          method: 'POST',
+          method: "POST",
           headers: {
-            'Content-Type': 'application/json',
+            "Content-Type": "application/json",
             Authorization: `Bearer ${idToken}`,
           },
           body: JSON.stringify({
             email,
-            name: email.split('@')[0],
+            name: email.split("@")[0],
           }),
         });
       } catch (netErr) {
@@ -85,13 +89,19 @@ export default function LoginScreen() {
       }
 
       const responseText = await response.text();
-      console.log(`[Register] Step 3 HTTP ${response.status}: ${responseText.slice(0, 300)}`);
+      console.log(
+        `[Register] Step 3 HTTP ${response.status}: ${responseText.slice(0, 300)}`,
+      );
 
       if (!response.ok) {
-        throw new Error(`Backend registration failed ${response.status}: ${responseText}`);
+        throw new Error(
+          `Backend registration failed ${response.status}: ${responseText}`,
+        );
       }
 
-      console.log('[Register] Done — onAuthStateChanged + profile fetch should handle navigation');
+      console.log(
+        "[Register] Done — onAuthStateChanged + profile fetch should handle navigation",
+      );
     } catch (e) {
       console.error(`[Register] FAILED: ${e.message}`);
       setError(e.message);
@@ -99,9 +109,11 @@ export default function LoginScreen() {
       // Rollback Firebase user if backend failed
       if (fbUser) {
         try {
-          console.log('[Register] Rollback: deleting Firebase user...');
+          console.log("[Register] Rollback: deleting Firebase user...");
           await fbUser.delete();
-          console.log('[Register] Rollback OK — user deleted, staying on Login');
+          console.log(
+            "[Register] Rollback OK — user deleted, staying on Login",
+          );
         } catch (rb) {
           console.error(`[Register] Rollback failed: ${rb.message}`);
         }
@@ -113,11 +125,19 @@ export default function LoginScreen() {
 
   return (
     <SafeAreaView style={styles.container}>
-      <ScrollView contentContainerStyle={styles.scroll} keyboardShouldPersistTaps="handled">
-        <Text style={styles.title}>Welcome</Text>
+      <ScrollView
+        contentContainerStyle={styles.scroll}
+        keyboardShouldPersistTaps="handled"
+      >
+        <Text style={styles.title}>NearPath</Text>
+        <Text style={styles.tagline}>
+          A no-category paycheck plan to cover bills, pay down debt, and save.
+        </Text>
 
         <Text style={styles.meta}>Firebase: {auth.app.options.projectId}</Text>
-        <Text style={styles.meta}>API: {process.env.EXPO_PUBLIC_API_URL || '⚠️ NOT SET'}</Text>
+        <Text style={styles.meta}>
+          API: {process.env.EXPO_PUBLIC_API_URL || "⚠️ NOT SET"}
+        </Text>
         <Text style={styles.meta}>Platform: {Platform.OS}</Text>
 
         <TextInput
@@ -140,10 +160,18 @@ export default function LoginScreen() {
           <ActivityIndicator style={{ marginTop: 20 }} />
         ) : (
           <>
-            <Button mode="contained" onPress={handleSignIn} style={styles.button}>
+            <Button
+              mode="contained"
+              onPress={handleSignIn}
+              style={styles.button}
+            >
               Login
             </Button>
-            <Button mode="outlined" onPress={handleSignUp} style={styles.button}>
+            <Button
+              mode="outlined"
+              onPress={handleSignUp}
+              style={styles.button}
+            >
               Sign Up
             </Button>
           </>
@@ -167,8 +195,8 @@ export default function LoginScreen() {
                 selectable
                 style={[
                   styles.logLine,
-                  entry.level === 'error' && styles.logError,
-                  entry.level === 'warn' && styles.logWarn,
+                  entry.level === "error" && styles.logError,
+                  entry.level === "warn" && styles.logWarn,
                 ]}
               >
                 {entry.time} {entry.msg}
@@ -184,30 +212,42 @@ export default function LoginScreen() {
 const styles = StyleSheet.create({
   container: { flex: 1 },
   scroll: { padding: 20, paddingTop: 40 },
-  title: { fontSize: 24, fontWeight: 'bold', textAlign: 'center', marginBottom: 12 },
-  meta: { fontSize: 11, color: '#666', marginBottom: 2 },
+  title: {
+    fontSize: 28,
+    fontWeight: "bold",
+    textAlign: "center",
+    marginBottom: 6,
+  },
+  tagline: {
+    fontSize: 13,
+    color: "#888",
+    textAlign: "center",
+    marginBottom: 20,
+    lineHeight: 18,
+  },
+  meta: { fontSize: 11, color: "#666", marginBottom: 2 },
   input: { marginBottom: 10, marginTop: 8 },
   button: { marginTop: 10 },
-  error: { marginTop: 10, color: 'red', textAlign: 'center' },
+  error: { marginTop: 10, color: "red", textAlign: "center" },
   logBox: {
     marginTop: 24,
     padding: 10,
-    backgroundColor: '#1e1e1e',
+    backgroundColor: "#1e1e1e",
     borderRadius: 8,
   },
   logTitle: {
-    color: '#888',
-    fontWeight: 'bold',
+    color: "#888",
+    fontWeight: "bold",
     fontSize: 11,
     marginBottom: 6,
-    fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace',
+    fontFamily: Platform.OS === "ios" ? "Menlo" : "monospace",
   },
   logLine: {
-    color: '#d4f5a5',
+    color: "#d4f5a5",
     fontSize: 10,
-    fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace',
+    fontFamily: Platform.OS === "ios" ? "Menlo" : "monospace",
     marginBottom: 2,
   },
-  logError: { color: '#ff6b6b' },
-  logWarn: { color: '#ffd93d' },
+  logError: { color: "#ff6b6b" },
+  logWarn: { color: "#ffd93d" },
 });
