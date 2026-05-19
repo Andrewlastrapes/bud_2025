@@ -45,6 +45,11 @@ public class User
 
     // ...
 
+    /// <summary>Savings contribution per paycheck. Stub [NotMapped] until a DB migration adds the column.</summary>
+    [NotMapped]
+    public decimal SavingsContributionAmount { get; set; } = 0m;
+
     public virtual ICollection<PlaidItem> PlaidItems { get; set; } = new List<PlaidItem>();
     public virtual ICollection<Balance> Balances { get; set; } = new List<Balance>();
+    public virtual ICollection<FixedCost> FixedCosts { get; set; } = new List<FixedCost>();
 }

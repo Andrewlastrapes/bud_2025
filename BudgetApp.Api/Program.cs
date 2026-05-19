@@ -154,6 +154,8 @@ builder.Services.AddScoped<INotificationService, ExpoNotificationService>();
 
 builder.Services.AddScoped<ITransactionService, TransactionService>();
 builder.Services.AddSingleton<IDynamicBudgetEngine, DynamicBudgetEngine>();
+builder.Services.AddScoped<DynamicBudgetEngine>();
+builder.Services.AddScoped<IPaycheckSummaryService, PaycheckSummaryService>();
 
 
 builder.Services.AddCors(options =>
@@ -1339,10 +1341,11 @@ app.MapPost("/api/budget/finalize", async (
 // POST: /api/plaid/webhook
 // POST: /api/plaid/webhook
 app.MapPost("/api/plaid/webhook", async (
-    ITransactionService transactionService,
+ITransactionService transactionService,
     ApiDbContext dbContext,
     PlaidWebhookRequest requestBody,
-    ILoggerFactory loggerFactory) =>
+    ILoggerFactory loggerFactory,
+    IPaycheckSummaryService paycheckSummaryService) =>
 {
     var logger = loggerFactory.CreateLogger("PlaidWebhook");
     var receivedAt = DateTime.UtcNow;
@@ -1586,6 +1589,18 @@ app.MapPost("/api/plaid/webhook", async (
                 scope.SetExtra("sync.hasMore", syncResponse.HasMore);
                 scope.SetExtra("sync.durationMs", (int)syncDuration.TotalMilliseconds);
             });
+
+        // ── Paycheck Summary ─────────────────────────────────────────────────
+        try
+        {
+            await paycheckSummaryService.CreateOrUpdateSummaryIfPaycheckDayAsync(
+                requestBody.ItemId ?? string.Empty,
+                DateTime.UtcNow);
+        }
+        catch (Exception pex)
+        {
+            Console.Error.WriteLine($"[PaycheckSummary] Webhook handler error for itemId={requestBody.ItemId}: {pex.Message}");
+        }
 
         return Results.Ok(new
         {
@@ -2749,6 +2764,71 @@ app.Lifetime.ApplicationStopped.Register(() =>
 
 SentrySdk.AddBreadcrumb("BOOT: before app.Run()", level: BreadcrumbLevel.Info);
 
+// ─── Paycheck Summary ─────────────────────────────────────────────────────────
+app.MapGet("/api/paycheck-summary/current", async (HttpContext http, ApiDbContext db) =>
+{
+    var userId = http.User.FindFirst(System.Security.Claims.ClaimTypes.NameIdentifier)?.Value;
+    if (userId == null) return Results.Unauthorized();
+
+    var summary = await db.PaycheckSummaries
+        .Where(s => s.UserId == int.Parse(userId) && !s.IsDismissed)
+        .OrderByDescending(s => s.PaycheckDate)
+        .FirstOrDefaultAsync();
+
+    if (summary == null) return Results.NoContent();
+
+    return Results.Ok(new
+    {
+        summary.Id,
+        summary.UserId,
+        PaycheckDate = summary.PaycheckDate.ToString("yyyy-MM-dd"),
+        PeriodStartDate = summary.PeriodStartDate.ToString("yyyy-MM-dd"),
+        PeriodEndDate = summary.PeriodEndDate.ToString("yyyy-MM-dd"),
+        NextPaycheckDate = summary.NextPaycheckDate.ToString("yyyy-MM-dd"),
+        summary.PaycheckAmount,
+        summary.PriorPeriodStartingBudget,
+        summary.PriorPeriodSpend,
+        summary.PriorPeriodRemaining,
+        summary.WasUnderBudget,
+        summary.LeftoverAmount,
+        summary.OverBudgetAmount,
+        summary.FixedCostsUntilNextPaycheck,
+        summary.SavingsContribution,
+        summary.DebtPaymentAmount,
+        summary.RecommendedDebtPaymentAmount,
+        summary.NewDynamicBudgetAmount,
+        summary.UserDecision,
+        summary.IsDismissed,
+        summary.CreatedAt,
+        summary.UpdatedAt
+    });
+});
+
+app.MapPost("/api/paycheck-summary/{id}/decision", async (
+    HttpContext http,
+    ApiDbContext db,
+    int id,
+    [Microsoft.AspNetCore.Mvc.FromBody] PaycheckDecisionRequest req) =>
+{
+    var userId = http.User.FindFirst(System.Security.Claims.ClaimTypes.NameIdentifier)?.Value;
+    if (userId == null) return Results.Unauthorized();
+
+    var summary = await db.PaycheckSummaries
+        .FirstOrDefaultAsync(s => s.Id == id && s.UserId == int.Parse(userId));
+
+    if (summary == null) return Results.NotFound();
+
+    var validDecisions = new[] { "AddToBudget", "TransferToSavings", "ExtraDebtPayment", "KeepAsBuffer", "Dismiss" };
+    if (!validDecisions.Contains(req.Decision))
+        return Results.BadRequest($"Unknown decision '{req.Decision}'.");
+
+    summary.UserDecision = req.Decision;
+    summary.UpdatedAt = DateTime.UtcNow;
+    if (req.Decision == "Dismiss") summary.IsDismissed = true;
+
+    await db.SaveChangesAsync();
+    return Results.Ok(new { summary.Id, summary.UserDecision, summary.IsDismissed });
+});
 
 
 // --- RUN THE APP ---
@@ -2759,6 +2839,8 @@ app.Run();
 public record MarkRecurringFromTransactionRequest(
     DateTime? FirstDueDate  // optional override; can be null for now
 );
+
+public record PaycheckDecisionRequest(string Decision, decimal? Amount = null);
 
 
 

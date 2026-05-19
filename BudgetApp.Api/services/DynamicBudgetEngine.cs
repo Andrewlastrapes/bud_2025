@@ -4,7 +4,6 @@ using BudgetApp.Api.Data;
 
 namespace BudgetApp.Api.Services;
 
-
 public record DepositContext
 {
     public decimal Amount { get; init; }
@@ -99,20 +98,13 @@ public interface IDynamicBudgetEngine
 
     /// <summary>
     /// Calculates the base budget BEFORE debt and savings decisions.
-    ///
-    /// This is the number shown on the Debt screen so users understand
-    /// what they have available before choosing a debt payment amount.
-    ///
     /// Formula: baseRemaining = paycheck - fixedCosts
     /// </summary>
     BaseBudgetResult CalculateBaseBudget(BaseBudgetRequest request);
 
     /// <summary>
     /// Calculates the final budget after all obligations (fixed + debt + savings).
-    ///
-    /// NO proration — the full paycheck minus obligations is available to spend,
-    /// regardless of where we are in the pay cycle.
-    ///
+    /// NO proration — the full paycheck minus obligations is available to spend.
     /// Formula: remainingToSpend = paycheck - fixedBills - savings - debt
     /// </summary>
     BudgetCalculationResult CalculateDynamicBudget(BudgetCalculationRequest request);
@@ -197,12 +189,6 @@ public class DynamicBudgetEngine : IDynamicBudgetEngine
 
     // ─── Base Budget (paycheck minus fixed costs only) ────────────────────────
 
-    /// <summary>
-    /// Returns how much is available BEFORE the user decides on debt and savings.
-    /// This is displayed on the Debt screen so the user can make an informed choice.
-    ///
-    /// Formula: baseRemaining = paycheck - fixedCosts
-    /// </summary>
     public BaseBudgetResult CalculateBaseBudget(BaseBudgetRequest req)
     {
         decimal fixedCostsRemaining = Math.Round(req.TotalFixedBills, 2);
@@ -210,34 +196,23 @@ public class DynamicBudgetEngine : IDynamicBudgetEngine
 
         return new BaseBudgetResult
         {
-            PaycheckAmount      = Math.Round(req.PaycheckAmount, 2),
+            PaycheckAmount = Math.Round(req.PaycheckAmount, 2),
             FixedCostsRemaining = fixedCostsRemaining,
-            BaseRemaining       = baseRemaining
+            BaseRemaining = baseRemaining
         };
     }
 
     // ─── Full Budget Calculation (paycheck minus ALL obligations) ─────────────
 
-    /// <summary>
-    /// Calculates how much the user has left to spend until the next paycheck,
-    /// after applying debt and savings decisions.
-    ///
-    /// Formula: remainingToSpend = paycheck - fixedBills - debt - savings
-    /// </summary>
     public BudgetCalculationResult CalculateDynamicBudget(BudgetCalculationRequest req)
     {
         decimal fixedCostsRemaining = Math.Round(req.TotalFixedBills, 2);
         decimal savingsContribution = Math.Round(req.SavingsContribution, 2);
-        decimal debtPerPaycheck     = Math.Round(req.DebtPerPaycheck, 2);
+        decimal debtPerPaycheck = Math.Round(req.DebtPerPaycheck, 2);
 
-        // Base: paycheck minus fixed costs (before debt/savings decisions)
         decimal baseRemaining = Math.Round(req.PaycheckAmount - fixedCostsRemaining, 2);
+        decimal remainingToSpend = Math.Round(baseRemaining - debtPerPaycheck - savingsContribution, 2);
 
-        // Final: subtract debt and savings
-        decimal remainingToSpend = Math.Round(
-            baseRemaining - debtPerPaycheck - savingsContribution, 2);
-
-        // Build explanation
         var explanationLines = new List<string>
         {
             $"Income:       ${req.PaycheckAmount:0.00}"
@@ -261,14 +236,106 @@ public class DynamicBudgetEngine : IDynamicBudgetEngine
 
         return new BudgetCalculationResult
         {
-            PaycheckAmount      = Math.Round(req.PaycheckAmount, 2),
+            PaycheckAmount = Math.Round(req.PaycheckAmount, 2),
             FixedCostsRemaining = fixedCostsRemaining,
-            BaseRemaining       = baseRemaining,
-            DebtPerPaycheck     = debtPerPaycheck,
+            BaseRemaining = baseRemaining,
+            DebtPerPaycheck = debtPerPaycheck,
             SavingsContribution = savingsContribution,
-            RemainingToSpend    = remainingToSpend,
-            Explanation         = explanation
+            RemainingToSpend = remainingToSpend,
+            Explanation = explanation
         };
+    }
+
+    // ─── User-object helpers (used by PaycheckSummaryService) ─────────────────
+
+    /// <summary>
+    /// Computes the dynamic budget for a user given their current settings.
+    /// paycheck - fixedCosts(until next paycheck) - savings - debt
+    /// </summary>
+    public decimal ComputeBudgetForUser(User user, DateTime referenceDate)
+    {
+        decimal paycheck = user.ExpectedPaycheckAmount;
+        decimal fixedCosts = ComputeFixedCostsUntilNextPaycheck(user, referenceDate);
+        decimal savings = user.SavingsContributionAmount;
+        decimal debt = user.DebtPerPaycheck ?? 0;
+        return paycheck - fixedCosts - savings - debt;
+    }
+
+    /// <summary>
+    /// Sums fixed-cost bills whose DayOfMonth falls between referenceDate.Day (exclusive)
+    /// and the next paycheck day (inclusive).
+    /// </summary>
+    public decimal ComputeFixedCostsUntilNextPaycheck(User user, DateTime referenceDate)
+    {
+        if (user.FixedCosts == null || user.PayDay1 == 0) return 0;
+        var nextPaycheck = GetNextPaycheckDate(user, referenceDate);
+        return user.FixedCosts
+            .Where(fc => fc.DayOfMonth > referenceDate.Day && fc.DayOfMonth <= nextPaycheck.Day)
+            .Sum(fc => fc.Amount);
+    }
+
+    /// <summary>
+    /// Returns the next paycheck date on or after referenceDate, based on the user's pay days.
+    /// </summary>
+    public DateTime GetNextPaycheckDate(User user, DateTime referenceDate)
+    {
+        if (user.PayDay1 == 0) return referenceDate;
+        int day1 = user.PayDay1;
+        int day2 = user.PayDay2;
+
+        var candidates = new List<DateTime>();
+        foreach (var day in new[] { day1, day2 }.Where(d => d > 0))
+        {
+            int daysInMonth = DateTime.DaysInMonth(referenceDate.Year, referenceDate.Month);
+            if (day <= daysInMonth)
+            {
+                var candidate = new DateTime(referenceDate.Year, referenceDate.Month, day);
+                if (candidate > referenceDate)
+                    candidates.Add(candidate);
+            }
+        }
+
+        if (candidates.Count > 0)
+            return candidates.Min();
+
+        // Spill into next month
+        var nextMonth = new DateTime(referenceDate.Year, referenceDate.Month, 1).AddMonths(1);
+        return new DateTime(nextMonth.Year, nextMonth.Month, day1);
+    }
+
+    /// <summary>
+    /// Returns the most recent paycheck date strictly before referenceDate.
+    /// Handles 1st/15th and single-payday patterns with correct month-length arithmetic.
+    /// </summary>
+    public DateTime GetPreviousPaycheckDate(User user, DateTime referenceDate)
+    {
+        if (user.PayDay1 == 0) return referenceDate.AddDays(-14);
+
+        int day1 = user.PayDay1;
+        int day2 = user.PayDay2;
+
+        var candidates = new List<DateTime>();
+
+        // Same-month candidates strictly before referenceDate
+        foreach (var day in new[] { day1, day2 }.Where(d => d > 0))
+        {
+            int daysInMonth = DateTime.DaysInMonth(referenceDate.Year, referenceDate.Month);
+            int clampedDay = Math.Min(day, daysInMonth);
+            var candidate = new DateTime(referenceDate.Year, referenceDate.Month, clampedDay);
+            if (candidate < referenceDate)
+                candidates.Add(candidate);
+        }
+
+        // Previous-month candidates (always added as fallback)
+        var prevMonth = referenceDate.AddMonths(-1);
+        foreach (var day in new[] { day1, day2 }.Where(d => d > 0))
+        {
+            int daysInPrevMonth = DateTime.DaysInMonth(prevMonth.Year, prevMonth.Month);
+            int clampedDay = Math.Min(day, daysInPrevMonth);
+            candidates.Add(new DateTime(prevMonth.Year, prevMonth.Month, clampedDay));
+        }
+
+        return candidates.Max();
     }
 
     // ─── Private helpers ──────────────────────────────────────────────────────

@@ -48,6 +48,10 @@ public class FixedCost
     [Column("updated_at")]
     public DateTime UpdatedAt { get; set; }
 
+    /// <summary>Day-of-month the bill is due. Derived from NextDueDate; falls back to 1 if unset.</summary>
+    [NotMapped]
+    public int DayOfMonth => NextDueDate?.Day ?? 1;
+
     [ForeignKey(nameof(UserId))]
     public virtual User? User { get; set; }
 }
