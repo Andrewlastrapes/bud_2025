@@ -3309,6 +3309,68 @@ app.MapGet("/api/transactions/deposits/pending/summary", async (ApiDbContext dbC
 .WithName("GetUnexpectedDepositSummary")
 .WithOpenApi();
 
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /api/recurring/suggestions
+//
+// Returns likely recurring fixed costs detected from the user's stored
+// transaction history over the last 6 months.
+//
+// This endpoint is completely independent of Plaid recurring streams.
+// It does NOT call GET /api/plaid/recurring and does NOT require Plaid
+// recurring data to exist.  GET /api/plaid/recurring is still available
+// as a separate endpoint and is intentionally left unchanged.
+//
+// Auth:  Firebase bearer token (same pattern as all other endpoints).
+// Query: last 6 months, non-pending transactions, all SuggestedKind values
+//        (income exclusion is handled inside RecurringSuggestionsAnalyzer).
+// Returns: List<RecurringSuggestionDto> — DTOs only, never EF entities.
+// ─────────────────────────────────────────────────────────────────────────────
+app.MapGet("/api/recurring/suggestions", async (ApiDbContext dbContext, HttpContext httpContext) =>
+{
+    try
+    {
+        string? idToken = httpContext.Request.Headers["Authorization"]
+            .FirstOrDefault()
+            ?.Split(" ")
+            .Last();
+
+        if (string.IsNullOrEmpty(idToken)) return Results.Unauthorized();
+
+        var decodedToken = await FirebaseAdmin.Auth.FirebaseAuth.DefaultInstance
+            .VerifyIdTokenAsync(idToken);
+
+        var user = await dbContext.Users
+            .FirstOrDefaultAsync(u => u.FirebaseUuid == decodedToken.Uid);
+
+        if (user == null) return Results.NotFound("User not found.");
+
+        // Look back 6 months from today (UTC).
+        // We load ALL non-pending transactions — no SuggestedKind filter here.
+        // RecurringSuggestionsAnalyzer excludes income/deposits itself by
+        // inspecting SuggestedKind, so pre-filtering would risk throwing away
+        // valid recurring debit transactions before the analyzer sees them.
+        DateTime cutoff = DateTime.UtcNow.Date.AddMonths(-6);
+
+        var transactions = await dbContext.Transactions
+            .Where(t => t.UserId == user.Id
+                && !t.Pending
+                && t.Date >= cutoff)
+            .OrderBy(t => t.Date)
+            .ToListAsync();
+
+        var suggestions = RecurringSuggestionsAnalyzer.Analyze(transactions, cutoff);
+
+        return Results.Ok(suggestions);
+    }
+    catch (Exception e)
+    {
+        SentrySdk.CaptureException(e);
+        return Results.Problem(e.Message);
+    }
+})
+.WithName("GetRecurringSuggestions")
+.WithOpenApi();
+
 // --- RUN THE APP ---
 app.Run();
 
