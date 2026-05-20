@@ -268,10 +268,22 @@ export default function HomeScreen({ navigation }) {
         {debtSummary?.totalDebt != null && debtSummary.totalDebt > 0 && (
           <View style={styles.debtCard}>
             <Text style={styles.debtEyebrow}>DEBT PAYOFF PROGRESS</Text>
+            {/* Show netDebtStartingBalance (after cash applied) when available;
+                fall back to totalDebt for backward compatibility with old users. */}
             <Text style={styles.debtBalance}>
-              ${debtSummary.totalDebt.toFixed(2)}{" "}
+              $
+              {(
+                debtSummary.netDebtStartingBalance ?? debtSummary.totalDebt
+              ).toFixed(2)}{" "}
               <Text style={styles.debtBalanceSub}>remaining</Text>
             </Text>
+            {/* If cash was applied at onboarding, show a helpful context note. */}
+            {debtSummary.cashAppliedAtOnboarding > 0 && (
+              <Text style={styles.debtCashNote}>
+                ${debtSummary.cashAppliedAtOnboarding.toFixed(2)} cash applied
+                at setup
+              </Text>
+            )}
             {debtSummary.debtPerPaycheck > 0 && (
               <Text style={styles.debtDetail}>
                 ${debtSummary.debtPerPaycheck.toFixed(2)}/paycheck
@@ -548,6 +560,13 @@ const styles = StyleSheet.create({
     fontSize: 14,
     fontWeight: "400",
     color: "#7C3AED",
+  },
+  debtCashNote: {
+    fontSize: 12,
+    color: "#7C3AED",
+    marginTop: 2,
+    marginBottom: 2,
+    fontStyle: "italic",
   },
   debtDetail: {
     fontSize: 13,

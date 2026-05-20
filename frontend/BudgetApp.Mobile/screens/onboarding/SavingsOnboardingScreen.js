@@ -65,6 +65,24 @@ export default function SavingsOnboardingScreen({ navigation, route }) {
   const hasDebt = debtPerPaycheck > 0;
   // Preserve null as-is: null = unknown/not captured, 0 = genuinely no debt.
   const debtStartingBalance = route.params?.debtStartingBalance ?? null;
+  // Cash-cushion fields — null when not provided (legacy clients or no Plaid depository link).
+  // Real 0 is meaningful (e.g. user had no cash or applied $0 toward debt).
+  const cashBalanceAtOnboarding =
+    route.params?.cashBalanceAtOnboarding !== undefined
+      ? route.params.cashBalanceAtOnboarding
+      : null;
+  const cashCushionAtOnboarding =
+    route.params?.cashCushionAtOnboarding !== undefined
+      ? route.params.cashCushionAtOnboarding
+      : null;
+  const cashAppliedToDebtAtOnboarding =
+    route.params?.cashAppliedToDebtAtOnboarding !== undefined
+      ? route.params.cashAppliedToDebtAtOnboarding
+      : null;
+  const netDebtStartingBalance =
+    route.params?.netDebtStartingBalance !== undefined
+      ? route.params.netDebtStartingBalance
+      : null;
 
   const calcNextPaycheck = (d1, d2) => {
     const today = new Date();
@@ -126,6 +144,13 @@ export default function SavingsOnboardingScreen({ navigation, route }) {
           // Persists the Plaid debt snapshot captured at the DebtOnboarding step.
           // null = unknown/not captured; 0 = user genuinely had no debt.
           debtStartingBalance: debtStartingBalance,
+          // Cash-cushion fields captured at the DebtOnboarding step.
+          // null = not provided (legacy client, no Plaid depository link).
+          // Real 0 is valid and meaningful.
+          cashBalanceAtOnboarding,
+          cashCushionAtOnboarding,
+          cashAppliedToDebtAtOnboarding,
+          netDebtStartingBalance,
         },
         config,
       );

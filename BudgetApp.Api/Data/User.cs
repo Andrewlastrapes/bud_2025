@@ -51,7 +51,32 @@ public class User
     [Column("debt_starting_balance")]
     public decimal? DebtStartingBalance { get; set; }
 
+    // ── Cash-cushion onboarding fields (added in migration AddCashOnboardingFieldsToUser) ───
+    // All nullable so old users are not affected.
 
+    /// <summary>Total checking + savings balance captured from the Plaid snapshot at onboarding time.</summary>
+    [Column("cash_balance_at_onboarding")]
+    public decimal? CashBalanceAtOnboarding { get; set; }
+
+    /// <summary>Cash cushion the user chose to keep for bills and emergencies (not applied toward debt).</summary>
+    [Column("cash_cushion_at_onboarding")]
+    public decimal? CashCushionAtOnboarding { get; set; }
+
+    /// <summary>
+    /// Amount of checking/savings cash the user applied toward credit card debt at onboarding.
+    /// Clamped by the backend to min(availableForDebt, totalCreditCardDebt).
+    /// </summary>
+    [Column("cash_applied_to_debt_at_onboarding")]
+    public decimal? CashAppliedToDebtAtOnboarding { get; set; }
+
+    /// <summary>
+    /// Remaining credit card debt after applying cash (= DebtStartingBalance − CashAppliedToDebtAtOnboarding).
+    /// This is the figure used for the payoff estimate — more accurate than raw DebtStartingBalance
+    /// when the user applied some cash at onboarding.
+    /// Null for legacy users who onboarded before this field existed.
+    /// </summary>
+    [Column("net_debt_starting_balance")]
+    public decimal? NetDebtStartingBalance { get; set; }
 
     // ...
 

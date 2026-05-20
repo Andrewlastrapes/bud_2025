@@ -114,3 +114,151 @@ public class DebtSummaryCalculationTests
         Assert.Null(result);
     }
 }
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Unit tests for DebtSummaryCalculator.CalculateNetDebt
+// All inputs/outputs are pure math — no DB, no Plaid.
+// ──────────────────────────────────────────────────────────────────────────────
+public class NetDebtCalculationTests
+{
+    // ── AvailableForDebt ──────────────────────────────────────────────────────
+
+    [Fact]
+    public void Available_IsZero_WhenCushionExceedsCash()
+    {
+        // cushion $2,000 > cash $1,500 → available = 0 (can't go negative)
+        var r = DebtSummaryCalculator.CalculateNetDebt(
+            totalCreditCardDebt: 8_420m,
+            totalCashBalance: 1_500m,
+            cashCushion: 2_000m,
+            cashToApplyNow: 0m);
+
+        Assert.Equal(0m, r.AvailableForDebt);
+        Assert.Equal(0m, r.EffectiveCashApplied);
+        Assert.Equal(8_420m, r.NetDebt);
+    }
+
+    [Fact]
+    public void Available_IsPositive_WhenCashExceedsCushion()
+    {
+        // cash $3,200 − cushion $1,500 = $1,700 available
+        var r = DebtSummaryCalculator.CalculateNetDebt(8_420m, 3_200m, 1_500m, 0m);
+
+        Assert.Equal(1_700m, r.AvailableForDebt);
+        Assert.Equal(0m, r.EffectiveCashApplied); // user asked for $0
+        Assert.Equal(8_420m, r.NetDebt);
+    }
+
+    // ── EffectiveCashApplied clamping ─────────────────────────────────────────
+
+    [Fact]
+    public void Effective_ClampsToAvailable_WhenRequestExceedsAvailable()
+    {
+        // available $1,700, user requests $2,000 → effective = $1,700
+        var r = DebtSummaryCalculator.CalculateNetDebt(8_420m, 3_200m, 1_500m, 2_000m);
+
+        Assert.Equal(1_700m, r.AvailableForDebt);
+        Assert.Equal(1_700m, r.EffectiveCashApplied);
+        Assert.Equal(6_720m, r.NetDebt);
+    }
+
+    [Fact]
+    public void Effective_ClampsToDebt_WhenRequestExceedsDebt()
+    {
+        // debt $500, available $3,200, user wants $3,200 → effective = $500 (can't overpay)
+        var r = DebtSummaryCalculator.CalculateNetDebt(500m, 3_200m, 0m, 3_200m);
+
+        Assert.Equal(3_200m, r.AvailableForDebt);
+        Assert.Equal(500m, r.EffectiveCashApplied);
+        Assert.Equal(0m, r.NetDebt);
+    }
+
+    [Fact]
+    public void Effective_IsExact_WhenRequestIsWithinBounds()
+    {
+        // available $1,700, user requests $1,000 → effective = $1,000 (no clamping)
+        var r = DebtSummaryCalculator.CalculateNetDebt(8_420m, 3_200m, 1_500m, 1_000m);
+
+        Assert.Equal(1_700m, r.AvailableForDebt);
+        Assert.Equal(1_000m, r.EffectiveCashApplied);
+        Assert.Equal(7_420m, r.NetDebt);
+    }
+
+    // ── NetDebt ───────────────────────────────────────────────────────────────
+
+    [Fact]
+    public void NetDebt_NeverBelowZero()
+    {
+        // cashToApply > debt → netDebt clamped to 0
+        var r = DebtSummaryCalculator.CalculateNetDebt(500m, 10_000m, 0m, 9_999m);
+
+        Assert.Equal(0m, r.NetDebt);
+    }
+
+    [Fact]
+    public void NetDebt_IsReducedByEffectiveCash()
+    {
+        // $8,420 debt − $1,700 applied = $6,720 remaining
+        var r = DebtSummaryCalculator.CalculateNetDebt(8_420m, 3_200m, 1_500m, 1_700m);
+
+        Assert.Equal(6_720m, r.NetDebt);
+    }
+
+    [Fact]
+    public void NetDebt_IsZero_WhenAllDebtCovered()
+    {
+        // debt $1,000 fully covered by $1,000 cash applied
+        var r = DebtSummaryCalculator.CalculateNetDebt(1_000m, 5_000m, 0m, 1_000m);
+
+        Assert.Equal(0m, r.NetDebt);
+    }
+
+    // ── Zero / null cash ──────────────────────────────────────────────────────
+
+    [Fact]
+    public void ZeroCash_NoChange_ToNetDebt()
+    {
+        // No checking/savings → net debt = original credit card debt
+        var r = DebtSummaryCalculator.CalculateNetDebt(8_420m, 0m, 0m, 0m);
+
+        Assert.Equal(0m, r.AvailableForDebt);
+        Assert.Equal(0m, r.EffectiveCashApplied);
+        Assert.Equal(8_420m, r.NetDebt);
+    }
+
+    // ── Negative input normalisation ──────────────────────────────────────────
+
+    [Fact]
+    public void NegativeInputs_AreNormalisedToZero()
+    {
+        // Caller passes negative balances (e.g. Plaid overdraft not yet clamped)
+        // CalculateNetDebt normalises them internally.
+        var r = DebtSummaryCalculator.CalculateNetDebt(
+            totalCreditCardDebt: -500m,  // nonsense — treated as 0
+            totalCashBalance: -200m,     // overdraft — treated as 0
+            cashCushion: -100m,          // nonsense — treated as 0
+            cashToApplyNow: -50m);       // nonsense — treated as 0
+
+        Assert.Equal(0m, r.AvailableForDebt);
+        Assert.Equal(0m, r.EffectiveCashApplied);
+        Assert.Equal(0m, r.NetDebt);
+    }
+
+    // ── PaychecksRemaining uses netDebt ───────────────────────────────────────
+
+    [Fact]
+    public void PaychecksRemaining_UsesNetDebt_NotRawDebt()
+    {
+        // credit card debt $8,420; user applied $1,700 cash → net debt $6,720
+        // at $300/paycheck → ceil(6720/300) = 22.4 → 23
+        var netResult = DebtSummaryCalculator.CalculateNetDebt(8_420m, 3_200m, 1_500m, 1_700m);
+        var paychecks = DebtSummaryCalculator.CalculatePaychecksRemaining(
+            netResult.NetDebt, 300m);
+
+        Assert.Equal(23, paychecks);
+
+        // Contrast: using raw debt would give ceil(8420/300) = 29
+        var paychecksRaw = DebtSummaryCalculator.CalculatePaychecksRemaining(8_420m, 300m);
+        Assert.Equal(29, paychecksRaw);
+    }
+}

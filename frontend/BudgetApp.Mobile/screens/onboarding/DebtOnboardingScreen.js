@@ -233,6 +233,9 @@ export default function DebtOnboardingScreen({ navigation, route }) {
 
   const isLoading = loadingDebt || loadingBase;
   const totalDebt = snapshot?.totalDebt ?? 0;
+  // Cash totals returned by the updated /api/debt/snapshot endpoint.
+  // null/0 for users without linked depository accounts or on legacy API.
+  const totalCashBalance = snapshot?.totalCashBalance ?? 0;
   const baseRemaining = baseBudget?.baseRemaining ?? paycheckAmount;
   const canPayInFull = totalDebt > 0 && baseRemaining >= totalDebt;
 
@@ -260,6 +263,19 @@ export default function DebtOnboardingScreen({ navigation, route }) {
       // null means Plaid had no credit accounts or the snapshot failed — not the
       // same as 0, which means the user genuinely had no credit card debt.
       debtStartingBalance: totalDebt != null ? totalDebt : null,
+      // ── Cash-cushion fields (new) ──────────────────────────────────────────
+      // totalCashBalance is the sum of linked checking + savings balances from
+      // the Plaid snapshot.  Passed through so the backend can persist it at
+      // finalization time, alongside whatever cash cushion the user chose.
+      // This screen does not yet have a cash-cushion selection UI, so we
+      // default cushion = 0 and applied = 0.  The values are non-null even at
+      // zero so the backend persists them (distinguishing "user had $0 cash"
+      // from "cash was never captured").
+      cashBalanceAtOnboarding:
+        totalCashBalance != null ? totalCashBalance : null,
+      cashCushionAtOnboarding: totalCashBalance != null ? 0 : null,
+      cashAppliedToDebtAtOnboarding: totalCashBalance != null ? 0 : null,
+      netDebtStartingBalance: totalDebt != null ? totalDebt : null,
       baseRemaining,
       remainingAfterDebt: Math.round((baseRemaining - debt) * 100) / 100,
       fixedCostsRemaining: baseBudget?.fixedCostsRemaining ?? 0,

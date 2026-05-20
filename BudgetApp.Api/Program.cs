@@ -1348,6 +1348,27 @@ app.MapPost("/api/budget/finalize", async (
         if (request.DebtStartingBalance.HasValue)
             user.DebtStartingBalance = request.DebtStartingBalance.Value;
 
+        // ── Cash-cushion onboarding fields ──────────────────────────────────
+        // Only persisted when the client sent at least one cash-related field.
+        // The backend recalculates using DebtSummaryCalculator so stored values
+        // are always consistent and properly clamped, even if the client sends
+        // an inconsistent combination (e.g. cashApplied > available).
+        if (request.CashBalanceAtOnboarding.HasValue || request.CashAppliedToDebtAtOnboarding.HasValue)
+        {
+            var creditDebt = Math.Max(0m, request.DebtStartingBalance ?? 0m);
+            var cashBalance = Math.Max(0m, request.CashBalanceAtOnboarding ?? 0m);
+            var cashCushion = Math.Max(0m, request.CashCushionAtOnboarding ?? 0m);
+            var requestedApplied = Math.Max(0m, request.CashAppliedToDebtAtOnboarding ?? 0m);
+
+            var netDebtResult = DebtSummaryCalculator.CalculateNetDebt(
+                creditDebt, cashBalance, cashCushion, requestedApplied);
+
+            user.CashBalanceAtOnboarding = cashBalance;
+            user.CashCushionAtOnboarding = cashCushion;
+            user.CashAppliedToDebtAtOnboarding = netDebtResult.EffectiveCashApplied;
+            user.NetDebtStartingBalance = netDebtResult.NetDebt;
+        }
+
         await dbContext.SaveChangesAsync();
 
         // Return structured response — no proration fields
@@ -2371,7 +2392,10 @@ app.MapGet("/api/debt/snapshot", async (ApiDbContext dbContext, PlaidClient plai
             .ToListAsync();
 
         var accounts = new List<DebtSnapshotAccountDto>();
-        decimal totalDebt = 0m;
+        var cashAccounts = new List<CashAccountDto>();
+        decimal totalCreditCardDebt = 0m;
+        decimal totalCheckingBalance = 0m;
+        decimal totalSavingsBalance = 0m;
 
         foreach (var item in items)
         {
@@ -2384,28 +2408,59 @@ app.MapGet("/api/debt/snapshot", async (ApiDbContext dbContext, PlaidClient plai
 
             foreach (var acct in resp.Accounts)
             {
-                // Only care about credit accounts for "debt"
-                if (acct.Type != AccountType.Credit) continue;
-
-                var bal = acct.Balances.Current ?? 0m;
-                if (bal <= 0) continue; // no debt on this card
-
-                accounts.Add(new DebtSnapshotAccountDto
+                if (acct.Type == AccountType.Credit)
                 {
-                    InstitutionName = item.InstitutionName ?? "Unknown institution",
-                    AccountName = acct.Name ?? acct.OfficialName ?? "Credit account",
-                    Mask = acct.Mask,
-                    CurrentBalance = bal
-                });
+                    // Credit cards: current balance = outstanding balance owed (positive = debt).
+                    var bal = acct.Balances.Current ?? 0m;
+                    if (bal <= 0) continue; // no debt on this card
 
-                totalDebt += bal;
+                    accounts.Add(new DebtSnapshotAccountDto
+                    {
+                        InstitutionName = item.InstitutionName ?? "Unknown institution",
+                        AccountName = acct.Name ?? acct.OfficialName ?? "Credit account",
+                        Mask = acct.Mask,
+                        CurrentBalance = bal
+                    });
+
+                    totalCreditCardDebt += bal;
+                }
+                else if (acct.Type == AccountType.Depository)
+                {
+                    // Checking/savings: prefer available balance (spendable funds);
+                    // fall back to current if available is null.
+                    // Negative balances (overdrafts) are clamped to 0 — an overdrawn account
+                    // does not contribute positively to available cash.
+                    var rawBal = acct.Balances.Available ?? acct.Balances.Current ?? 0m;
+                    var bal = Math.Max(0m, rawBal);
+                    var subType = acct.Subtype?.ToString()?.ToLowerInvariant() ?? "";
+
+                    cashAccounts.Add(new CashAccountDto
+                    {
+                        InstitutionName = item.InstitutionName ?? "Unknown institution",
+                        AccountName = acct.Name ?? acct.OfficialName ?? "Depository account",
+                        Mask = acct.Mask,
+                        SubType = subType,
+                        Balance = bal
+                    });
+
+                    if (subType == "savings")
+                        totalSavingsBalance += bal;
+                    else
+                        totalCheckingBalance += bal; // checking, money market, cd, etc.
+                }
             }
         }
 
+        var totalCashBalance = totalCheckingBalance + totalSavingsBalance;
+
         var result = new DebtSnapshotResponse
         {
-            TotalDebt = totalDebt,
-            Accounts = accounts
+            TotalCreditCardDebt = totalCreditCardDebt,
+            TotalCheckingBalance = totalCheckingBalance,
+            TotalSavingsBalance = totalSavingsBalance,
+            TotalCashBalance = totalCashBalance,
+            Accounts = accounts,
+            CashAccounts = cashAccounts
         };
 
         return Results.Ok(result);
@@ -2447,17 +2502,29 @@ app.MapGet("/api/debt/summary", async (ApiDbContext dbContext, HttpContext httpC
 
         if (user == null) return Results.NotFound("User not found.");
 
+        // Use netDebtStartingBalance (remaining debt after cash was applied at onboarding) when
+        // available; fall back to raw DebtStartingBalance for backward compatibility.
+        // This ensures old users who never had the cash-cushion feature still see their estimate.
+        var debtForEstimate = user.NetDebtStartingBalance ?? user.DebtStartingBalance;
+
         // Calculate how many paychecks remain to pay off the debt.
         // Uses the pure static helper so the formula is independently testable.
         var paychecksRemaining = DebtSummaryCalculator.CalculatePaychecksRemaining(
-            user.DebtStartingBalance, user.DebtPerPaycheck);
+            debtForEstimate, user.DebtPerPaycheck);
 
         return Results.Ok(new
         {
             // null when old user / no Plaid snapshot captured → frontend hides the card
             totalDebt = user.DebtStartingBalance,
             debtPerPaycheck = user.DebtPerPaycheck,
-            paychecksRemaining
+            paychecksRemaining,
+            // ── Cash-cushion fields (null for users who onboarded before this feature) ──
+            // netDebtStartingBalance: what the payoff estimate is actually calculated from.
+            // If null, the estimate uses totalDebt (backward-compatible).
+            netDebtStartingBalance = user.NetDebtStartingBalance,
+            cashAppliedAtOnboarding = user.CashAppliedToDebtAtOnboarding,
+            cashBalanceAtOnboarding = user.CashBalanceAtOnboarding,
+            cashCushionAtOnboarding = user.CashCushionAtOnboarding
         });
     }
     catch (Exception e)
