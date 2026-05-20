@@ -105,6 +105,18 @@ const formatDisplayDate = (dateStr) => {
   }
 };
 
+// --- Utility: Format yyyy-MM-dd → "Jun 12" for suggestion display ---
+const formatShortDate = (dateStr) => {
+  if (!dateStr) return null;
+  try {
+    const [y, m, d] = dateStr.split("-").map(Number);
+    const date = new Date(y, m - 1, d);
+    return date.toLocaleDateString("en-US", { month: "short", day: "numeric" });
+  } catch {
+    return dateStr;
+  }
+};
+
 // --- Utility: Infer next projected date from last_date + frequency ---
 const inferNextDate = (lastDateStr, frequency) => {
   if (!lastDateStr) return null;
@@ -139,6 +151,26 @@ const inferNextDate = (lastDateStr, frequency) => {
     return null;
   }
 };
+
+// --- Utility: Normalize a name for duplicate detection ---
+// Strips non-alphanumeric chars and lowercases so "NETFLIX.COM" matches "Netflix"
+const normalizeName = (name) =>
+  (name || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+
+// --- Duplicate check: is this suggestion already covered in costsToSave? ---
+// Compares normalized name and rounded dollar amount (±$1 tolerance).
+const isDuplicate = (suggestion, costsToSave) => {
+  const sName = normalizeName(suggestion.merchantName);
+  const sAmt = Math.round(suggestion.estimatedAmount);
+  return costsToSave.some((c) => {
+    const cName = normalizeName(c.name);
+    const cAmt = Math.round(c.amount);
+    return cName === sName && Math.abs(cAmt - sAmt) <= 1;
+  });
+};
+
+// --- Classification options for detected recurring suggestions ---
+const CLASSIFICATION_OPTIONS = ["Rent", "Car Payment", "Student Loan"];
 
 // --- Helper function to get the auth token ---
 const getAuthHeader = async () => {
@@ -185,8 +217,14 @@ export default function FixedCostsSetupScreen({ navigation, route }) {
   // and locked); when empty this is a free-form manual bill add.
   const [quickAddName, setQuickAddName] = useState("");
 
-  // Plaid Discovery State
+  // Plaid Discovery State (unchanged — stays as-is)
   const [plaidRecurrings, setPlaidRecurrings] = useState([]);
+
+  // ── Internal recurring suggestions (from /api/recurring/suggestions) ────────
+  // Each item: { ...backendFields, isChecked: true, classification: null }
+  // classification: null | "Rent" | "Car Payment" | "Student Loan"
+  const [detectedSuggestions, setDetectedSuggestions] = useState([]);
+  const [suggestionsError, setSuggestionsError] = useState(false);
 
   // ── Derived: subscription chips to show ───────────────────────────────────
   // Recomputed on every render from current state — no useEffect needed.
@@ -200,12 +238,19 @@ export default function FixedCostsSetupScreen({ navigation, route }) {
     (s) => !coveredKeys.has(s.key),
   );
 
-  // --- Lifecycle: Fetch Plaid Data and Set Initial Date ---
+  // --- Lifecycle: Fetch Plaid Data and Detected Suggestions in parallel ---
   useEffect(() => {
     setManualRentDueDate(getNextMonthFirstDay());
-    fetchPlaidData();
+
+    const loadAllData = async () => {
+      await Promise.all([fetchPlaidData(), fetchDetectedSuggestions()]);
+      setIsLoading(false);
+    };
+
+    loadAllData();
   }, []);
 
+  // --- Fetch Plaid recurring (unchanged) ---
   const fetchPlaidData = async () => {
     try {
       const config = await getAuthHeader();
@@ -243,8 +288,59 @@ export default function FixedCostsSetupScreen({ navigation, route }) {
       setPlaidRecurrings(initialCosts);
     } catch (e) {
       console.error("Failed to fetch Plaid recurring data:", e);
+      // Non-fatal: Plaid may not be connected. Screen still loads.
     }
-    setIsLoading(false);
+  };
+
+  // --- Fetch internal detected recurring suggestions ---
+  // Non-fatal: if this fails, the screen still works for manual entry and Plaid.
+  const fetchDetectedSuggestions = async () => {
+    try {
+      const config = await getAuthHeader();
+      const response = await axios.get(
+        `${API_BASE_URL}/api/recurring/suggestions`,
+        config,
+      );
+
+      const suggestions = (response.data || []).map((item) => ({
+        ...item,
+        isChecked: true,
+        classification: null,
+      }));
+
+      setDetectedSuggestions(suggestions);
+    } catch (e) {
+      console.error("Failed to fetch recurring suggestions:", e);
+      setSuggestionsError(true);
+      // Do not rethrow — this is intentionally non-fatal.
+    }
+  };
+
+  // --- Toggle a detected suggestion's checked state ---
+  const handleToggleSuggestion = (normalizedName) => {
+    setDetectedSuggestions((prev) =>
+      prev.map((s) =>
+        s.normalizedName === normalizedName
+          ? { ...s, isChecked: !s.isChecked }
+          : s,
+      ),
+    );
+  };
+
+  // --- Set / clear a classification for a detected suggestion ---
+  // Tapping the already-selected classification deselects it (back to null).
+  const handleClassificationChange = (normalizedName, classification) => {
+    setDetectedSuggestions((prev) =>
+      prev.map((s) =>
+        s.normalizedName === normalizedName
+          ? {
+              ...s,
+              classification:
+                s.classification === classification ? null : classification,
+            }
+          : s,
+      ),
+    );
   };
 
   // --- Remove Item from free-form dynamic list ---
@@ -318,7 +414,7 @@ export default function FixedCostsSetupScreen({ navigation, route }) {
     handleCloseModal();
   };
 
-  // --- Logic for saving all costs (Manual + Quick-add + Plaid) ---
+  // --- Logic for saving all costs (Manual + Quick-add + Plaid + Detected) ---
   const handleNext = async () => {
     setIsSaving(true);
     try {
@@ -390,8 +486,46 @@ export default function FixedCostsSetupScreen({ navigation, route }) {
         }
       });
 
+      // 5. Detected recurring suggestions (internal, not Plaid)
+      // Skip any suggestion that duplicates a cost already in costsToSave
+      // (matched by normalized name + rounded amount within ±$1 tolerance).
+      detectedSuggestions.forEach((s) => {
+        if (!s.isChecked) return;
+        if (isDuplicate(s, costsToSave)) {
+          console.log(
+            `[RecurringSuggestions] Skipping duplicate: ${s.merchantName} $${s.estimatedAmount}`,
+          );
+          return;
+        }
+        costsToSave.push({
+          name: s.merchantName,
+          amount: s.estimatedAmount,
+          category: s.classification ?? "other",
+          type: "detected-recurring",
+          recurrenceFrequency: s.frequency || "Monthly",
+          nextDueDate: s.nextEstimatedDate
+            ? getISODate(s.nextEstimatedDate, s.merchantName)
+            : null,
+        });
+      });
+
+      // Track partial failures so we can report them without blocking navigation
+      const saveErrors = [];
+
       for (const cost of costsToSave) {
-        await axios.post(`${API_BASE_URL}/api/fixed-costs`, cost, config);
+        try {
+          await axios.post(`${API_BASE_URL}/api/fixed-costs`, cost, config);
+        } catch (err) {
+          console.error(`Failed to save fixed cost "${cost.name}":`, err);
+          saveErrors.push(cost.name);
+        }
+      }
+
+      if (saveErrors.length > 0) {
+        Alert.alert(
+          "Some costs could not be saved",
+          `The following items failed to save and will need to be added manually:\n\n${saveErrors.join(", ")}`,
+        );
       }
 
       navigation.navigate("DebtOnboarding", incomeParams);
@@ -410,6 +544,85 @@ export default function FixedCostsSetupScreen({ navigation, route }) {
       </View>
     );
   }
+
+  // ── Render: detected recurring suggestions section ────────────────────────
+  const renderDetectedSuggestionsSection = () => {
+    // Show section if we have suggestions OR if the fetch errored
+    // (so the user sees the error message instead of a silent gap)
+    if (detectedSuggestions.length === 0 && !suggestionsError) return null;
+
+    return (
+      <Card style={styles.card}>
+        <Card.Title
+          title="Recurring costs we found"
+          subtitle="Uncheck anything that should not be part of your paycheck plan."
+        />
+        <Card.Content>
+          {suggestionsError && (
+            <Text style={styles.suggestionsErrorText}>
+              We couldn't load recurring suggestions. You can still add fixed
+              costs manually.
+            </Text>
+          )}
+
+          {detectedSuggestions.length === 0 && !suggestionsError && (
+            <Text style={styles.infoText}>
+              We didn't find recurring costs yet. You can add them manually.
+            </Text>
+          )}
+
+          {detectedSuggestions.map((s) => {
+            const shortDate = formatShortDate(s.nextEstimatedDate);
+            const descParts = [
+              `$${parseFloat(s.estimatedAmount).toFixed(2)}`,
+              s.frequency || null,
+              shortDate ? `Expected ${shortDate}` : null,
+            ].filter(Boolean);
+
+            return (
+              <View key={s.normalizedName} style={styles.suggestionRow}>
+                {/* Row: checkbox + text */}
+                <View style={styles.suggestionMain}>
+                  <Checkbox.Android
+                    status={s.isChecked ? "checked" : "unchecked"}
+                    onPress={() => handleToggleSuggestion(s.normalizedName)}
+                  />
+                  <View style={styles.suggestionText}>
+                    <Text style={styles.suggestionName}>{s.merchantName}</Text>
+                    <Text style={styles.suggestionMeta}>
+                      {descParts.join(" · ")}
+                    </Text>
+                    {!!s.warning && (
+                      <Text style={styles.suggestionWarning}>{s.warning}</Text>
+                    )}
+                  </View>
+                </View>
+
+                {/* Classification chips — only shown when checked */}
+                {s.isChecked && (
+                  <View style={styles.classificationRow}>
+                    {CLASSIFICATION_OPTIONS.map((label) => (
+                      <Chip
+                        key={label}
+                        selected={s.classification === label}
+                        onPress={() =>
+                          handleClassificationChange(s.normalizedName, label)
+                        }
+                        style={styles.classificationChip}
+                        compact
+                      >
+                        {label}
+                      </Chip>
+                    ))}
+                  </View>
+                )}
+              </View>
+            );
+          })}
+        </Card.Content>
+      </Card>
+    );
+  };
 
   return (
     <SafeAreaView style={styles.container}>
@@ -574,7 +787,10 @@ export default function FixedCostsSetupScreen({ navigation, route }) {
           </Card.Content>
         </Card>
 
-        {/* --- C. Plaid Discovery --- */}
+        {/* --- E. Internal Detected Recurring Suggestions --- */}
+        {renderDetectedSuggestionsSection()}
+
+        {/* --- C. Plaid Discovery (unchanged) --- */}
         <Card style={styles.card}>
           <Card.Title
             title="Suggested from your accounts"
@@ -618,6 +834,7 @@ export default function FixedCostsSetupScreen({ navigation, route }) {
         mode="contained"
         onPress={handleNext}
         loading={isSaving}
+        disabled={isSaving}
         style={styles.bottomButton}
       >
         Next: Debt
@@ -728,4 +945,53 @@ const styles = StyleSheet.create({
   modalHint: { fontSize: 12, color: "#888", marginBottom: 8 },
   bottomButton: { margin: 20 },
   modal: { backgroundColor: "white", padding: 20, margin: 20, borderRadius: 8 },
+
+  // ── Detected suggestions styles ───────────────────────────────────────────
+  suggestionsErrorText: {
+    fontSize: 13,
+    color: "#b45309",
+    marginBottom: 8,
+    textAlign: "center",
+  },
+  suggestionRow: {
+    borderBottomWidth: 1,
+    borderBottomColor: "#e5e5e5",
+    paddingVertical: 8,
+  },
+  suggestionMain: {
+    flexDirection: "row",
+    alignItems: "flex-start",
+  },
+  suggestionText: {
+    flex: 1,
+    paddingTop: 6,
+    paddingRight: 4,
+  },
+  suggestionName: {
+    fontSize: 15,
+    fontWeight: "500",
+    color: "#111",
+  },
+  suggestionMeta: {
+    fontSize: 13,
+    color: "#555",
+    marginTop: 2,
+  },
+  suggestionWarning: {
+    fontSize: 12,
+    color: "#b45309",
+    marginTop: 4,
+    lineHeight: 16,
+  },
+  classificationRow: {
+    flexDirection: "row",
+    flexWrap: "wrap",
+    gap: 6,
+    marginTop: 6,
+    marginLeft: 40, // indent to align with text (past checkbox width)
+    marginBottom: 2,
+  },
+  classificationChip: {
+    marginBottom: 2,
+  },
 });

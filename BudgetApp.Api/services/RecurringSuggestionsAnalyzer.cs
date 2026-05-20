@@ -444,4 +444,344 @@ public static class RecurringSuggestionsAnalyzer
         double variance = values.Sum(v => Math.Pow(v - mean, 2)) / values.Count;
         return Math.Sqrt(variance);
     }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Debug / audit entry point
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Runs the same detection pipeline as <see cref="Analyze"/> but returns a
+    /// per-group diagnostic record for EVERY normalized group encountered,
+    /// including groups that were rejected and the reason they were rejected.
+    ///
+    /// Used exclusively by the admin/debug recurring-suggestions-audit endpoint.
+    /// Never called from the public suggestions endpoint.
+    /// </summary>
+    public static List<RecurringSuggestionAuditGroupDto> AnalyzeGroupsForDebug(
+        IReadOnlyList<Transaction> transactions,
+        DateTime cutoffDate)
+    {
+        var results = new List<RecurringSuggestionAuditGroupDto>();
+
+        if (transactions == null || transactions.Count == 0)
+            return results;
+
+        // ── Pre-filter (same as Analyze): non-pending, in window, amount > 0 ──
+        var candidates = transactions
+            .Where(t => !t.Pending && t.Date >= cutoffDate && t.Amount > 0)
+            .ToList();
+
+        if (candidates.Count == 0)
+            return results;
+
+        // ── Group by normalized name (include singletons so caller sees them) ──
+        var groups = candidates
+            .GroupBy(t => NormalizeName(t.MerchantName ?? t.Name ?? string.Empty))
+            .Where(g => !string.IsNullOrWhiteSpace(g.Key))
+            .ToList();
+
+        foreach (var group in groups)
+        {
+            string normalizedName = group.Key;
+            var txList = group.ToList();
+
+            // ── Build sample fields (independent of rejection) ─────────────────
+            var sorted = txList.OrderBy(t => t.Date).ToList();
+            var amounts = sorted.Select(t => t.Amount).ToList();
+            var dates = sorted.Select(t => t.Date.ToString("yyyy-MM-dd")).ToList();
+            var gaps = ComputeGaps(sorted);
+
+            string displayName = sorted.Last().MerchantName
+                              ?? sorted.Last().Name
+                              ?? normalizedName;
+
+            var sampleNames = sorted
+                .Select(t => t.Name ?? string.Empty)
+                .Distinct()
+                .Take(5)
+                .ToList();
+
+            var sampleMerchants = sorted
+                .Select(t => t.MerchantName ?? string.Empty)
+                .Where(m => !string.IsNullOrWhiteSpace(m))
+                .Distinct()
+                .Take(5)
+                .ToList();
+
+            var sampleKinds = sorted
+                .Select(t => t.SuggestedKind.ToString())
+                .Distinct()
+                .ToList();
+
+            decimal amtMin = amounts.Count > 0 ? amounts.Min() : 0m;
+            decimal amtMax = amounts.Count > 0 ? amounts.Max() : 0m;
+            double amtAvg = amounts.Count > 0 ? (double)amounts.Average() : 0.0;
+            decimal amtMedian = Median(amounts);
+            double cv = ComputeCoefficientOfVariation(amounts);
+
+            // ── Gate 1: singleton groups (too few to group in Analyze) ─────────
+            if (txList.Count < 2)
+            {
+                results.Add(new RecurringSuggestionAuditGroupDto(
+                    NormalizedName: normalizedName,
+                    DisplayName: displayName,
+                    OccurrenceCount: txList.Count,
+                    Dates: dates,
+                    Amounts: amounts,
+                    AmountMin: amtMin,
+                    AmountMax: amtMax,
+                    AmountAverage: Math.Round(amtAvg, 4),
+                    AmountMedian: amtMedian,
+                    DayGaps: gaps,
+                    LikelyFrequency: null,
+                    GapMatchRatio: 0.0,
+                    AmountCoefficientOfVariation: Math.Round(cv, 4),
+                    Confidence: 0,
+                    IsHardExcluded: false,
+                    IsSoftExcluded: false,
+                    IsPaymentApp: false,
+                    Included: false,
+                    RejectionReason: $"singleton-group (count={txList.Count}, minimum=2)",
+                    Warning: null,
+                    SampleTransactionNames: sampleNames,
+                    SampleMerchantNames: sampleMerchants,
+                    SampleSuggestedKinds: sampleKinds
+                ));
+                continue;
+            }
+
+            // ── Gate 2: hard exclude ───────────────────────────────────────────
+            bool isHardExcluded = false;
+            string? hardExcludeReason = null;
+
+            int incomeCount = txList.Count(t => t.SuggestedKind != TransactionSuggestedKind.Unknown);
+            if (incomeCount > txList.Count / 2)
+            {
+                isHardExcluded = true;
+                hardExcludeReason =
+                    $"hard-excluded: majority-income ({incomeCount}/{txList.Count} transactions have SuggestedKind != Unknown)";
+            }
+            else
+            {
+                foreach (var frag in HardExcludeFragments)
+                {
+                    if (normalizedName.Contains(frag, StringComparison.OrdinalIgnoreCase))
+                    {
+                        isHardExcluded = true;
+                        hardExcludeReason = $"hard-excluded: keyword '{frag}'";
+                        break;
+                    }
+                }
+            }
+
+            if (isHardExcluded)
+            {
+                results.Add(new RecurringSuggestionAuditGroupDto(
+                    NormalizedName: normalizedName,
+                    DisplayName: displayName,
+                    OccurrenceCount: txList.Count,
+                    Dates: dates,
+                    Amounts: amounts,
+                    AmountMin: amtMin,
+                    AmountMax: amtMax,
+                    AmountAverage: Math.Round(amtAvg, 4),
+                    AmountMedian: amtMedian,
+                    DayGaps: gaps,
+                    LikelyFrequency: null,
+                    GapMatchRatio: 0.0,
+                    AmountCoefficientOfVariation: Math.Round(cv, 4),
+                    Confidence: 0,
+                    IsHardExcluded: true,
+                    IsSoftExcluded: false,
+                    IsPaymentApp: false,
+                    Included: false,
+                    RejectionReason: hardExcludeReason,
+                    Warning: null,
+                    SampleTransactionNames: sampleNames,
+                    SampleMerchantNames: sampleMerchants,
+                    SampleSuggestedKinds: sampleKinds
+                ));
+                continue;
+            }
+
+            // ── Classify sensitivity (same as Analyze) ─────────────────────────
+            bool isPaymentApp = ContainsAny(normalizedName, PaymentAppFragments);
+            bool isSoftExclude = !isPaymentApp && ContainsAny(normalizedName, SoftExcludeFragments);
+
+            // ── Gate 3: no positive gaps ───────────────────────────────────────
+            if (gaps.Count == 0)
+            {
+                results.Add(new RecurringSuggestionAuditGroupDto(
+                    NormalizedName: normalizedName,
+                    DisplayName: displayName,
+                    OccurrenceCount: txList.Count,
+                    Dates: dates,
+                    Amounts: amounts,
+                    AmountMin: amtMin,
+                    AmountMax: amtMax,
+                    AmountAverage: Math.Round(amtAvg, 4),
+                    AmountMedian: amtMedian,
+                    DayGaps: gaps,
+                    LikelyFrequency: null,
+                    GapMatchRatio: 0.0,
+                    AmountCoefficientOfVariation: Math.Round(cv, 4),
+                    Confidence: 0,
+                    IsHardExcluded: false,
+                    IsSoftExcluded: isSoftExclude,
+                    IsPaymentApp: isPaymentApp,
+                    Included: false,
+                    RejectionReason: "no-positive-gaps (all occurrences on same date)",
+                    Warning: null,
+                    SampleTransactionNames: sampleNames,
+                    SampleMerchantNames: sampleMerchants,
+                    SampleSuggestedKinds: sampleKinds
+                ));
+                continue;
+            }
+
+            // ── Gate 4: frequency detection ────────────────────────────────────
+            var (frequency, matchingGapCount) = DetectFrequency(sorted, gaps);
+            double gapMatchRatio = gaps.Count > 0 ? (double)matchingGapCount / gaps.Count : 0.0;
+
+            if (frequency == null)
+            {
+                results.Add(new RecurringSuggestionAuditGroupDto(
+                    NormalizedName: normalizedName,
+                    DisplayName: displayName,
+                    OccurrenceCount: txList.Count,
+                    Dates: dates,
+                    Amounts: amounts,
+                    AmountMin: amtMin,
+                    AmountMax: amtMax,
+                    AmountAverage: Math.Round(amtAvg, 4),
+                    AmountMedian: amtMedian,
+                    DayGaps: gaps,
+                    LikelyFrequency: null,
+                    GapMatchRatio: 0.0,
+                    AmountCoefficientOfVariation: Math.Round(cv, 4),
+                    Confidence: 0,
+                    IsHardExcluded: false,
+                    IsSoftExcluded: isSoftExclude,
+                    IsPaymentApp: isPaymentApp,
+                    Included: false,
+                    RejectionReason: $"no-matching-frequency (gaps: [{string.Join(", ", gaps)}])",
+                    Warning: null,
+                    SampleTransactionNames: sampleNames,
+                    SampleMerchantNames: sampleMerchants,
+                    SampleSuggestedKinds: sampleKinds
+                ));
+                continue;
+            }
+
+            // ── Gate 5: minimum occurrence count ───────────────────────────────
+            int occurrences = sorted.Count;
+            int requiredOcc = GetMinOccurrences(frequency);
+
+            if (occurrences < requiredOcc)
+            {
+                results.Add(new RecurringSuggestionAuditGroupDto(
+                    NormalizedName: normalizedName,
+                    DisplayName: displayName,
+                    OccurrenceCount: occurrences,
+                    Dates: dates,
+                    Amounts: amounts,
+                    AmountMin: amtMin,
+                    AmountMax: amtMax,
+                    AmountAverage: Math.Round(amtAvg, 4),
+                    AmountMedian: amtMedian,
+                    DayGaps: gaps,
+                    LikelyFrequency: frequency,
+                    GapMatchRatio: Math.Round(gapMatchRatio, 4),
+                    AmountCoefficientOfVariation: Math.Round(cv, 4),
+                    Confidence: 0,
+                    IsHardExcluded: false,
+                    IsSoftExcluded: isSoftExclude,
+                    IsPaymentApp: isPaymentApp,
+                    Included: false,
+                    RejectionReason: $"too-few-occurrences (count={occurrences}, required={requiredOcc}, freq={frequency})",
+                    Warning: null,
+                    SampleTransactionNames: sampleNames,
+                    SampleMerchantNames: sampleMerchants,
+                    SampleSuggestedKinds: sampleKinds
+                ));
+                continue;
+            }
+
+            // ── Confidence scoring (same formula as Analyze) ───────────────────
+            double baseScore = gapMatchRatio * 100.0;
+            double amountPenalty = Math.Max(0.0, cv * 50.0);
+            double requiredForFullScore = GetMinOccurrences(frequency) * 1.5 + 1.0;
+            double occurrenceRatio = Math.Min(1.0, occurrences / requiredForFullScore);
+            double occurrencePenalty = Math.Max(0.0, (1.0 - occurrenceRatio) * 15.0);
+            double categoryPenalty = isSoftExclude ? 15.0 : isPaymentApp ? 10.0 : 0.0;
+            double rawConfidence = baseScore - amountPenalty - occurrencePenalty - categoryPenalty;
+            int confidence = (int)Math.Round(Math.Clamp(rawConfidence, 0.0, 100.0));
+
+            // ── Gate 6: confidence threshold ───────────────────────────────────
+            int threshold = (isSoftExclude || isPaymentApp) ? ElevatedThreshold : NormalThreshold;
+            if (confidence < threshold)
+            {
+                results.Add(new RecurringSuggestionAuditGroupDto(
+                    NormalizedName: normalizedName,
+                    DisplayName: displayName,
+                    OccurrenceCount: occurrences,
+                    Dates: dates,
+                    Amounts: amounts,
+                    AmountMin: amtMin,
+                    AmountMax: amtMax,
+                    AmountAverage: Math.Round(amtAvg, 4),
+                    AmountMedian: amtMedian,
+                    DayGaps: gaps,
+                    LikelyFrequency: frequency,
+                    GapMatchRatio: Math.Round(gapMatchRatio, 4),
+                    AmountCoefficientOfVariation: Math.Round(cv, 4),
+                    Confidence: confidence,
+                    IsHardExcluded: false,
+                    IsSoftExcluded: isSoftExclude,
+                    IsPaymentApp: isPaymentApp,
+                    Included: false,
+                    RejectionReason: $"confidence-below-threshold (score={confidence}, threshold={threshold})",
+                    Warning: isPaymentApp ? PaymentAppWarning : null,
+                    SampleTransactionNames: sampleNames,
+                    SampleMerchantNames: sampleMerchants,
+                    SampleSuggestedKinds: sampleKinds
+                ));
+                continue;
+            }
+
+            // ── Passed all gates — included ────────────────────────────────────
+            results.Add(new RecurringSuggestionAuditGroupDto(
+                NormalizedName: normalizedName,
+                DisplayName: displayName,
+                OccurrenceCount: occurrences,
+                Dates: dates,
+                Amounts: amounts,
+                AmountMin: amtMin,
+                AmountMax: amtMax,
+                AmountAverage: Math.Round(amtAvg, 4),
+                AmountMedian: amtMedian,
+                DayGaps: gaps,
+                LikelyFrequency: frequency,
+                GapMatchRatio: Math.Round(gapMatchRatio, 4),
+                AmountCoefficientOfVariation: Math.Round(cv, 4),
+                Confidence: confidence,
+                IsHardExcluded: false,
+                IsSoftExcluded: isSoftExclude,
+                IsPaymentApp: isPaymentApp,
+                Included: true,
+                RejectionReason: null,
+                Warning: isPaymentApp ? PaymentAppWarning : null,
+                SampleTransactionNames: sampleNames,
+                SampleMerchantNames: sampleMerchants,
+                SampleSuggestedKinds: sampleKinds
+            ));
+        }
+
+        // Return: included groups first, then rejected; within each bucket sort by confidence desc
+        return results
+            .OrderByDescending(r => r.Included ? 1 : 0)
+            .ThenByDescending(r => r.Confidence)
+            .ThenBy(r => r.NormalizedName)
+            .ToList();
+    }
 }

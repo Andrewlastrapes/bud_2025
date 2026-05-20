@@ -3371,6 +3371,151 @@ app.MapGet("/api/recurring/suggestions", async (ApiDbContext dbContext, HttpCont
 .WithName("GetRecurringSuggestions")
 .WithOpenApi();
 
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /api/admin/debug/users/{userId}/recurring-suggestions-audit
+//
+// Admin/debug-only endpoint that exposes full per-group diagnostic data from
+// RecurringSuggestionsAnalyzer for a specific user.  Use this to understand
+// exactly why expected recurring charges (Netflix, Max, Spotify, etc.) were
+// included or rejected by the suggestions pipeline.
+//
+// Security: X-Debug-Secret header must match DEBUG_SECRET env var / config.
+//           Returns 401 if header is missing, wrong, or no secret is configured.
+//
+// Does NOT call Plaid.
+// Does NOT modify GET /api/plaid/recurring.
+// Does NOT modify GET /api/recurring/suggestions.
+// Does NOT create migrations.
+// Returns only DTOs / anonymous objects — never EF navigation properties.
+//
+// Response structure:
+//   {
+//     userId, generatedAt, cutoffDate,
+//     summary: { allTransactionsLoaded, pendingExcludedCount, outflowCount,
+//                inflowOrZeroCount, groupCount, recurringSuggestionCount },
+//     suggestions:  [ /* same as public endpoint */ ],
+//     groups:       [ /* RecurringSuggestionAuditGroupDto per group */ ],
+//     watchList:    { terms, matches }   // scans ALL loaded txs including pending
+//   }
+// ─────────────────────────────────────────────────────────────────────────────
+app.MapGet("/api/admin/debug/users/{userId}/recurring-suggestions-audit",
+    async (int userId, HttpContext httpContext, ApiDbContext dbContext, IConfiguration config) =>
+    {
+        // ── 1. Security gate (same pattern as other admin/debug endpoints) ─────
+        var configuredSecret =
+            config["Debug:Secret"] ??
+            System.Environment.GetEnvironmentVariable("DEBUG_SECRET");
+
+        if (string.IsNullOrWhiteSpace(configuredSecret))
+            return Results.Unauthorized();
+
+        var providedSecret = httpContext.Request.Headers["X-Debug-Secret"].FirstOrDefault();
+        if (string.IsNullOrWhiteSpace(providedSecret) ||
+            !string.Equals(providedSecret, configuredSecret, StringComparison.Ordinal))
+            return Results.Unauthorized();
+
+        // ── 2. Load user ───────────────────────────────────────────────────────
+        var user = await dbContext.Users.FirstOrDefaultAsync(u => u.Id == userId);
+        if (user == null)
+            return Results.NotFound(new { error = $"User {userId} not found." });
+
+        // ── 3. Load all transactions for this user from the last 6 months ──────
+        // Same window as the public endpoint.
+        // Load ALL (including pending) so the watch-list section can tell the caller
+        // whether the transactions exist at all before worrying about grouping.
+        DateTime cutoff = DateTime.UtcNow.Date.AddMonths(-6);
+
+        var allTransactions = await dbContext.Transactions
+            .Where(t => t.UserId == userId && t.Date >= cutoff)
+            .OrderBy(t => t.Date)
+            .ToListAsync();
+
+        // Separate pending vs non-pending for summary counts
+        var nonPending = allTransactions.Where(t => !t.Pending).ToList();
+        int pendingExcludedCount = allTransactions.Count - nonPending.Count;
+        int outflowCount = nonPending.Count(t => t.Amount > 0);
+        int inflowOrZero = nonPending.Count(t => t.Amount <= 0);
+
+        // ── 4. Run the same Analyze() used by the public endpoint ──────────────
+        // (non-pending only, same cutoff)
+        var suggestions = RecurringSuggestionsAnalyzer.Analyze(nonPending, cutoff);
+
+        // ── 5. Run the debug analyzer (includes rejected groups + reasons) ─────
+        var groups = RecurringSuggestionsAnalyzer.AnalyzeGroupsForDebug(nonPending, cutoff);
+
+        // ── 6. Watch-list scan ────────────────────────────────────────────────
+        // Searches ALL loaded transactions (including pending) for common
+        // subscription terms so caller can verify whether the charges exist
+        // before digging into grouping / exclusion logic.
+        var watchTerms = new[]
+        {
+            "NETFLIX", "MAX", "HBO", "DISNEY", "HULU", "SPOTIFY",
+            "APPLE", "PARAMOUNT", "PEACOCK", "YOUTUBE", "AMAZON PRIME",
+        };
+
+        var watchMatches = allTransactions
+            .Where(t =>
+            {
+                var name = (t.MerchantName ?? t.Name ?? string.Empty).ToUpperInvariant();
+                return watchTerms.Any(term => name.Contains(term, StringComparison.OrdinalIgnoreCase));
+            })
+            .OrderBy(t => t.Date)
+            .Select(t => new
+            {
+                id = t.Id,
+                date = t.Date.ToString("yyyy-MM-dd"),
+                name = t.Name,
+                merchantName = t.MerchantName,
+                amount = t.Amount,
+                pending = t.Pending,
+                suggestedKind = t.SuggestedKind.ToString(),
+                normalizedName = RecurringSuggestionsAnalyzer.NormalizeName(
+                    t.MerchantName ?? t.Name ?? string.Empty),
+                withinCutoffWindow = t.Date >= cutoff,
+                excludedBecausePending = t.Pending,
+                excludedBecauseAmountNotPositive = t.Amount <= 0,
+            })
+            .ToList();
+
+        // ── 7. Build and return response ─────────────────────────────────────
+        string? earliestDate = allTransactions.Count > 0
+            ? allTransactions.Min(t => t.Date).ToString("yyyy-MM-dd")
+            : null;
+        string? latestDate = allTransactions.Count > 0
+            ? allTransactions.Max(t => t.Date).ToString("yyyy-MM-dd")
+            : null;
+
+        return Results.Ok(new
+        {
+            userId,
+            generatedAt = DateTime.UtcNow.ToString("O"),
+            cutoffDate = cutoff.ToString("yyyy-MM-dd"),
+            summary = new
+            {
+                allTransactionsLoaded = allTransactions.Count,
+                pendingExcludedCount,
+                outflowCount,
+                inflowOrZeroCount = inflowOrZero,
+                earliestTransactionDate = earliestDate,
+                latestTransactionDate = latestDate,
+                groupCount = groups.Count,
+                groupsIncluded = groups.Count(g => g.Included),
+                groupsRejected = groups.Count(g => !g.Included),
+                recurringSuggestionCount = suggestions.Count,
+            },
+            suggestions,
+            groups,
+            watchList = new
+            {
+                terms = watchTerms,
+                matchCount = watchMatches.Count,
+                matches = watchMatches,
+            },
+        });
+    })
+    .WithName("RecurringSuggestionsAudit")
+    .WithOpenApi();
+
 // --- RUN THE APP ---
 app.Run();
 
