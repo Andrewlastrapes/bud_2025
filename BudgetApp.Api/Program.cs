@@ -342,7 +342,13 @@ app.MapPost("/api/plaid/create_link_token", async (PlaidClient plaidClient, ICon
         User = user,
         Products = products,
         Webhook = config["Plaid:WebhookUrl"],
-        RedirectUri = "https://plaid-redirect.dynamicbudgetapp.com"
+        // RedirectUri is only needed for OAuth institutions in web/production flows.
+        // In Sandbox (dev), setting it causes link token creation to fail unless the URI
+        // is also registered in the Plaid Dashboard's Sandbox allowed-redirect-URI list.
+        // For native mobile (react-native-plaid-link-sdk) no redirect URI is needed.
+        RedirectUri = app.Environment.IsProduction()
+            ? "https://plaid-redirect.dynamicbudgetapp.com"
+            : null
     };
 
     SentrySdk.CaptureMessage($"Plaid webhook URL in create_link_token: {config["Plaid:WebhookUrl"]}");
@@ -486,7 +492,12 @@ app.MapPost("/api/plaid/exchange_public_token",
 
                 SentrySdk.CaptureException(e);
 
-                return Results.Problem("Unexpected error occurred.");
+                // In development, surface the real exception so it's visible in the response
+                var detail = app.Environment.IsDevelopment()
+                    ? $"[DEV] {e.GetType().Name}: {e.Message}\n{e.StackTrace}"
+                    : "Unexpected error occurred.";
+
+                return Results.Problem(detail);
             }
         }
     });
@@ -783,6 +794,27 @@ app.MapGet("/api/transactions", async (ApiDbContext dbContext, HttpContext httpC
 
 
 
+// ─── Shared DTO helper — avoids the User navigation-property cycle ────────────
+// Used by POST and PUT endpoints.  GET uses an inline EF projection instead
+// so EF can translate the projection to SQL without loading the entity.
+static object ToFixedCostDto(FixedCost fc) => new
+{
+    id = fc.Id,
+    userId = fc.UserId,
+    name = fc.Name,
+    amount = fc.Amount,
+    category = fc.Category,
+    type = fc.Type,
+    plaidMerchantName = fc.PlaidMerchantName,
+    plaidAccountId = fc.PlaidAccountId,
+    userHasApproved = fc.UserHasApproved,
+    recurrenceFrequency = fc.RecurrenceFrequency,
+    originalDueDayOfMonth = fc.OriginalDueDayOfMonth,
+    nextDueDate = fc.NextDueDate,
+    createdAt = fc.CreatedAt,
+    updatedAt = fc.UpdatedAt
+};
+
 // GET: /api/fixed-costs
 app.MapGet("/api/fixed-costs", async (ApiDbContext dbContext, HttpContext httpContext) =>
 {
@@ -795,9 +827,28 @@ app.MapGet("/api/fixed-costs", async (ApiDbContext dbContext, HttpContext httpCo
         var user = await dbContext.Users.FirstOrDefaultAsync(u => u.FirebaseUuid == decodedToken.Uid);
         if (user == null) return Results.NotFound("User not found.");
 
+        // Inline EF projection — never loads the FixedCost entity into memory,
+        // so the virtual User navigation property cannot trigger a serialization cycle.
         var costs = await dbContext.FixedCosts
             .Where(fc => fc.UserId == user.Id)
             .OrderBy(fc => fc.Name)
+            .Select(fc => new
+            {
+                id = fc.Id,
+                userId = fc.UserId,
+                name = fc.Name,
+                amount = fc.Amount,
+                category = fc.Category,
+                type = fc.Type,
+                plaidMerchantName = fc.PlaidMerchantName,
+                plaidAccountId = fc.PlaidAccountId,
+                userHasApproved = fc.UserHasApproved,
+                recurrenceFrequency = fc.RecurrenceFrequency,
+                originalDueDayOfMonth = fc.OriginalDueDayOfMonth,
+                nextDueDate = fc.NextDueDate,
+                createdAt = fc.CreatedAt,
+                updatedAt = fc.UpdatedAt
+            })
             .ToListAsync();
 
         return Results.Ok(costs);
@@ -848,7 +899,7 @@ app.MapPost("/api/fixed-costs", async (ApiDbContext dbContext, HttpContext httpC
         await dbContext.FixedCosts.AddAsync(newCost);
         await dbContext.SaveChangesAsync();
 
-        return Results.Ok(newCost);
+        return Results.Ok(ToFixedCostDto(newCost));
     }
     catch (Exception e)
     {
@@ -960,7 +1011,7 @@ app.MapPut("/api/fixed-costs/{id}", async (ApiDbContext dbContext, HttpContext h
             $"dueDateChanged={dueDateChanged} userId={user.Id}",
             level: BreadcrumbLevel.Info);
 
-        return Results.Ok(cost);
+        return Results.Ok(ToFixedCostDto(cost));
     }
     catch (Exception e)
     {
