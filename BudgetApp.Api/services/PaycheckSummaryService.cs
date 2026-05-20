@@ -5,13 +5,47 @@ using BudgetApp.Api.Services;
 public interface IPaycheckSummaryService
 {
     /// <summary>
-    /// Called from the Plaid webhook after transaction sync.
-    /// Checks if today is a paycheck day for the user linked to the given Plaid item.
-    /// If it is, creates or updates (recalculates) a PaycheckSummary for that user + date.
-    /// Returns the summary if created/updated, or null if skipped (not a paycheck day,
-    /// incomplete onboarding, or missing settings).
+    /// Schedule-based trigger: called from the Plaid webhook after transaction sync.
+    ///
+    /// Checks whether today falls inside a payday window for the user linked to the
+    /// given Plaid item.  If it does, creates or updates (recalculates) a
+    /// <see cref="PaycheckSummary"/> keyed to the <em>nominal payday</em> for that
+    /// window — not the literal date this method was called.
+    ///
+    /// Using the nominal payday as the key means that any call made on any day within
+    /// the same payday window (e.g. the 12th, 14th, or 17th when nominal = 15th) all
+    /// resolve to the same DB row, giving full idempotency.
+    ///
+    /// Returns the summary if created/updated, or null when skipped (not inside a
+    /// payday window, incomplete onboarding, or missing settings).
     /// </summary>
     Task<PaycheckSummary?> CreateOrUpdateSummaryIfPaycheckDayAsync(string plaidItemId, DateTime utcNow);
+
+    /// <summary>
+    /// Paycheck-deposit fallback trigger: called after each Plaid sync.
+    ///
+    /// Queries the DB for <see cref="TransactionSuggestedKind.Paycheck"/> transactions
+    /// that were saved during the current sync batch (scoped by UserId + CreatedAt ≥
+    /// syncStartedAt minus 1-minute buffer).  For each distinct nominal payday that is
+    /// not yet covered by an existing summary, creates or updates a PaycheckSummary.
+    ///
+    /// <para>
+    /// Why DB query instead of sync-response list: <c>SyncAndProcessTransactions</c>
+    /// returns <c>Going.Plaid.Transactions.TransactionsSyncResponse</c> — the raw
+    /// Plaid response — which has no <c>SuggestedKind</c>.  The only reliable source
+    /// of classified transaction data is our own <c>Transactions</c> table.
+    /// </para>
+    ///
+    /// <para>
+    /// Why no PlaidItemId filter: our <c>Transaction</c> model stores the Plaid
+    /// <c>AccountId</c> string but has no FK to <c>PlaidItems</c>.  Scoping by
+    /// UserId + CreatedAt is tight enough for a single sync batch.
+    /// </para>
+    /// </summary>
+    Task TriggerSummaryForRecentPaycheckTransactionsAsync(
+        string plaidItemId,
+        DateTime syncStartedAt,
+        DateTime utcNow);
 }
 
 public class PaycheckSummaryService : IPaycheckSummaryService
@@ -30,32 +64,25 @@ public class PaycheckSummaryService : IPaycheckSummaryService
         _notificationService = notificationService;
     }
 
+    // ─────────────────────────────────────────────────────────────────────────
+    // Schedule-based trigger
+    // ─────────────────────────────────────────────────────────────────────────
+
     public async Task<PaycheckSummary?> CreateOrUpdateSummaryIfPaycheckDayAsync(
         string plaidItemId,
         DateTime utcNow)
     {
-        // ── 1. Load PlaidItem → User (with FixedCosts) ──────────────────────────
-        var plaidItem = await _db.PlaidItems
-            .Include(p => p.User)
-                .ThenInclude(u => u.FixedCosts)
-            .FirstOrDefaultAsync(p => p.ItemId == plaidItemId);
+        var user = await LoadUserForPlaidItemAsync(plaidItemId);
+        if (user == null) return null;
 
-        if (plaidItem == null)
-        {
-            Console.WriteLine($"[PaycheckSummary] Skipped: PlaidItem not found for itemId={plaidItemId}");
-            return null;
-        }
-
-        var user = plaidItem.User;
-
-        // ── 2. Guard: onboarding must be complete ───────────────────────────────
+        // ── Guard: onboarding must be complete ──────────────────────────────
         if (!user.OnboardingComplete)
         {
             Console.WriteLine($"[PaycheckSummary] Skipped: onboarding incomplete for userId={user.Id}");
             return null;
         }
 
-        // ── 3. Guard: paycheck settings must be configured ──────────────────────
+        // ── Guard: paycheck settings must be configured ──────────────────────
         if (user.PayDay1 == 0 && user.PayDay2 == 0)
         {
             Console.WriteLine($"[PaycheckSummary] Skipped: no paydays configured for userId={user.Id}");
@@ -68,68 +95,202 @@ public class PaycheckSummaryService : IPaycheckSummaryService
             return null;
         }
 
-        // ── 4. Guard: is today actually a paycheck day? ─────────────────────────
-        var today = utcNow.Date; // UTC midnight
-        int todayDay = today.Day;
-        bool isPayDay1 = user.PayDay1 == todayDay;
-        bool isPayDay2 = user.PayDay2 == todayDay;
+        // ── Window-based trigger (replaces the old exact-day check) ─────────
+        // Old code: today.Day == user.PayDay1 || today.Day == user.PayDay2
+        // New code: is today inside the ±window around any configured nominal payday?
+        var todayOnly = DateOnly.FromDateTime(utcNow.Date);
+        var nominalPayday = PaydayCycleHelper.GetNominalPaydayForDate(
+            todayOnly, user.PayDay1, user.PayDay2);
 
-        if (!isPayDay1 && !isPayDay2)
+        if (nominalPayday is null)
         {
-            Console.WriteLine($"[PaycheckSummary] Skipped: today ({today:yyyy-MM-dd}) is not a paycheck day for userId={user.Id} " +
-                $"(PayDay1={user.PayDay1}, PayDay2={user.PayDay2})");
+            Console.WriteLine(
+                $"[PaycheckSummary] Skipped (scheduled): {todayOnly:yyyy-MM-dd} is not inside any " +
+                $"payday window for userId={user.Id} (PayDay1={user.PayDay1}, PayDay2={user.PayDay2})");
             return null;
         }
 
-        // ── 5. Compute period dates ─────────────────────────────────────────────
-        var paycheckDate = today;
+        return await BuildAndSavePaycheckSummaryAsync(user, nominalPayday.Value, utcNow, "scheduled");
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Paycheck-deposit fallback trigger
+    // ─────────────────────────────────────────────────────────────────────────
+
+    public async Task TriggerSummaryForRecentPaycheckTransactionsAsync(
+        string plaidItemId,
+        DateTime syncStartedAt,
+        DateTime utcNow)
+    {
+        var user = await LoadUserForPlaidItemAsync(plaidItemId);
+        if (user == null) return;
+
+        if (!user.OnboardingComplete) return;
+        if (user.PayDay1 == 0 && user.PayDay2 == 0) return;
+        if (user.ExpectedPaycheckAmount <= 0) return;
+
+        // ── Query tightly scoped to this sync batch ──────────────────────────
+        // Transaction has no PlaidItemId FK.  Scope: UserId + SuggestedKind
+        // + CreatedAt >= (syncStartedAt − 1 min to absorb minor clock skew).
+        var cutoff = syncStartedAt.AddMinutes(-1);
+
+        var recentPaycheckDates = await _db.Transactions
+            .Where(t =>
+                t.UserId == user.Id
+                && t.SuggestedKind == TransactionSuggestedKind.Paycheck
+                && t.CreatedAt >= cutoff)
+            .Select(t => t.Date)
+            .Distinct()
+            .ToListAsync();
+
+        if (!recentPaycheckDates.Any())
+        {
+            Console.WriteLine(
+                $"[PaycheckSummary] Fallback: no recent Paycheck transactions found for " +
+                $"userId={user.Id} since {cutoff:yyyy-MM-dd HH:mm:ss}Z");
+            return;
+        }
+
+        Console.WriteLine(
+            $"[PaycheckSummary] Fallback: found {recentPaycheckDates.Count} Paycheck " +
+            $"transaction date(s) for userId={user.Id}");
+
+        foreach (var txDate in recentPaycheckDates)
+        {
+            var txDateOnly = DateOnly.FromDateTime(txDate.Date);
+
+            // Resolve to the nearest nominal payday (in-window = fast path;
+            // out-of-window = nearest by calendar distance).
+            var nominalPayday = PaydayCycleHelper.GetNearestNominalPaydayForDate(
+                txDateOnly, user.PayDay1, user.PayDay2);
+
+            Console.WriteLine(
+                $"[PaycheckSummary] Fallback trigger: txDate={txDateOnly} → " +
+                $"nominalPayday={nominalPayday} for userId={user.Id}");
+
+            // BuildAndSavePaycheckSummaryAsync handles the idempotency check
+            // (including window-based lookup for migrating old today-keyed rows).
+            await BuildAndSavePaycheckSummaryAsync(user, nominalPayday, utcNow, "paycheck-fallback");
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Shared helpers
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Loads the <see cref="User"/> (with FixedCosts) linked to a Plaid item.
+    /// Returns null and logs a message when the item is not found.
+    /// </summary>
+    private async Task<User?> LoadUserForPlaidItemAsync(string plaidItemId)
+    {
+        var plaidItem = await _db.PlaidItems
+            .Include(p => p.User)
+                .ThenInclude(u => u.FixedCosts)
+            .FirstOrDefaultAsync(p => p.ItemId == plaidItemId);
+
+        if (plaidItem == null)
+        {
+            Console.WriteLine(
+                $"[PaycheckSummary] Skipped: PlaidItem not found for itemId={plaidItemId}");
+            return null;
+        }
+
+        return plaidItem.User;
+    }
+
+    /// <summary>
+    /// Core logic: computes all payday-summary metrics for the pay period whose
+    /// nominal payday is <paramref name="nominalPayday"/>, then upserts the
+    /// <see cref="PaycheckSummary"/> row.
+    ///
+    /// <para>
+    /// The nominal payday date is used as the canonical <c>PaycheckDate</c> key.
+    /// If an existing row is found with a different date inside the same window
+    /// (pre-migration row keyed to the literal date), its <c>PaycheckDate</c> is
+    /// updated to the nominal date so future lookups find it correctly.
+    /// </para>
+    /// </summary>
+    private async Task<PaycheckSummary?> BuildAndSavePaycheckSummaryAsync(
+        User user,
+        DateOnly nominalPayday,
+        DateTime utcNow,
+        string trigger)
+    {
+        // Canonical UTC midnight for the nominal payday — used as the DB key.
+        var paycheckDate = nominalPayday.ToDateTime(TimeOnly.MinValue, DateTimeKind.Utc);
+
+        // ── Period dates ─────────────────────────────────────────────────────
         var periodStartDate = _engine.GetPreviousPaycheckDate(user, paycheckDate);
         var periodEndDate = paycheckDate;
         var nextPaycheckDate = _engine.GetNextPaycheckDate(user, paycheckDate);
 
-        // ── 6. Calculate prior-period spend ─────────────────────────────────────
-        // Counts settled (non-pending), non-income expenses in the prior period.
-        // Excludes transactions the user explicitly tagged IgnoreForDynamic.
+        // ── Prior-period spend ───────────────────────────────────────────────
+        // Settled (non-pending) debit transactions in the prior period, excluding
+        // income and any the user marked IgnoreForDynamic.
         var priorPeriodSpend = await _db.Transactions
             .Where(t =>
                 t.UserId == user.Id
-                && !t.Pending                                                        // settled (not pending)
-                && t.Amount > 0                                                      // debit / expense
-                && !t.CountedAsIncome                                                // not income
-                && t.UserDecision != TransactionUserDecision.IgnoreForDynamic        // not excluded
+                && !t.Pending
+                && t.Amount > 0                             // debit / expense
+                && !t.CountedAsIncome
+                && t.UserDecision != TransactionUserDecision.IgnoreForDynamic
                 && t.Date >= periodStartDate
                 && t.Date < paycheckDate)
             .SumAsync(t => (decimal?)t.Amount) ?? 0m;
 
-        // ── 7. Approximate prior-period starting budget ─────────────────────────
+        // ── Prior-period budget & under/over metrics ─────────────────────────
         decimal priorPeriodStartingBudget = _engine.ComputeBudgetForUser(user, periodStartDate);
-
-        // ── 8. Derive under/over budget metrics ─────────────────────────────────
         decimal priorPeriodRemaining = priorPeriodStartingBudget - priorPeriodSpend;
         bool wasUnderBudget = priorPeriodRemaining >= 0;
         decimal leftoverAmount = wasUnderBudget ? priorPeriodRemaining : 0m;
         decimal overBudgetAmount = wasUnderBudget ? 0m : Math.Abs(priorPeriodRemaining);
 
-        // ── 9. Compute new-period budget values ─────────────────────────────────
+        // ── New-period budget values ─────────────────────────────────────────
         decimal fixedCostsUntilNextPaycheck = _engine.ComputeFixedCostsUntilNextPaycheck(user, paycheckDate);
         decimal newDynamicBudgetAmount = _engine.ComputeBudgetForUser(user, paycheckDate);
         decimal savingsContribution = user.SavingsContributionAmount;
         decimal debtPaymentAmount = user.DebtPerPaycheck ?? 0m;
         decimal paycheckAmount = user.ExpectedPaycheckAmount;
 
-        // ── 10. Upsert ──────────────────────────────────────────────────────────
+        // ── Compatibility-aware upsert ───────────────────────────────────────
+        // Look for an existing summary keyed to the exact nominal date first.
+        // If not found, search within the full payday window to catch rows that
+        // were written before this code change used `today` instead of the
+        // nominal date (migration compatibility).
+        var windowStart = nominalPayday
+            .AddDays(-PaydayCycleHelper.DefaultDaysBefore)
+            .ToDateTime(TimeOnly.MinValue, DateTimeKind.Utc);
+
+        // Exclusive upper bound: the day after the window end.
+        var windowEndExclusive = nominalPayday
+            .AddDays(PaydayCycleHelper.DefaultDaysAfter + 1)
+            .ToDateTime(TimeOnly.MinValue, DateTimeKind.Utc);
+
         var existing = await _db.PaycheckSummaries
-            .FirstOrDefaultAsync(s => s.UserId == user.Id && s.PaycheckDate == paycheckDate);
+            .FirstOrDefaultAsync(s =>
+                s.UserId == user.Id &&
+                (s.PaycheckDate == paycheckDate ||
+                 (s.PaycheckDate >= windowStart && s.PaycheckDate < windowEndExclusive)));
 
         bool isNewRecord = existing == null;
         var summary = existing ?? new PaycheckSummary
         {
             UserId = user.Id,
-            PaycheckDate = paycheckDate,
+            PaycheckDate = paycheckDate,   // canonical nominal-date key
             CreatedAt = utcNow
         };
 
-        // Update all computed fields (same for create and update)
+        // Migrate a pre-existing row that was keyed to a non-nominal date.
+        if (!isNewRecord && summary.PaycheckDate != paycheckDate)
+        {
+            Console.WriteLine(
+                $"[PaycheckSummary] Migrating PaycheckDate {summary.PaycheckDate:yyyy-MM-dd} → " +
+                $"{paycheckDate:yyyy-MM-dd} for userId={user.Id} (nominal-payday alignment)");
+            summary.PaycheckDate = paycheckDate;
+        }
+
+        // ── Update all computed fields (same for insert and update) ──────────
         summary.PeriodStartDate = periodStartDate;
         summary.PeriodEndDate = periodEndDate;
         summary.NextPaycheckDate = nextPaycheckDate;
@@ -147,18 +308,18 @@ public class PaycheckSummaryService : IPaycheckSummaryService
         summary.UpdatedAt = utcNow;
 
         if (isNewRecord)
-        {
             _db.PaycheckSummaries.Add(summary);
-        }
 
         await _db.SaveChangesAsync();
 
         if (isNewRecord)
         {
-            Console.WriteLine($"[PaycheckSummary] Created for userId={user.Id} on {paycheckDate:yyyy-MM-dd} " +
-                $"| spend={priorPeriodSpend:F2} | budget={priorPeriodStartingBudget:F2} | underBudget={wasUnderBudget}");
+            Console.WriteLine(
+                $"[PaycheckSummary] Created ({trigger}) for userId={user.Id} " +
+                $"on {paycheckDate:yyyy-MM-dd} | spend={priorPeriodSpend:F2} " +
+                $"| budget={priorPeriodStartingBudget:F2} | underBudget={wasUnderBudget}");
 
-            // Push notification only on first creation — same-day recalculations are silent
+            // Push notification only on first creation — recalculations are silent.
             try
             {
                 string notifBody = wasUnderBudget
@@ -174,14 +335,17 @@ public class PaycheckSummaryService : IPaycheckSummaryService
             }
             catch (Exception ex)
             {
-                Console.Error.WriteLine($"[PaycheckSummary] Push notification failed for userId={user.Id}: {ex.Message}");
-                // Do not rethrow — notification failure must not block summary creation
+                Console.Error.WriteLine(
+                    $"[PaycheckSummary] Push notification failed for userId={user.Id}: {ex.Message}");
+                // Do not rethrow — notification failure must not block summary creation.
             }
         }
         else
         {
-            Console.WriteLine($"[PaycheckSummary] Updated (recalculated) for userId={user.Id} on {paycheckDate:yyyy-MM-dd} " +
-                $"| spend={priorPeriodSpend:F2} | budget={priorPeriodStartingBudget:F2}");
+            Console.WriteLine(
+                $"[PaycheckSummary] Updated ({trigger}) for userId={user.Id} " +
+                $"on {paycheckDate:yyyy-MM-dd} | spend={priorPeriodSpend:F2} " +
+                $"| budget={priorPeriodStartingBudget:F2}");
         }
 
         return summary;

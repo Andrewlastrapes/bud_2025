@@ -487,6 +487,46 @@ namespace BudgetApp.Api.Services
                                     matchedFc.PlaidAccountId = t.AccountId;
                                 }
 
+                                // ── Advance NextDueDate for recurring fixed costs ───────────
+                                // Advance the due date past the matched transaction so the cost
+                                // participates correctly in the NEXT budget period and the
+                                // matcher can re-match next month.
+                                //
+                                // OneTime costs are NOT advanced — they retain their original
+                                // NextDueDate so they remain visible but won't auto-advance.
+                                //
+                                // OriginalDueDayOfMonth is used by FixedCostAdvancer to
+                                // restore the intended day after short-month clamping
+                                // (e.g. Jan 31 → Feb 28 → Mar 31).
+                                // We intentionally do NOT update OriginalDueDayOfMonth here —
+                                // only explicit user edits via PUT /api/fixed-costs/{id} may
+                                // change it.
+                                string fcFreq = matchedFc.RecurrenceFrequency ?? "Monthly";
+                                bool isRecurring = !string.Equals(
+                                    fcFreq, "OneTime", StringComparison.OrdinalIgnoreCase);
+
+                                if (matchedFc.NextDueDate.HasValue && isRecurring)
+                                {
+                                    DateTime oldDueDate = matchedFc.NextDueDate.Value;
+                                    matchedFc.NextDueDate = FixedCostAdvancer.AdvanceNextDueDate(
+                                        oldDueDate,
+                                        fcFreq,
+                                        txDateUtc,
+                                        matchedFc.OriginalDueDayOfMonth);
+                                    matchedFc.UpdatedAt = DateTime.UtcNow;
+
+                                    _logger.LogInformation(
+                                        "Fixed cost NextDueDate advanced: " +
+                                        "fixedCostId={FixedCostId} fixedCostName={FixedCostName} " +
+                                        "recurrenceFrequency={Frequency} " +
+                                        "oldDueDate={OldDueDate} newDueDate={NewDueDate} " +
+                                        "triggeredByTx={PlaidTxId}",
+                                        matchedFc.Id, matchedFc.Name, fcFreq,
+                                        oldDueDate.ToString("yyyy-MM-dd"),
+                                        matchedFc.NextDueDate.Value.ToString("yyyy-MM-dd"),
+                                        t.TransactionId);
+                                }
+
                                 _logger.LogInformation(
                                     "Transaction matched as fixed cost (no budget impact): " +
                                     "plaidTxId={PlaidTxId} merchant={Merchant} amount={Amount} " +

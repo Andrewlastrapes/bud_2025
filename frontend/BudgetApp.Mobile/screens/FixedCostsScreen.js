@@ -31,6 +31,20 @@ const CATEGORIES = [
   "Other",
 ];
 
+// ─── Recurrence frequency options ────────────────────────────────────────────
+// "Monthly" is the default and covers 95% of bills.
+// "OneTime" costs are NEVER auto-advanced — they sit with their original due date.
+const FREQUENCIES = ["Monthly", "BiMonthly", "Quarterly", "Annual", "OneTime"];
+
+// Human-readable labels shown on chips and in the list description
+const FREQ_LABELS = {
+  Monthly: "Monthly",
+  BiMonthly: "Every 2 months",
+  Quarterly: "Quarterly",
+  Annual: "Annual",
+  OneTime: "One-time",
+};
+
 export default function FixedCostsScreen() {
   const [costs, setCosts] = useState([]);
   const [isLoading, setIsLoading] = useState(false);
@@ -41,6 +55,7 @@ export default function FixedCostsScreen() {
   const [newAmount, setNewAmount] = useState("");
   const [newCategory, setNewCategory] = useState("Other");
   const [newDueDate, setNewDueDate] = useState("");
+  const [newFrequency, setNewFrequency] = useState("Monthly");
 
   // ── Edit modal state ──
   const [isEditModalVisible, setIsEditModalVisible] = useState(false);
@@ -49,6 +64,7 @@ export default function FixedCostsScreen() {
   const [editAmount, setEditAmount] = useState("");
   const [editCategory, setEditCategory] = useState("Other");
   const [editDueDate, setEditDueDate] = useState("");
+  const [editFrequency, setEditFrequency] = useState("Monthly");
 
   // ── Snackbar ──
   const [snackbarMessage, setSnackbarMessage] = useState("");
@@ -113,6 +129,7 @@ export default function FixedCostsScreen() {
           category: newCategory,
           type: "manual",
           nextDueDate,
+          recurrenceFrequency: newFrequency,
         },
         config,
       );
@@ -122,12 +139,16 @@ export default function FixedCostsScreen() {
       setNewAmount("");
       setNewCategory("Other");
       setNewDueDate("");
+      setNewFrequency("Monthly");
       setIsAddModalVisible(false);
 
       await fetchCosts();
 
+      const isOneTime = newFrequency === "OneTime";
       const msg = nextDueDate
-        ? "Fixed cost saved. Your budget will reflect this after the next recalculation."
+        ? isOneTime
+          ? "Fixed cost saved. This is a one-time cost — it won't auto-advance after it's matched."
+          : "Fixed cost saved. The due date will automatically advance after each matched transaction."
         : "Fixed cost saved (no due date set — it will not affect the current budget period until a due date is added).";
       setSnackbarMessage(msg);
     } catch (e) {
@@ -143,6 +164,8 @@ export default function FixedCostsScreen() {
     setEditAmount(String(cost.amount || ""));
     setEditCategory(cost.category || "Other");
     setEditDueDate(formatMMDD(cost.nextDueDate) || "");
+    // Fall back to Monthly for older costs that don't have the field yet
+    setEditFrequency(cost.recurrenceFrequency || "Monthly");
     setIsEditModalVisible(true);
   };
 
@@ -176,6 +199,7 @@ export default function FixedCostsScreen() {
           category: editCategory,
           type: editingCost.type || "manual",
           nextDueDate,
+          recurrenceFrequency: editFrequency,
         },
         config,
       );
@@ -185,8 +209,11 @@ export default function FixedCostsScreen() {
 
       await fetchCosts();
 
+      const isOneTime = editFrequency === "OneTime";
       const msg = nextDueDate
-        ? "Fixed cost updated. Your budget will reflect this after the next recalculation."
+        ? isOneTime
+          ? "Fixed cost updated. One-time cost — due date won't auto-advance."
+          : "Fixed cost updated. Due date will auto-advance after each matched transaction."
         : "Fixed cost updated (no due date — not included in current budget period).";
       setSnackbarMessage(msg);
     } catch (e) {
@@ -224,11 +251,15 @@ export default function FixedCostsScreen() {
       ? `Due: ${displayDate}`
       : "⚠️ No due date — not included in budget";
     const categoryLine = item.category || "other";
+    const freqLabel =
+      FREQ_LABELS[item.recurrenceFrequency] ||
+      item.recurrenceFrequency ||
+      "Monthly";
 
     return (
       <List.Item
         title={item.name}
-        description={`$${item.amount.toFixed(2)}  ·  ${categoryLine}\n${dueLine}`}
+        description={`$${item.amount.toFixed(2)}  ·  ${categoryLine}  ·  ${freqLabel}\n${dueLine}`}
         descriptionNumberOfLines={2}
         left={() => (
           <List.Icon
@@ -267,6 +298,23 @@ export default function FixedCostsScreen() {
           compact
         >
           {cat}
+        </Chip>
+      ))}
+    </View>
+  );
+
+  // ─── Frequency chip row ───────────────────────────────────────────────────
+  const renderFrequencyChips = (selected, onSelect) => (
+    <View style={styles.chipRow}>
+      {FREQUENCIES.map((freq) => (
+        <Chip
+          key={freq}
+          selected={selected === freq}
+          onPress={() => onSelect(freq)}
+          style={styles.chip}
+          compact
+        >
+          {FREQ_LABELS[freq]}
         </Chip>
       ))}
     </View>
@@ -322,16 +370,19 @@ export default function FixedCostsScreen() {
               />
               <Text style={styles.label}>Category</Text>
               {renderCategoryChips(newCategory, setNewCategory)}
+              <Text style={styles.label}>How often does this recur?</Text>
+              {renderFrequencyChips(newFrequency, setNewFrequency)}
               <TextInput
-                label="Due Date (MM/DD) — required to affect budget"
+                label="Next Due Date (MM/DD) — required to affect budget"
                 value={newDueDate}
                 onChangeText={setNewDueDate}
                 placeholder="MM/DD"
                 style={styles.input}
               />
               <Text style={styles.hint}>
-                Leave blank if unknown. Without a due date this cost will not be
-                counted in the current budget period.
+                {newFrequency === "OneTime"
+                  ? "One-time cost: enter the due date. It won't auto-advance after it's matched."
+                  : "The due date will automatically advance to the next period after each matched transaction — you don't need to update it manually."}
               </Text>
               <Button
                 mode="contained"
@@ -370,16 +421,19 @@ export default function FixedCostsScreen() {
               />
               <Text style={styles.label}>Category</Text>
               {renderCategoryChips(editCategory, setEditCategory)}
+              <Text style={styles.label}>How often does this recur?</Text>
+              {renderFrequencyChips(editFrequency, setEditFrequency)}
               <TextInput
-                label="Due Date (MM/DD)"
+                label="Next Due Date (MM/DD)"
                 value={editDueDate}
                 onChangeText={setEditDueDate}
                 placeholder="MM/DD"
                 style={styles.input}
               />
               <Text style={styles.hint}>
-                Update this each month to keep the cost active in your budget.
-                Without a date it will not be counted in the current period.
+                {editFrequency === "OneTime"
+                  ? "One-time cost: the due date won't auto-advance after being matched."
+                  : "The due date will automatically advance after each matched transaction — no need to update it manually each month."}
               </Text>
               <Button
                 mode="contained"

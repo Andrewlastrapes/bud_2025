@@ -23,13 +23,19 @@ const DECISIONS = {
 
 // These numeric values MUST match your C# enum TransactionSuggestedKind
 // public enum TransactionSuggestedKind { Unknown = 0, Paycheck = 1, Windfall = 2, InternalTransfer = 3, Refund = 4 }
-// Used as a defensive client-side guard: only render rows the backend already
-// filtered, but double-check here in case of future regressions.
-const DEPOSIT_SUGGESTED_KINDS = [1, 2, 3, 4]; // Paycheck, Windfall, InternalTransfer, Refund
+//
+// IMPORTANT: Paycheck (1) is intentionally excluded from this screen.
+// Paychecks are *expected* income — the user already entered their paycheck
+// schedule and expected amount during onboarding, and the dynamic budget
+// already accounts for them. Showing paychecks here would be confusing and
+// redundant. This screen is only for *unexpected* deposits that need review.
+//
+// Defensive client-side guard: even if a future backend regression leaks a
+// paycheck row through, it will be filtered out here.
+const DEPOSIT_SUGGESTED_KINDS = [2, 3, 4]; // Windfall, InternalTransfer, Refund
 
 // Human-readable kind labels shown as a subtitle hint on each card.
 const KIND_LABELS = {
-  1: "Paycheck",
   2: "Windfall",
   3: "Transfer in",
   4: "Refund",
@@ -177,7 +183,8 @@ export default function DepositReviewScreen() {
           <Text style={styles.emptyIcon}>💚</Text>
           <Text style={styles.emptyHeading}>No new deposits to review.</Text>
           <Text style={styles.emptySubtext}>
-            New paychecks, refunds, and transfers will appear here.
+            Unexpected deposits like refunds, windfalls, and transfers in will
+            appear here.
           </Text>
         </View>
       ) : (

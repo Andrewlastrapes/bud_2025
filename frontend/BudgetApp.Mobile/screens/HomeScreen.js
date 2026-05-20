@@ -32,6 +32,14 @@ export default function HomeScreen({ navigation }) {
     count: 0,
     totalAmount: 0,
   });
+  // depositSummary: { count, totalAmount } for undecided unexpected deposits
+  // (Windfall, InternalTransfer, Refund only — Paycheck is excluded because it
+  // is expected income already planned at onboarding).
+  // null = not yet loaded; { count: 0 } = loaded but nothing to show.
+  const [depositSummary, setDepositSummary] = useState({
+    count: 0,
+    totalAmount: 0,
+  });
   const isFocused = useIsFocused();
 
   // Helper to get auth headers
@@ -100,12 +108,32 @@ export default function HomeScreen({ navigation }) {
     }
   };
 
+  // Fetches count + total of undecided unexpected deposits (Windfall, InternalTransfer, Refund).
+  // Paycheck is excluded — it is expected income already accounted for at onboarding.
+  // Non-fatal: banner just won't show if this fails.
+  const fetchDepositSummary = async () => {
+    try {
+      const config = await getAuthHeader();
+      const response = await axios.get(
+        `${API_BASE_URL}/api/transactions/deposits/pending/summary`,
+        config,
+      );
+      setDepositSummary({
+        count: response.data.count ?? 0,
+        totalAmount: response.data.totalAmount ?? 0,
+      });
+    } catch (e) {
+      console.error("Failed to fetch deposit summary:", e);
+    }
+  };
+
   useEffect(() => {
     if (isFocused) {
       fetchBalance();
       fetchHoldCount();
       fetchLargeExpenseSummary();
       fetchDebtSummary();
+      fetchDepositSummary();
     }
   }, [isFocused]);
 
@@ -207,6 +235,30 @@ export default function HomeScreen({ navigation }) {
               </Text>
             </View>
             <Text style={styles.holdChevron}>›</Text>
+          </TouchableOpacity>
+        )}
+
+        {/* ── Unexpected deposit banner ── */}
+        {/* Shown when Windfall, InternalTransfer, or Refund deposits are     */}
+        {/* awaiting review. Paycheck is excluded — it is expected income.    */}
+        {depositSummary.count > 0 && (
+          <TouchableOpacity
+            style={styles.depositBanner}
+            onPress={() => navigation.navigate("DepositReview")}
+            activeOpacity={0.8}
+          >
+            <Text style={styles.depositIcon}>💚</Text>
+            <View style={styles.holdTextBlock}>
+              <Text style={styles.depositTitle}>
+                {depositSummary.count} Unexpected Deposit
+                {depositSummary.count > 1 ? "s" : ""} to Review
+              </Text>
+              <Text style={styles.depositSub}>
+                ${depositSummary.totalAmount.toFixed(2)} awaiting your decision.
+                Tap to review.
+              </Text>
+            </View>
+            <Text style={styles.depositChevron}>›</Text>
           </TouchableOpacity>
         )}
 
@@ -429,6 +481,43 @@ const styles = StyleSheet.create({
     color: "#3B82F6",
     marginTop: 2,
     lineHeight: 18,
+  },
+
+  // ── Unexpected deposit banner ─────────────────────────────────
+  // Teal palette (#0D9488 family) — visually distinct from:
+  //   hold banner    (amber  #FFFBEB / #FDE68A)
+  //   large expense  (blue   #EFF6FF / #BFDBFE)
+  depositBanner: {
+    flexDirection: "row",
+    alignItems: "center",
+    backgroundColor: "#F0FDFA",
+    borderWidth: 1,
+    borderColor: "#99F6E4",
+    borderRadius: 14,
+    paddingVertical: 14,
+    paddingHorizontal: 16,
+    marginBottom: 16,
+  },
+  depositIcon: {
+    fontSize: 20,
+    marginRight: 12,
+  },
+  depositTitle: {
+    fontSize: 14,
+    fontWeight: "700",
+    color: "#0F766E",
+  },
+  depositSub: {
+    fontSize: 12,
+    color: "#0D9488",
+    marginTop: 2,
+    lineHeight: 18,
+  },
+  depositChevron: {
+    fontSize: 22,
+    color: "#0D9488",
+    marginLeft: 8,
+    fontWeight: "300",
   },
 
   // ── Debt payoff card ──────────────────────────────────────────

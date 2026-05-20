@@ -835,7 +835,14 @@ app.MapPost("/api/fixed-costs", async (ApiDbContext dbContext, HttpContext httpC
             UserHasApproved = true,
             CreatedAt = DateTime.UtcNow,
             UpdatedAt = DateTime.UtcNow,
-            NextDueDate = requestBody.NextDueDate
+            NextDueDate = requestBody.NextDueDate,
+            // Recurrence — default Monthly if not provided
+            RecurrenceFrequency = !string.IsNullOrWhiteSpace(requestBody.RecurrenceFrequency)
+                ? requestBody.RecurrenceFrequency
+                : "Monthly",
+            // OriginalDueDayOfMonth: set once from the initial due date.
+            // Never overwritten by automatic advancement — only user edits may change it.
+            OriginalDueDayOfMonth = requestBody.NextDueDate?.Day
         };
 
         await dbContext.FixedCosts.AddAsync(newCost);
@@ -917,8 +924,29 @@ app.MapPut("/api/fixed-costs/{id}", async (ApiDbContext dbContext, HttpContext h
         if (!string.IsNullOrWhiteSpace(requestBody.Type))
             cost.Type = requestBody.Type;
 
+        // RecurrenceFrequency: update if the caller provides a non-empty value.
+        if (!string.IsNullOrWhiteSpace(requestBody.RecurrenceFrequency))
+            cost.RecurrenceFrequency = requestBody.RecurrenceFrequency;
+
         // NextDueDate: accept null (clears the date) or any valid DateTime from caller.
+        // IMPORTANT: only update OriginalDueDayOfMonth when the user explicitly changes
+        // the due date.  Automatic recurrence advancement NEVER calls this endpoint, so
+        // any write here is always a deliberate user edit.
+        //
+        // Why this matters: if a bill is intended for the 31st but the current
+        // NextDueDate landed on Feb 28 after a short-month clamp, we still need
+        // OriginalDueDayOfMonth = 31 so the NEXT advance restores Mar 31.
+        // Overwriting it with 28 here would permanently lose that intent.
+        bool dueDateChanged = cost.NextDueDate?.Date != requestBody.NextDueDate?.Date;
         cost.NextDueDate = requestBody.NextDueDate;
+
+        if (dueDateChanged)
+        {
+            // Capture the new intended day-of-month from the user's explicit edit.
+            // Null if the user cleared the due date.
+            cost.OriginalDueDayOfMonth = requestBody.NextDueDate?.Day;
+        }
+        // else: leave OriginalDueDayOfMonth unchanged — it reflects the user's original intent.
 
         cost.UpdatedAt = DateTime.UtcNow;
 
@@ -926,7 +954,10 @@ app.MapPut("/api/fixed-costs/{id}", async (ApiDbContext dbContext, HttpContext h
 
         SentrySdk.AddBreadcrumb(
             $"FixedCost updated: id={cost.Id} name={cost.Name} amount={cost.Amount} " +
-            $"category={cost.Category} nextDueDate={cost.NextDueDate?.ToString("yyyy-MM-dd") ?? "(null)"} userId={user.Id}",
+            $"category={cost.Category} recurrenceFrequency={cost.RecurrenceFrequency} " +
+            $"nextDueDate={cost.NextDueDate?.ToString("yyyy-MM-dd") ?? "(null)"} " +
+            $"originalDueDayOfMonth={cost.OriginalDueDayOfMonth?.ToString() ?? "(null)"} " +
+            $"dueDateChanged={dueDateChanged} userId={user.Id}",
             level: BreadcrumbLevel.Info);
 
         return Results.Ok(cost);
@@ -1595,7 +1626,10 @@ ITransactionService transactionService,
                 scope.SetExtra("sync.durationMs", (int)syncDuration.TotalMilliseconds);
             });
 
-        // ── Paycheck Summary ─────────────────────────────────────────────────
+        // ── Paycheck Summary: schedule-based trigger ─────────────────────────
+        // Fires when today is inside the ±window around a configured nominal payday.
+        // Uses the nominal payday date (not today) as the PaycheckSummary key,
+        // so repeated webhook calls within the same window are idempotent.
         try
         {
             await paycheckSummaryService.CreateOrUpdateSummaryIfPaycheckDayAsync(
@@ -1604,7 +1638,24 @@ ITransactionService transactionService,
         }
         catch (Exception pex)
         {
-            Console.Error.WriteLine($"[PaycheckSummary] Webhook handler error for itemId={requestBody.ItemId}: {pex.Message}");
+            Console.Error.WriteLine($"[PaycheckSummary] Scheduled trigger error for itemId={requestBody.ItemId}: {pex.Message}");
+        }
+
+        // ── Paycheck Summary: paycheck-deposit fallback trigger ───────────────
+        // Queries the DB for Paycheck transactions created during THIS sync batch
+        // (scoped by UserId + SuggestedKind + CreatedAt >= receivedAt − 1 min).
+        // For each distinct nominal payday not yet covered, creates/updates a summary.
+        // Non-fatal — failure here must not block the webhook response.
+        try
+        {
+            await paycheckSummaryService.TriggerSummaryForRecentPaycheckTransactionsAsync(
+                requestBody.ItemId ?? string.Empty,
+                receivedAt,
+                DateTime.UtcNow);
+        }
+        catch (Exception pfEx)
+        {
+            Console.Error.WriteLine($"[PaycheckSummary] Fallback trigger error for itemId={requestBody.ItemId}: {pfEx.Message}");
         }
 
         return Results.Ok(new
@@ -1666,16 +1717,21 @@ app.MapGet("/api/transactions/deposits/pending", async (ApiDbContext dbContext, 
         var user = await dbContext.Users.FirstOrDefaultAsync(u => u.FirebaseUuid == decodedToken.Uid);
         if (user == null) return Results.NotFound("User not found.");
 
-        // "Deposit" = transaction classified as a true account inflow.
-        // Only the four deposit-style SuggestedKind values are eligible;
-        // debit/spend transactions always keep SuggestedKind == Unknown and
-        // must never appear here.
+        // "Unexpected deposit" = a credit that is NOT a normal paycheck.
+        // Paychecks are expected income — the user entered their paycheck schedule
+        // and expected amount during onboarding, so the dynamic budget already
+        // accounts for them. Showing paychecks in "Review New Deposits" would be
+        // confusing and redundant.
+        //
+        // Only unexpected inflows need user review:
+        //   Windfall          — large one-off credit (e.g. tax return, bonus)
+        //   InternalTransfer  — bank-to-bank transfer in
+        //   Refund            — merchant or card refund
+        //
         // Note: Transaction.Amount is always stored as a positive absolute value
-        // (Math.Abs of the Plaid raw amount), so amount sign cannot be used to
-        // distinguish credits from debits after storage.
+        // (Math.Abs of the Plaid raw amount), so amount sign is NOT used here.
         var depositKinds = new[]
         {
-            TransactionSuggestedKind.Paycheck,
             TransactionSuggestedKind.Windfall,
             TransactionSuggestedKind.InternalTransfer,
             TransactionSuggestedKind.Refund
@@ -3080,6 +3136,60 @@ app.MapPost("/api/admin/debug/users/{userId}/reconcile-fixed-costs",
         skipped = skippedRows,
     });
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /api/transactions/deposits/pending/summary
+//
+// Authenticated — returns { count, totalAmount } for undecided unexpected
+// deposits belonging to the current user.
+//
+// "Unexpected deposit" = Windfall | InternalTransfer | Refund.
+// Paycheck is intentionally excluded — it is expected income that was already
+// planned during onboarding.  Showing paychecks here would be misleading.
+//
+// No amount-sign logic is used.  Transaction.Amount is always stored as a
+// positive absolute value by TransactionService (Math.Abs of Plaid raw amount).
+// ─────────────────────────────────────────────────────────────────────────────
+app.MapGet("/api/transactions/deposits/pending/summary", async (ApiDbContext dbContext, HttpContext httpContext) =>
+{
+    try
+    {
+        string? idToken = httpContext.Request.Headers["Authorization"].FirstOrDefault()?.Split(" ").Last();
+        if (string.IsNullOrEmpty(idToken)) return Results.Unauthorized();
+
+        var decodedToken = await FirebaseAdmin.Auth.FirebaseAuth.DefaultInstance.VerifyIdTokenAsync(idToken);
+        var user = await dbContext.Users.FirstOrDefaultAsync(u => u.FirebaseUuid == decodedToken.Uid);
+        if (user == null) return Results.NotFound("User not found.");
+
+        // Same three unexpected-deposit kinds used by GET /deposits/pending.
+        // Paycheck is deliberately absent — it is expected and already planned.
+        var unexpectedDepositKinds = new[]
+        {
+            TransactionSuggestedKind.Windfall,
+            TransactionSuggestedKind.InternalTransfer,
+            TransactionSuggestedKind.Refund
+        };
+
+        var pendingUnexpectedDeposits = await dbContext.Transactions
+            .Where(t => t.UserId == user.Id
+                && unexpectedDepositKinds.Contains(t.SuggestedKind)
+                && t.UserDecision == TransactionUserDecision.Undecided
+                && !t.IsLargeExpenseCandidate)
+            .ToListAsync();
+
+        var count = pendingUnexpectedDeposits.Count;
+        var totalAmount = pendingUnexpectedDeposits.Sum(t => t.Amount);
+
+        return Results.Ok(new { count, totalAmount });
+    }
+    catch (Exception e)
+    {
+        SentrySdk.CaptureException(e);
+        return Results.Problem(e.Message);
+    }
+})
+.WithName("GetUnexpectedDepositSummary")
+.WithOpenApi();
 
 // --- RUN THE APP ---
 app.Run();
