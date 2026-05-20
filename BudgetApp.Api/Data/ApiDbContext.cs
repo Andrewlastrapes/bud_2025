@@ -34,5 +34,15 @@ public class ApiDbContext : DbContext
         modelBuilder.Entity<PaycheckSummary>()
             .HasIndex(s => new { s.UserId, s.PaycheckDate })
             .IsUnique();
+
+        // Unique index prevents duplicate transaction rows for the same user + Plaid transaction.
+        // Root cause: the application-level "check then insert" guard had a race condition when
+        // two Plaid webhooks arrived simultaneously. The DB constraint is the authoritative guard.
+        // Scoped to (UserId, PlaidTransactionId) rather than PlaidTransactionId alone for
+        // architectural clarity, even though Plaid IDs are globally unique in practice.
+        modelBuilder.Entity<Transaction>()
+            .HasIndex(t => new { t.UserId, t.PlaidTransactionId })
+            .IsUnique()
+            .HasDatabaseName("IX_Transactions_UserId_PlaidTransactionId");
     }
 }

@@ -122,6 +122,29 @@ public class DynamicBudgetEngine : IDynamicBudgetEngine
         if (ctx.Amount <= 0)
             return TransactionSuggestedKind.Unknown;
 
+        // ── Merchant keyword checks ────────────────────────────────────────────
+        // These run before the amount/payday logic so that refunds and internal
+        // transfers of any size are correctly classified regardless of paycheck
+        // amount or payday schedule.
+        var m = ctx.MerchantName ?? string.Empty;
+
+        // Refund keywords
+        if (m.Contains("REFUND", StringComparison.OrdinalIgnoreCase) ||
+            m.Contains("RETURN", StringComparison.OrdinalIgnoreCase) ||
+            m.Contains("REVERSAL", StringComparison.OrdinalIgnoreCase) ||
+            m.Contains("CASHBACK", StringComparison.OrdinalIgnoreCase) ||
+            m.Contains("CASH BACK", StringComparison.OrdinalIgnoreCase) ||
+            m.Contains("CHARGEBACK", StringComparison.OrdinalIgnoreCase))
+            return TransactionSuggestedKind.Refund;
+
+        // Internal transfer keywords — require directional "FROM" context so that
+        // "WIRE TRANSFER" (a large inflow) is not mis-classified as InternalTransfer.
+        if (m.Contains("TRANSFER FROM", StringComparison.OrdinalIgnoreCase) ||
+            m.Contains("FROM SAVINGS", StringComparison.OrdinalIgnoreCase) ||
+            m.Contains("FROM CHECKING", StringComparison.OrdinalIgnoreCase) ||
+            m.Contains("XFER", StringComparison.OrdinalIgnoreCase))
+            return TransactionSuggestedKind.InternalTransfer;
+
         if (ctx.ExpectedPaycheckAmount is null or <= 0)
         {
             if (!string.IsNullOrWhiteSpace(ctx.MerchantName) &&

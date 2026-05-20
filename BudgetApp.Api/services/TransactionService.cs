@@ -341,10 +341,33 @@ namespace BudgetApp.Api.Services
                 // ── 5. Added ───────────────────────────────────────────────────────────
                 if (response.Added != null)
                 {
+                    // seenInThisBatch guards against the rare case where Plaid includes the
+                    // same plaid_transaction_id twice within a single sync response.
+                    // This is the first line of defense; the DB unique constraint on
+                    // (user_id, plaid_transaction_id) is the authoritative guard.
+                    var seenInThisBatch = new HashSet<string>(StringComparer.Ordinal);
+
                     foreach (var t in response.Added)
                     {
+                        // ── Guard 1: duplicate within this batch ──────────────────────
+                        if (!seenInThisBatch.Add(t.TransactionId ?? string.Empty))
+                        {
+                            _logger.LogWarning(
+                                "Duplicate plaidTxId within single sync batch — skipping second occurrence: " +
+                                "plaidTxId={PlaidTxId} merchant={Merchant} amount={Amount} " +
+                                "itemId={ItemId} webhookCode={WebhookCode}",
+                                t.TransactionId, t.MerchantName ?? t.Name,
+                                Math.Abs(t.Amount ?? 0m), itemId, webhookCode ?? "(manual)");
+                            continue;
+                        }
+
+                        // ── Guard 2: already in DB for this user ──────────────────────
+                        // Scoped to the current user (x.UserId == user.Id) to match the
+                        // DB unique index on (user_id, plaid_transaction_id).
+                        // The original check was not user-scoped; in a multi-user environment
+                        // that was harmless but inconsistent with the index definition.
                         var exists = await _dbContext.Transactions
-                            .AnyAsync(x => x.PlaidTransactionId == t.TransactionId);
+                            .AnyAsync(x => x.UserId == user.Id && x.PlaidTransactionId == t.TransactionId);
 
                         if (exists)
                         {
@@ -441,26 +464,36 @@ namespace BudgetApp.Api.Services
                         }
                         else
                         {
-                            bool isFixed = fixedCosts.Any(fc =>
-                                !string.IsNullOrEmpty(fc.PlaidMerchantName) &&
-                                fc.PlaidMerchantName.Equals(
-                                    merchantName,
-                                    StringComparison.OrdinalIgnoreCase));
+                            // ── Fixed-cost / recurring match ───────────────────────────────
+                            // Priority 1: exact PlaidMerchantName (plaid_discovered or previously
+                            //   enriched manual cost).
+                            // Priority 2: manual cost — amount within tolerance + date window OR
+                            //   amount within tolerance + name-token overlap (null-due-date path).
+                            // MatchType is captured BEFORE enrichment so logs are not polluted.
+                            var (matchedFc, matchType) = FixedCostMatcher.TryMatch(
+                                fixedCosts, merchantName, absAmount, txDateUtc);
 
-                            if (isFixed)
+                            if (matchedFc != null)
                             {
-                                matchedFcForNotification = fixedCosts.FirstOrDefault(fc =>
-                                    !string.IsNullOrEmpty(fc.PlaidMerchantName) &&
-                                    fc.PlaidMerchantName.Equals(merchantName, StringComparison.OrdinalIgnoreCase));
+                                matchedFcForNotification = matchedFc;
                                 isFixedCostMatch = true;
 
+                                // Enrich manual cost with Plaid merchant info so future syncs
+                                // fall through to the faster Priority 1 merchant-name path.
+                                if (string.IsNullOrEmpty(matchedFc.PlaidMerchantName) &&
+                                    !string.IsNullOrEmpty(t.MerchantName))
+                                {
+                                    matchedFc.PlaidMerchantName = t.MerchantName;
+                                    matchedFc.PlaidAccountId = t.AccountId;
+                                }
+
                                 _logger.LogInformation(
-                                    "Transaction is a known fixed cost (no budget impact): " +
-                                    "plaidTxId={PlaidTxId} merchant={Merchant} " +
-                                    "matchedFixedCostId={FixedCostId} matchedFixedCostName={FixedCostName}",
-                                    t.TransactionId, merchantName,
-                                    matchedFcForNotification?.Id.ToString() ?? "(none)",
-                                    matchedFcForNotification?.Name ?? "(none)");
+                                    "Transaction matched as fixed cost (no budget impact): " +
+                                    "plaidTxId={PlaidTxId} merchant={Merchant} amount={Amount} " +
+                                    "matchedFixedCostId={FixedCostId} matchedFixedCostName={FixedCostName} " +
+                                    "matchType={MatchType}",
+                                    t.TransactionId, merchantName, absAmount,
+                                    matchedFc.Id, matchedFc.Name, matchType);
                             }
                             else
                             {
@@ -741,7 +774,49 @@ namespace BudgetApp.Api.Services
                         });
                 }
 
-                await _dbContext.SaveChangesAsync();
+                // ── Save all changes atomically ────────────────────────────────────────
+                // The unique index on (user_id, plaid_transaction_id) is the authoritative
+                // guard against concurrent duplicate inserts. The application-level checks
+                // above are defense-in-depth. If a concurrent webhook beat us past all the
+                // app-level guards, Postgres will raise a 23505 unique violation here.
+                // We catch it, clear the change tracker (rolling back all in-memory state),
+                // log a warning, and re-throw so the caller can handle it. The next Plaid
+                // sync will find all already-inserted rows via the AnyAsync check and skip them.
+                try
+                {
+                    await _dbContext.SaveChangesAsync();
+                }
+                catch (Microsoft.EntityFrameworkCore.DbUpdateException dbEx)
+                    when (dbEx.InnerException is Npgsql.PostgresException pgEx
+                          && pgEx.SqlState == "23505")
+                {
+                    // Unique constraint violation — concurrent webhook race condition.
+                    // Clear the EF change tracker so we don't leave stale state in memory.
+                    _dbContext.ChangeTracker.Clear();
+
+                    _logger.LogWarning(
+                        "Unique constraint violation during transaction sync (concurrent webhook race) — " +
+                        "batch rolled back. Next Plaid sync will deduplicate correctly. " +
+                        "itemId={ItemId} webhookCode={WebhookCode} " +
+                        "constraintName={ConstraintName} detail={Detail}",
+                        itemId, webhookCode ?? "(manual)",
+                        pgEx.ConstraintName ?? "(unknown)", pgEx.Detail ?? pgEx.Message);
+
+                    SentrySdk.CaptureMessage(
+                        "Transaction sync unique-constraint collision (concurrent webhook race) — batch rolled back",
+                        scope =>
+                        {
+                            scope.Level = SentryLevel.Warning;
+                            scope.SetTag("event.type", "sync_unique_constraint_collision");
+                            scope.SetTag("sync.itemId", itemId ?? "unknown");
+                            scope.SetTag("sync.webhookCode", webhookCode ?? "(manual)");
+                            scope.SetExtra("pg.sqlState", pgEx.SqlState);
+                            scope.SetExtra("pg.constraintName", pgEx.ConstraintName);
+                            scope.SetExtra("pg.detail", pgEx.Detail);
+                        });
+
+                    throw; // Re-throw — the outer catch at the bottom of this method handles it
+                }
 
                 var currentDynamicBalance = balanceRecord?.BalanceAmount ?? 0m;
 

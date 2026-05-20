@@ -1,22 +1,29 @@
 // File: screens/ReviewLargeExpensesScreen.js
 
-import React, { useState, useEffect } from 'react';
-import { View, FlatList, StyleSheet } from 'react-native';
+import React, { useState, useEffect } from "react";
+import { View, FlatList, StyleSheet } from "react-native";
 import {
   Text,
   Button,
-  Card,
   ActivityIndicator,
   Portal,
   Modal,
   TextInput,
-} from 'react-native-paper';
-import axios from 'axios';
-import { auth } from '../firebaseConfig';
-import { useIsFocused } from '@react-navigation/native';
+} from "react-native-paper";
+import { SafeAreaView } from "react-native-safe-area-context";
+import axios from "axios";
+import { auth } from "../firebaseConfig";
+import { useIsFocused } from "@react-navigation/native";
 
-import { API_BASE_URL } from '../config/api';
-;
+import { API_BASE_URL } from "../config/api";
+import TransactionCard from "../components/TransactionCard";
+import {
+  colors,
+  spacing,
+  radius,
+  type as typeTokens,
+  shadow,
+} from "../config/theme";
 
 // Enum numeric values must match TransactionUserDecision in C#
 const DECISIONS = {
@@ -29,12 +36,12 @@ export default function ReviewLargeExpensesScreen() {
   const [items, setItems] = useState([]);
   const [loading, setLoading] = useState(true);
   const [installmentModalTx, setInstallmentModalTx] = useState(null);
-  const [installmentCount, setInstallmentCount] = useState('2');
+  const [installmentCount, setInstallmentCount] = useState("2");
   const isFocused = useIsFocused();
 
   const getAuthHeader = async () => {
     const user = auth.currentUser;
-    if (!user) throw new Error('No user logged in.');
+    if (!user) throw new Error("No user logged in.");
     const token = await user.getIdToken();
     return { headers: { Authorization: `Bearer ${token}` } };
   };
@@ -45,12 +52,12 @@ export default function ReviewLargeExpensesScreen() {
       const config = await getAuthHeader();
       const res = await axios.get(
         `${API_BASE_URL}/api/transactions/large-expenses/pending`,
-        config
+        config,
       );
       setItems(res.data || []);
     } catch (e) {
-      console.error('Failed to load large expenses', e);
-      alert('Error loading large expenses');
+      console.error("Failed to load large expenses", e);
+      alert("Error loading large expenses");
     } finally {
       setLoading(false);
     }
@@ -68,128 +75,160 @@ export default function ReviewLargeExpensesScreen() {
       await axios.post(
         `${API_BASE_URL}/api/transactions/${txId}/decision`,
         { decision, ...extra },
-        config
+        config,
       );
-      setItems(current => current.filter(x => x.id !== txId));
+      setItems((current) => current.filter((x) => x.id !== txId));
     } catch (e) {
-      console.error('Failed to apply decision', e);
-      alert('Error saving decision');
+      console.error("Failed to apply decision", e);
+      alert("Error saving decision");
     }
   };
 
   const renderItem = ({ item }) => {
-    const title = item.merchantName || item.name || 'Transaction';
-    const amount = typeof item.amount === 'number' ? item.amount : 0;
+    const amount = typeof item.amount === "number" ? item.amount : 0;
 
     return (
-      <Card style={styles.card}>
-        <Card.Title title={title} />
-        <Card.Content>
-          <Text style={styles.amount}>${amount.toFixed(2)}</Text>
-          {item.date && (
-            <Text style={styles.date}>
-              {new Date(item.date).toLocaleDateString()}
-            </Text>
-          )}
+      <TransactionCard
+        type="largeExpense"
+        merchantName={item.merchantName}
+        name={item.name}
+        amount={amount}
+        date={item.date}
+      >
+        {/* Count as normal spending */}
+        <Button
+          mode="outlined"
+          style={styles.actionButton}
+          labelStyle={styles.actionButtonLabel}
+          onPress={() => applyDecision(item.id, DECISIONS.TreatAsVariableSpend)}
+        >
+          Count as spending
+        </Button>
 
-          <View style={styles.buttonRow}>
-            <Button
-              mode="outlined"
-              onPress={() =>
-                applyDecision(item.id, DECISIONS.TreatAsVariableSpend)
-              }
-            >
-              Count as spending
-            </Button>
-          </View>
+        {/* Paid from savings */}
+        <Button
+          mode="outlined"
+          style={styles.actionButton}
+          labelStyle={styles.actionButtonLabel}
+          onPress={() =>
+            applyDecision(item.id, DECISIONS.LargeExpenseFromSavings)
+          }
+        >
+          Paid from savings
+        </Button>
 
-          <View style={styles.buttonRow}>
-            <Button
-              mode="outlined"
-              onPress={() =>
-                applyDecision(item.id, DECISIONS.LargeExpenseFromSavings)
-              }
-            >
-              Paid from savings
-            </Button>
-          </View>
-
-          <View style={styles.buttonRow}>
-            <Button
-              mode="contained"
-              onPress={() => {
-                setInstallmentModalTx(item);
-                setInstallmentCount('2');
-              }}
-            >
-              Convert to fixed cost
-            </Button>
-          </View>
-        </Card.Content>
-      </Card>
+        {/* Convert to fixed cost (installment) */}
+        <Button
+          mode="contained"
+          style={[styles.actionButton, styles.primaryActionButton]}
+          labelStyle={styles.primaryActionButtonLabel}
+          onPress={() => {
+            setInstallmentModalTx(item);
+            setInstallmentCount("2");
+          }}
+        >
+          Spread as fixed cost
+        </Button>
+      </TransactionCard>
     );
   };
 
   return (
-    <View style={styles.container}>
+    <SafeAreaView style={styles.container}>
       {loading ? (
-        <ActivityIndicator style={{ marginTop: 32 }} />
+        <View style={styles.centered}>
+          <ActivityIndicator size="large" color={colors.warning} />
+          <Text style={styles.loadingText}>Loading large expenses…</Text>
+        </View>
       ) : items.length === 0 ? (
-        <View style={styles.emptyContainer}>
-          <Text>No large expenses to review right now.</Text>
+        <View style={styles.centered}>
+          <Text style={styles.emptyIcon}>✅</Text>
+          <Text style={styles.emptyHeading}>No large expenses to review.</Text>
+          <Text style={styles.emptySubtext}>
+            Unusually large purchases will appear here for you to categorize.
+          </Text>
         </View>
       ) : (
         <FlatList
           data={items}
-          keyExtractor={item => String(item.id)}
+          keyExtractor={(item) => String(item.id)}
           renderItem={renderItem}
+          contentContainerStyle={styles.listContent}
         />
       )}
 
+      {/* ── Installment modal ── */}
       <Portal>
         <Modal
           visible={!!installmentModalTx}
           onDismiss={() => setInstallmentModalTx(null)}
           contentContainerStyle={styles.modal}
         >
-          <Text style={styles.modalTitle}>Convert to fixed cost</Text>
+          <Text style={styles.modalTitle}>Spread as fixed cost</Text>
 
           {installmentModalTx && (
-            <>
-              <Text>
-                {installmentModalTx.merchantName || installmentModalTx.name}
+            <View style={styles.modalMeta}>
+              <Text style={styles.modalMerchant}>
+                {installmentModalTx.merchantName ||
+                  installmentModalTx.name ||
+                  "Transaction"}
               </Text>
-              <Text style={{ marginBottom: 8 }}>
-                Amount: ${Number(installmentModalTx.amount).toFixed(2)}
+              <Text style={styles.modalAmount}>
+                ${Number(installmentModalTx.amount).toFixed(2)}
               </Text>
-            </>
+            </View>
           )}
 
           <TextInput
-            label="Number of paychecks to spread over"
+            label="Paychecks to spread over"
             value={installmentCount}
             onChangeText={setInstallmentCount}
             keyboardType="numeric"
-            style={{ marginTop: 8 }}
+            mode="outlined"
+            style={styles.modalInput}
           />
 
+          {installmentModalTx &&
+            installmentCount &&
+            Number(installmentCount) > 0 && (
+              <Text style={styles.modalHint}>
+                ≈ $
+                {(
+                  Number(installmentModalTx.amount) / Number(installmentCount)
+                ).toFixed(2)}{" "}
+                per paycheck
+              </Text>
+            )}
+
           <View style={styles.modalButtons}>
-            <Button onPress={() => setInstallmentModalTx(null)}>Cancel</Button>
+            <Button
+              mode="text"
+              onPress={() => setInstallmentModalTx(null)}
+              labelStyle={styles.modalCancelLabel}
+            >
+              Cancel
+            </Button>
             <Button
               mode="contained"
+              style={styles.modalSaveButton}
               onPress={async () => {
                 const n = parseInt(installmentCount, 10);
                 if (!n || n <= 0) {
-                  alert('Enter a valid number of paychecks.');
+                  alert("Enter a valid number of paychecks.");
                   return;
                 }
                 if (!installmentModalTx) return;
 
-                await applyDecision(installmentModalTx.id, DECISIONS.LargeExpenseToFixedCost, {
-                  installmentCount: n,
-                  fixedCostName:
-                    installmentModalTx.merchantName || installmentModalTx.name,
-                });
+                await applyDecision(
+                  installmentModalTx.id,
+                  DECISIONS.LargeExpenseToFixedCost,
+                  {
+                    installmentCount: n,
+                    fixedCostName:
+                      installmentModalTx.merchantName ||
+                      installmentModalTx.name,
+                  },
+                );
 
                 setInstallmentModalTx(null);
               }}
@@ -199,47 +238,123 @@ export default function ReviewLargeExpensesScreen() {
           </View>
         </Modal>
       </Portal>
-    </View>
+    </SafeAreaView>
   );
 }
 
 const styles = StyleSheet.create({
   container: {
     flex: 1,
-    padding: 16,
+    backgroundColor: colors.lightBg,
   },
-  card: {
-    marginBottom: 12,
+  listContent: {
+    padding: spacing.md,
+    paddingBottom: spacing.xl,
   },
-  amount: {
-    fontSize: 20,
-    fontWeight: '600',
-    marginTop: 4,
+
+  // ── Loading / empty states ────────────────────────────────
+  centered: {
+    flex: 1,
+    justifyContent: "center",
+    alignItems: "center",
+    padding: spacing.xl,
   },
-  date: {
-    marginTop: 4,
-    color: '#666',
+  loadingText: {
+    marginTop: spacing.sm,
+    fontSize: typeTokens.sm,
+    color: colors.textMuted,
   },
-  buttonRow: {
-    marginTop: 8,
+  emptyIcon: {
+    fontSize: 40,
+    marginBottom: spacing.md,
   },
-  emptyContainer: {
-    marginTop: 32,
-    alignItems: 'center',
+  emptyHeading: {
+    fontSize: typeTokens.lg,
+    fontWeight: typeTokens.semibold,
+    color: colors.textPrimary,
+    marginBottom: spacing.xs,
+    textAlign: "center",
   },
+  emptySubtext: {
+    fontSize: typeTokens.sm,
+    color: colors.textMuted,
+    textAlign: "center",
+    lineHeight: 20,
+  },
+
+  // ── Card action buttons ───────────────────────────────────
+  actionButton: {
+    borderRadius: spacing.sm,
+    borderColor: colors.lightBorder,
+  },
+  actionButtonLabel: {
+    fontSize: typeTokens.sm,
+    fontWeight: typeTokens.medium,
+    letterSpacing: 0.1,
+  },
+  primaryActionButton: {
+    // inherits contained style from RN Paper theme
+  },
+  primaryActionButtonLabel: {
+    fontSize: typeTokens.sm,
+    fontWeight: typeTokens.semibold,
+    letterSpacing: 0.1,
+  },
+
+  // ── Modal ─────────────────────────────────────────────────
   modal: {
-    margin: 24,
-    padding: 16,
-    backgroundColor: 'white',
+    margin: spacing.lg,
+    padding: spacing.lg,
+    backgroundColor: colors.lightSurface,
+    borderRadius: radius.lg,
+    ...shadow.md,
   },
   modalTitle: {
-    fontSize: 18,
-    fontWeight: '600',
-    marginBottom: 8,
+    fontSize: typeTokens.lg,
+    fontWeight: typeTokens.bold,
+    color: colors.textPrimary,
+    marginBottom: spacing.md,
+  },
+  modalMeta: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+    marginBottom: spacing.md,
+    padding: spacing.sm,
+    backgroundColor: colors.lightBg,
+    borderRadius: radius.sm,
+  },
+  modalMerchant: {
+    fontSize: typeTokens.base,
+    fontWeight: typeTokens.semibold,
+    color: colors.textPrimary,
+    flex: 1,
+  },
+  modalAmount: {
+    fontSize: typeTokens.base,
+    fontWeight: typeTokens.bold,
+    color: colors.textPrimary,
+    marginLeft: spacing.sm,
+  },
+  modalInput: {
+    backgroundColor: colors.lightSurface,
+    marginBottom: spacing.xs,
+  },
+  modalHint: {
+    fontSize: typeTokens.sm,
+    color: colors.textMuted,
+    marginBottom: spacing.md,
   },
   modalButtons: {
-    marginTop: 16,
-    flexDirection: 'row',
-    justifyContent: 'flex-end',
+    flexDirection: "row",
+    justifyContent: "flex-end",
+    gap: spacing.sm,
+    marginTop: spacing.sm,
+  },
+  modalCancelLabel: {
+    color: colors.textSecondary,
+  },
+  modalSaveButton: {
+    borderRadius: spacing.sm,
   },
 });

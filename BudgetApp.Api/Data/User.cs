@@ -41,6 +41,16 @@ public class User
     [Column("debt_per_paycheck")]
     public decimal? DebtPerPaycheck { get; set; }
 
+    /// <summary>
+    /// Total credit card debt captured from the Plaid snapshot at the time the user
+    /// completed onboarding. Null for users who onboarded before this field existed or
+    /// who had no linked credit accounts at onboarding time.
+    /// This is a historical starting balance used for the payoff plan — it is NOT
+    /// updated automatically as the user pays down their debt.
+    /// </summary>
+    [Column("debt_starting_balance")]
+    public decimal? DebtStartingBalance { get; set; }
+
 
 
     // ...

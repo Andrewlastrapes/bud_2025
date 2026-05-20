@@ -31,12 +31,14 @@ namespace BudgetApp.Api.Tests
         [Fact]
         public void ClassifyDeposit_ReturnsWindfall_WhenAmountDoesNotMatch()
         {
+            // A mystery credit with no keyword cues — just an amount far from
+            // the expected paycheck.  Should fall through to Windfall.
             var engine = new DynamicBudgetEngine();
             var ctx = new DepositContext
             {
                 Amount = 500m,
                 Date = new DateTime(2025, 02, 16),
-                MerchantName = "Random Refund",
+                MerchantName = "BONUS CREDIT",  // no refund/transfer keywords
                 PayDay1 = 1,
                 PayDay2 = 15,
                 ExpectedPaycheckAmount = 3000m
@@ -84,6 +86,156 @@ namespace BudgetApp.Api.Tests
 
             Assert.Equal(TransactionSuggestedKind.Windfall, kind);
         }
+    }
+
+    // ─── Deposit Filter Logic ─────────────────────────────────────────────────────
+    //
+    // These tests verify the whitelist logic used by:
+    //   GET /api/transactions/deposits/pending
+    //
+    // The endpoint now filters to ONLY:
+    //   SuggestedKind ∈ { Paycheck, Windfall, InternalTransfer, Refund }
+    //   AND UserDecision == Undecided
+    //   AND IsLargeExpenseCandidate == false
+    //
+    // Sign-convention reminder:
+    //   Transaction.Amount is always stored as a positive absolute value
+    //   (Math.Abs of the Plaid raw amount). Amount sign CANNOT distinguish
+    //   credits from debits after storage. SuggestedKind is the discriminator.
+
+    public class DepositFilterLogicTests
+    {
+        // ─── Helper: build a minimal Transaction with sane defaults ──────────────
+
+        private static Transaction MakeTx(
+            TransactionSuggestedKind kind,
+            TransactionUserDecision decision = TransactionUserDecision.Undecided,
+            bool isLargeExpenseCandidate = false,
+            decimal amount = 2500m)
+        {
+            return new Transaction
+            {
+                Id = 1,
+                UserId = 99,
+                PlaidTransactionId = "test",
+                AccountId = "acc1",
+                Amount = amount,          // always positive (abs value)
+                Date = new DateTime(2026, 5, 1),
+                Name = "Test",
+                Pending = false,
+                CreatedAt = DateTime.UtcNow,
+                UpdatedAt = DateTime.UtcNow,
+                SuggestedKind = kind,
+                UserDecision = decision,
+                IsLargeExpenseCandidate = isLargeExpenseCandidate
+            };
+        }
+
+        // ─── Deposit kinds that must appear ──────────────────────────────────────
+
+        [Fact]
+        public void Paycheck_Undecided_PassesFilter()
+        {
+            var tx = MakeTx(TransactionSuggestedKind.Paycheck);
+            Assert.True(IsDepositPendingRow(tx));
+        }
+
+        [Fact]
+        public void Windfall_Undecided_PassesFilter()
+        {
+            var tx = MakeTx(TransactionSuggestedKind.Windfall);
+            Assert.True(IsDepositPendingRow(tx));
+        }
+
+        [Fact]
+        public void InternalTransfer_Undecided_PassesFilter()
+        {
+            var tx = MakeTx(TransactionSuggestedKind.InternalTransfer);
+            Assert.True(IsDepositPendingRow(tx));
+        }
+
+        [Fact]
+        public void Refund_Undecided_PassesFilter()
+        {
+            var tx = MakeTx(TransactionSuggestedKind.Refund);
+            Assert.True(IsDepositPendingRow(tx));
+        }
+
+        // ─── Rows that must NOT appear ────────────────────────────────────────────
+
+        [Fact]
+        public void Unknown_SuggestedKind_DoesNotPassFilter()
+        {
+            // A normal debit/spend has SuggestedKind == Unknown
+            var tx = MakeTx(TransactionSuggestedKind.Unknown);
+            Assert.False(IsDepositPendingRow(tx));
+        }
+
+        [Fact]
+        public void Paycheck_AlreadyDecided_TreatAsIncome_DoesNotPassFilter()
+        {
+            var tx = MakeTx(TransactionSuggestedKind.Paycheck,
+                            decision: TransactionUserDecision.TreatAsIncome);
+            Assert.False(IsDepositPendingRow(tx));
+        }
+
+        [Fact]
+        public void Paycheck_AlreadyDecided_Ignore_DoesNotPassFilter()
+        {
+            var tx = MakeTx(TransactionSuggestedKind.Paycheck,
+                            decision: TransactionUserDecision.IgnoreForDynamic);
+            Assert.False(IsDepositPendingRow(tx));
+        }
+
+        [Fact]
+        public void LargeExpenseCandidate_DoesNotPassFilter()
+        {
+            // Even if it somehow had a deposit kind, IsLargeExpenseCandidate must exclude it.
+            // In practice large expenses are debits (Unknown kind), but we guard both.
+            var tx = MakeTx(TransactionSuggestedKind.Unknown,
+                            isLargeExpenseCandidate: true);
+            Assert.False(IsDepositPendingRow(tx));
+        }
+
+        [Fact]
+        public void LargeExpenseCandidate_WithDepositKind_DoesNotPassFilter()
+        {
+            // Belt-and-suspenders: even an unlikely deposit-kind large expense is excluded.
+            var tx = MakeTx(TransactionSuggestedKind.Windfall,
+                            isLargeExpenseCandidate: true);
+            Assert.False(IsDepositPendingRow(tx));
+        }
+
+        // ─── Sign convention guard ─────────────────────────────────────────────────
+        // The filter does NOT use amount sign. A debit with SuggestedKind == Unknown
+        // is excluded regardless of the amount value.
+
+        [Fact]
+        public void DebitTransaction_HighPositiveAmount_WithUnknownKind_IsExcluded()
+        {
+            // This is the scenario that was leaking through the old filter.
+            // amount=999 but SuggestedKind=Unknown → must NOT appear.
+            var tx = MakeTx(TransactionSuggestedKind.Unknown, amount: 999m);
+            Assert.False(IsDepositPendingRow(tx));
+        }
+
+        // ─── Static helper that mirrors the LINQ predicate in Program.cs ─────────
+        // depositKinds.Contains(t.SuggestedKind)
+        //   && t.UserDecision == Undecided
+        //   && !t.IsLargeExpenseCandidate
+
+        private static readonly TransactionSuggestedKind[] DepositKinds =
+        {
+        TransactionSuggestedKind.Paycheck,
+        TransactionSuggestedKind.Windfall,
+        TransactionSuggestedKind.InternalTransfer,
+        TransactionSuggestedKind.Refund
+    };
+
+        private static bool IsDepositPendingRow(Transaction t) =>
+            DepositKinds.Contains(t.SuggestedKind) &&
+            t.UserDecision == TransactionUserDecision.Undecided &&
+            !t.IsLargeExpenseCandidate;
     }
 
     // ─── Pay Cycle Calculation ────────────────────────────────────────────────
@@ -145,10 +297,10 @@ namespace BudgetApp.Api.Tests
         {
             return new BaseBudgetRequest
             {
-                PaycheckAmount   = paycheckAmount,
-                Today            = new DateTime(2026, 4, 7),
+                PaycheckAmount = paycheckAmount,
+                Today = new DateTime(2026, 4, 7),
                 NextPaycheckDate = new DateTime(2026, 4, 15),
-                TotalFixedBills  = totalFixedBills
+                TotalFixedBills = totalFixedBills
             };
         }
 
@@ -195,7 +347,7 @@ namespace BudgetApp.Api.Tests
                 paycheckAmount: 2500m, totalFixedBills: 800m));
 
             Assert.Equal(2500m, result.PaycheckAmount);
-            Assert.Equal(800m,  result.FixedCostsRemaining);
+            Assert.Equal(800m, result.FixedCostsRemaining);
         }
 
         [Fact]
@@ -214,10 +366,10 @@ namespace BudgetApp.Api.Tests
         {
             var req = new BaseBudgetRequest
             {
-                PaycheckAmount   = 2333.33m,
-                Today            = new DateTime(2026, 4, 7),
+                PaycheckAmount = 2333.33m,
+                Today = new DateTime(2026, 4, 7),
                 NextPaycheckDate = new DateTime(2026, 4, 15),
-                TotalFixedBills  = 333.33m
+                TotalFixedBills = 333.33m
             };
 
             var result = _engine.CalculateBaseBudget(req);
@@ -228,9 +380,9 @@ namespace BudgetApp.Api.Tests
                     $"{name} has more than 2 decimal places: {value}");
             }
 
-            AssertMaxTwoDecimals(result.PaycheckAmount,      nameof(result.PaycheckAmount));
+            AssertMaxTwoDecimals(result.PaycheckAmount, nameof(result.PaycheckAmount));
             AssertMaxTwoDecimals(result.FixedCostsRemaining, nameof(result.FixedCostsRemaining));
-            AssertMaxTwoDecimals(result.BaseRemaining,       nameof(result.BaseRemaining));
+            AssertMaxTwoDecimals(result.BaseRemaining, nameof(result.BaseRemaining));
         }
     }
 
@@ -257,12 +409,12 @@ namespace BudgetApp.Api.Tests
 
             return new BudgetCalculationRequest
             {
-                PaycheckAmount      = paycheckAmount,
-                Today               = today,
-                NextPaycheckDate    = nextPaycheck,
-                TotalFixedBills     = totalFixedBills,
+                PaycheckAmount = paycheckAmount,
+                Today = today,
+                NextPaycheckDate = nextPaycheck,
+                TotalFixedBills = totalFixedBills,
                 SavingsContribution = savingsContribution,
-                DebtPerPaycheck     = debtPerPaycheck
+                DebtPerPaycheck = debtPerPaycheck
             };
         }
 
@@ -330,26 +482,26 @@ namespace BudgetApp.Api.Tests
         {
             var reqEarly = new BudgetCalculationRequest
             {
-                PaycheckAmount      = 2500m,
-                Today               = new DateTime(2026, 4, 1),
-                NextPaycheckDate    = new DateTime(2026, 4, 15),
-                TotalFixedBills     = 500m,
+                PaycheckAmount = 2500m,
+                Today = new DateTime(2026, 4, 1),
+                NextPaycheckDate = new DateTime(2026, 4, 15),
+                TotalFixedBills = 500m,
                 SavingsContribution = 200m,
-                DebtPerPaycheck     = 150m
+                DebtPerPaycheck = 150m
             };
 
             var reqLate = new BudgetCalculationRequest
             {
-                PaycheckAmount      = 2500m,
-                Today               = new DateTime(2026, 4, 14),
-                NextPaycheckDate    = new DateTime(2026, 4, 15),
-                TotalFixedBills     = 500m,
+                PaycheckAmount = 2500m,
+                Today = new DateTime(2026, 4, 14),
+                NextPaycheckDate = new DateTime(2026, 4, 15),
+                TotalFixedBills = 500m,
                 SavingsContribution = 200m,
-                DebtPerPaycheck     = 150m
+                DebtPerPaycheck = 150m
             };
 
             var earlyResult = _engine.CalculateDynamicBudget(reqEarly);
-            var lateResult  = _engine.CalculateDynamicBudget(reqLate);
+            var lateResult = _engine.CalculateDynamicBudget(reqLate);
 
             Assert.Equal(1650m, earlyResult.RemainingToSpend);
             Assert.Equal(1650m, lateResult.RemainingToSpend);
@@ -363,18 +515,18 @@ namespace BudgetApp.Api.Tests
             // paycheck $2500, fixed $1250, savings $200, debt $300 → remaining $750
             var req = new BudgetCalculationRequest
             {
-                PaycheckAmount      = 2500m,
-                Today               = new DateTime(2026, 4, 7),
-                NextPaycheckDate    = new DateTime(2026, 4, 15),
-                TotalFixedBills     = 1250m,
+                PaycheckAmount = 2500m,
+                Today = new DateTime(2026, 4, 7),
+                NextPaycheckDate = new DateTime(2026, 4, 15),
+                TotalFixedBills = 1250m,
                 SavingsContribution = 200m,
-                DebtPerPaycheck     = 300m
+                DebtPerPaycheck = 300m
             };
 
             var result = _engine.CalculateDynamicBudget(req);
 
             Assert.Equal(1250m, result.BaseRemaining);   // 2500 - 1250
-            Assert.Equal(750m,  result.RemainingToSpend); // 1250 - 300 - 200
+            Assert.Equal(750m, result.RemainingToSpend); // 1250 - 300 - 200
         }
 
         // ── Field pass-through ────────────────────────────────────────────────
@@ -386,9 +538,9 @@ namespace BudgetApp.Api.Tests
             var result = _engine.CalculateDynamicBudget(req);
 
             Assert.Equal(2500m, result.PaycheckAmount);
-            Assert.Equal(500m,  result.FixedCostsRemaining);
-            Assert.Equal(150m,  result.DebtPerPaycheck);
-            Assert.Equal(200m,  result.SavingsContribution);
+            Assert.Equal(500m, result.FixedCostsRemaining);
+            Assert.Equal(150m, result.DebtPerPaycheck);
+            Assert.Equal(200m, result.SavingsContribution);
         }
 
         [Fact]
@@ -397,7 +549,7 @@ namespace BudgetApp.Api.Tests
             var req = MakeStandardRequest(totalFixedBills: 0m, debtPerPaycheck: 0m, savingsContribution: 300m);
             var result = _engine.CalculateDynamicBudget(req);
 
-            Assert.Equal(300m,  result.SavingsContribution);
+            Assert.Equal(300m, result.SavingsContribution);
             Assert.Equal(2200m, result.RemainingToSpend); // 2500 - 300
         }
 
@@ -471,12 +623,12 @@ namespace BudgetApp.Api.Tests
         {
             var req = new BudgetCalculationRequest
             {
-                PaycheckAmount      = 2333.33m,
-                Today               = new DateTime(2026, 4, 7),
-                NextPaycheckDate    = new DateTime(2026, 4, 15),
-                TotalFixedBills     = 333.33m,
+                PaycheckAmount = 2333.33m,
+                Today = new DateTime(2026, 4, 7),
+                NextPaycheckDate = new DateTime(2026, 4, 15),
+                TotalFixedBills = 333.33m,
                 SavingsContribution = 111.11m,
-                DebtPerPaycheck     = 77.77m
+                DebtPerPaycheck = 77.77m
             };
 
             var result = _engine.CalculateDynamicBudget(req);
@@ -488,11 +640,11 @@ namespace BudgetApp.Api.Tests
                     $"{fieldName} has more than 2 decimal places: {value}");
             }
 
-            AssertMaxTwoDecimals(result.PaycheckAmount,      nameof(result.PaycheckAmount));
+            AssertMaxTwoDecimals(result.PaycheckAmount, nameof(result.PaycheckAmount));
             AssertMaxTwoDecimals(result.FixedCostsRemaining, nameof(result.FixedCostsRemaining));
-            AssertMaxTwoDecimals(result.BaseRemaining,       nameof(result.BaseRemaining));
-            AssertMaxTwoDecimals(result.RemainingToSpend,    nameof(result.RemainingToSpend));
-            AssertMaxTwoDecimals(result.DebtPerPaycheck,     nameof(result.DebtPerPaycheck));
+            AssertMaxTwoDecimals(result.BaseRemaining, nameof(result.BaseRemaining));
+            AssertMaxTwoDecimals(result.RemainingToSpend, nameof(result.RemainingToSpend));
+            AssertMaxTwoDecimals(result.DebtPerPaycheck, nameof(result.DebtPerPaycheck));
             AssertMaxTwoDecimals(result.SavingsContribution, nameof(result.SavingsContribution));
         }
 
@@ -505,7 +657,7 @@ namespace BudgetApp.Api.Tests
             var result2 = _engine.CalculateDynamicBudget(req);
 
             Assert.Equal(result1.RemainingToSpend, result2.RemainingToSpend);
-            Assert.Equal(result1.BaseRemaining,    result2.BaseRemaining);
+            Assert.Equal(result1.BaseRemaining, result2.BaseRemaining);
         }
     }
 }

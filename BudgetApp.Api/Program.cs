@@ -1311,6 +1311,11 @@ app.MapPost("/api/budget/finalize", async (
         user.PayDay2 = request.PayDay2;
         user.ExpectedPaycheckAmount = request.PaycheckAmount;
         user.DebtPerPaycheck = request.DebtPerPaycheck;
+        // Persist the Plaid debt snapshot captured during onboarding.
+        // Null means the client did not send it (old app version / no Plaid connection).
+        // 0 means the user had no credit card debt — both are valid and both are saved.
+        if (request.DebtStartingBalance.HasValue)
+            user.DebtStartingBalance = request.DebtStartingBalance.Value;
 
         await dbContext.SaveChangesAsync();
 
@@ -1661,12 +1666,26 @@ app.MapGet("/api/transactions/deposits/pending", async (ApiDbContext dbContext, 
         var user = await dbContext.Users.FirstOrDefaultAsync(u => u.FirebaseUuid == decodedToken.Uid);
         if (user == null) return Results.NotFound("User not found.");
 
-        // "Deposit" = transaction where we set SuggestedKind (credits only),
-        // and where the user has not made a decision yet.
+        // "Deposit" = transaction classified as a true account inflow.
+        // Only the four deposit-style SuggestedKind values are eligible;
+        // debit/spend transactions always keep SuggestedKind == Unknown and
+        // must never appear here.
+        // Note: Transaction.Amount is always stored as a positive absolute value
+        // (Math.Abs of the Plaid raw amount), so amount sign cannot be used to
+        // distinguish credits from debits after storage.
+        var depositKinds = new[]
+        {
+            TransactionSuggestedKind.Paycheck,
+            TransactionSuggestedKind.Windfall,
+            TransactionSuggestedKind.InternalTransfer,
+            TransactionSuggestedKind.Refund
+        };
+
         var pendingDeposits = await dbContext.Transactions
             .Where(t => t.UserId == user.Id
-            && t.SuggestedKind != TransactionSuggestedKind.Unknown
-            && t.UserDecision == TransactionUserDecision.Undecided)
+                && depositKinds.Contains(t.SuggestedKind)
+                && t.UserDecision == TransactionUserDecision.Undecided
+                && !t.IsLargeExpenseCandidate)
             .OrderByDescending(t => t.Date)
             .ToListAsync();
 
@@ -1994,6 +2013,41 @@ app.MapGet("/api/transactions/large-expenses/pending", async (ApiDbContext dbCon
 .WithName("GetLargeExpenses")
 .WithOpenApi();
 
+// GET: /api/transactions/large-expenses/summary
+// Returns the count and total amount of unreviewed large expenses for the authenticated user.
+// Used by the HomeScreen dashboard to show a subtle warning when the dynamic budget
+// includes unusually large expenses that the user has not yet categorized.
+// Does NOT change any large-expense behavior — large expenses still subtract from the
+// budget immediately regardless of whether they have been reviewed.
+app.MapGet("/api/transactions/large-expenses/summary", async (ApiDbContext dbContext, HttpContext httpContext) =>
+{
+    try
+    {
+        string? idToken = httpContext.Request.Headers["Authorization"].FirstOrDefault()?.Split(" ").Last();
+        if (string.IsNullOrEmpty(idToken)) return Results.Unauthorized();
+
+        var decodedToken = await FirebaseAdmin.Auth.FirebaseAuth.DefaultInstance.VerifyIdTokenAsync(idToken);
+        var user = await dbContext.Users.FirstOrDefaultAsync(u => u.FirebaseUuid == decodedToken.Uid);
+        if (user == null) return Results.NotFound("User not found.");
+
+        var unreviewedLargeExpenses = await dbContext.Transactions
+            .Where(t => t.UserId == user.Id && t.IsLargeExpenseCandidate && !t.LargeExpenseHandled)
+            .ToListAsync();
+
+        var count = unreviewedLargeExpenses.Count;
+        var totalAmount = unreviewedLargeExpenses.Sum(t => t.Amount);
+
+        return Results.Ok(new { count, totalAmount });
+    }
+    catch (Exception e)
+    {
+        SentrySdk.CaptureException(e);
+        return Results.Problem(e.Message);
+    }
+})
+.WithName("GetLargeExpenseSummary")
+.WithOpenApi();
+
 // POST: /api/transactions/{id}/large-expense-decision
 app.MapPost("/api/transactions/{id}/large-expense-decision",
     async (int id, LargeExpenseDecisionRequest body, ApiDbContext dbContext, HttpContext httpContext) =>
@@ -2311,6 +2365,53 @@ app.MapGet("/api/debt/snapshot", async (ApiDbContext dbContext, PlaidClient plai
 
 
 
+
+// GET: /api/debt/summary
+// Returns the stored debt payoff plan summary for the authenticated user.
+// Reads only from our database — no Plaid API call is made.
+// Used by the HomeScreen dashboard to display a lightweight payoff estimate.
+// If DebtStartingBalance is null (old user / no Plaid at onboarding time), totalDebt
+// is returned as null and the dashboard card is hidden.
+app.MapGet("/api/debt/summary", async (ApiDbContext dbContext, HttpContext httpContext) =>
+{
+    try
+    {
+        string? idToken = httpContext.Request.Headers["Authorization"]
+            .FirstOrDefault()
+            ?.Split(" ")
+            .Last();
+        if (string.IsNullOrEmpty(idToken)) return Results.Unauthorized();
+
+        var decoded = await FirebaseAdmin.Auth.FirebaseAuth
+            .DefaultInstance
+            .VerifyIdTokenAsync(idToken);
+
+        var user = await dbContext.Users
+            .FirstOrDefaultAsync(u => u.FirebaseUuid == decoded.Uid);
+
+        if (user == null) return Results.NotFound("User not found.");
+
+        // Calculate how many paychecks remain to pay off the debt.
+        // Uses the pure static helper so the formula is independently testable.
+        var paychecksRemaining = DebtSummaryCalculator.CalculatePaychecksRemaining(
+            user.DebtStartingBalance, user.DebtPerPaycheck);
+
+        return Results.Ok(new
+        {
+            // null when old user / no Plaid snapshot captured → frontend hides the card
+            totalDebt = user.DebtStartingBalance,
+            debtPerPaycheck = user.DebtPerPaycheck,
+            paychecksRemaining
+        });
+    }
+    catch (Exception e)
+    {
+        SentrySdk.CaptureException(e);
+        return Results.Problem(e.Message);
+    }
+})
+.WithName("GetDebtSummary")
+.WithOpenApi();
 
 // ─── AUDIT ENDPOINT ──────────────────────────────────────────────────────────
 // GET /api/admin/debug/users/{userId}/transaction-balance-audit
@@ -2830,6 +2931,155 @@ app.MapPost("/api/paycheck-summary/{id}/decision", async (
     return Results.Ok(new { summary.Id, summary.UserDecision, summary.IsDismissed });
 });
 
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /api/admin/debug/users/{userId}/reconcile-fixed-costs?dryRun=true
+//
+// ADMIN / DEBUG ONLY.  Gated by the same X-Debug-Secret header as the
+// transaction-balance-audit endpoint.  Default is dryRun=true — writes are
+// only applied when the caller explicitly passes ?dryRun=false.
+//
+// Purpose: re-evaluate existing stored transactions for user {userId} against
+// their current fixed costs using FixedCostMatcher.  Transactions that now
+// match a fixed cost but were previously charged against the dynamic budget
+// will have their BudgetAppliedAmount cleared and the balance restored.
+//
+// Safety rules (all applied together):
+//   - Deposits (SuggestedKind != Unknown) are never touched.
+//   - Large expenses that have already been handled (LargeExpenseHandled=true) are skipped.
+//   - Suspicious holds that have been reviewed (HoldReviewed=true) are skipped.
+//   - Transactions the user has manually decided (UserDecision != Undecided) are skipped.
+//   - Only transactions with BudgetAppliedAmount != null are candidates.
+//   - Entire operation is wrapped in a DB transaction; rolled back on any error.
+//   - Idempotent: re-running on already-reconciled rows is a no-op.
+// ─────────────────────────────────────────────────────────────────────────────
+app.MapPost("/api/admin/debug/users/{userId}/reconcile-fixed-costs",
+    async (int userId, HttpContext httpContext, ApiDbContext dbContext, IConfiguration config,
+           bool dryRun = true) =>
+{
+    // ── Auth gate (same as audit endpoint) ───────────────────────────────────
+    var providedSecret = httpContext.Request.Headers["X-Debug-Secret"].FirstOrDefault();
+    var expectedSecret = config["Debug:Secret"]
+                         ?? System.Environment.GetEnvironmentVariable("DEBUG_SECRET");
+
+    if (string.IsNullOrWhiteSpace(providedSecret) ||
+        string.IsNullOrWhiteSpace(expectedSecret) ||
+        !string.Equals(providedSecret, expectedSecret, StringComparison.Ordinal))
+    {
+        return Results.Unauthorized();
+    }
+
+    // ── Load user ─────────────────────────────────────────────────────────────
+    var user = await dbContext.Users.FirstOrDefaultAsync(u => u.Id == userId);
+    if (user == null) return Results.NotFound($"User {userId} not found.");
+
+    // ── Load fixed costs ──────────────────────────────────────────────────────
+    var fixedCosts = await dbContext.FixedCosts
+        .Where(fc => fc.UserId == userId)
+        .ToListAsync();
+
+    // ── Load balance ──────────────────────────────────────────────────────────
+    var balance = await dbContext.Balances.FirstOrDefaultAsync(b => b.UserId == userId);
+
+    // ── Candidate transactions ────────────────────────────────────────────────
+    // Only debits that were charged to the budget and haven't been manually resolved.
+    var candidates = await dbContext.Transactions
+        .Where(t =>
+            t.UserId == userId &&
+            t.BudgetAppliedAmount != null &&          // was charged against budget
+            t.SuggestedKind == TransactionSuggestedKind.Unknown && // debit (not a deposit)
+            !t.LargeExpenseHandled &&                 // not an already-handled large expense
+            !t.HoldReviewed &&                        // not a hold the user has reviewed
+            t.UserDecision == TransactionUserDecision.Undecided) // user hasn't overridden it
+        .OrderBy(t => t.Date)
+        .ToListAsync();
+
+    // ── Reconcile ─────────────────────────────────────────────────────────────
+    var matchedRows = new List<object>();
+    var skippedRows = new List<object>();
+    decimal totalRestored = 0m;
+
+    foreach (var tx in candidates)
+    {
+        string txMerchant = tx.MerchantName ?? tx.Name ?? "(unknown)";
+
+        var (matchedFc, matchType) = FixedCostMatcher.TryMatch(
+            fixedCosts, txMerchant, tx.Amount, tx.Date);
+
+        if (matchedFc != null)
+        {
+            decimal restored = tx.BudgetAppliedAmount!.Value;
+            totalRestored += restored;
+
+            matchedRows.Add(new
+            {
+                transactionId = tx.Id,
+                plaidTransactionId = tx.PlaidTransactionId,
+                merchantName = txMerchant,
+                amount = tx.Amount,
+                date = tx.Date.ToString("yyyy-MM-dd"),
+                matchedFixedCostId = matchedFc.Id,
+                matchedFixedCostName = matchedFc.Name,
+                matchType,
+                budgetAppliedAmountRestored = restored,
+            });
+
+            if (!dryRun)
+            {
+                // Restore the balance
+                if (balance != null)
+                {
+                    balance.BalanceAmount += restored;
+                    balance.UpdatedAt = DateTime.UtcNow;
+                }
+
+                // Clear the budget impact
+                tx.BudgetAppliedAmount = null;
+                tx.UpdatedAt = DateTime.UtcNow;
+
+                // Enrich the fixed cost for faster future matching
+                if (string.IsNullOrEmpty(matchedFc.PlaidMerchantName) &&
+                    !string.IsNullOrEmpty(tx.MerchantName))
+                {
+                    matchedFc.PlaidMerchantName = tx.MerchantName;
+                    matchedFc.PlaidAccountId = tx.AccountId;
+                }
+            }
+        }
+        else
+        {
+            // Calculate why it was skipped (for diagnostic output)
+            decimal tol = Math.Max(FixedCostMatcher.AbsoluteTolerance,
+                                   tx.Amount * FixedCostMatcher.RelativeTolerance);
+            skippedRows.Add(new
+            {
+                transactionId = tx.Id,
+                merchantName = txMerchant,
+                amount = tx.Amount,
+                date = tx.Date.ToString("yyyy-MM-dd"),
+                skipReason = $"no-fixed-cost-match (tolerance=${tol:0.00})",
+            });
+        }
+    }
+
+    // ── Commit (only when not dry-run) ────────────────────────────────────────
+    if (!dryRun && matchedRows.Count > 0)
+    {
+        await dbContext.SaveChangesAsync();
+    }
+
+    return Results.Ok(new
+    {
+        userId,
+        dryRun,
+        candidatesConsidered = candidates.Count,
+        matchedCount = matchedRows.Count,
+        totalAmountRestored = dryRun ? totalRestored : totalRestored, // same in both modes
+        appliedToDb = !dryRun && matchedRows.Count > 0,
+        matched = matchedRows,
+        skipped = skippedRows,
+    });
+});
 
 // --- RUN THE APP ---
 app.Run();

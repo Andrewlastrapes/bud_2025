@@ -5,36 +5,36 @@
 
 export const colors = {
   // Brand
-  primary: '#4F46E5',       // indigo-600 — modern, trustworthy
-  primaryLight: '#6366F1',  // indigo-500
+  primary: "#4F46E5", // indigo-600 — modern, trustworthy
+  primaryLight: "#6366F1", // indigo-500
 
   // Dark palette (onboarding / splash screens)
-  darkBg: '#0F172A',           // slate-900
-  darkSurface: '#1E293B',      // slate-800
-  darkBorder: 'rgba(255,255,255,0.09)',
-  darkTextPrimary: '#F1F5F9',  // slate-100
-  darkTextSecondary: '#CBD5E1', // slate-300
-  darkTextMuted: '#94A3B8',    // slate-400
-  darkAccent: '#A5B4FC',       // indigo-300 — accent text on dark
+  darkBg: "#0F172A", // slate-900
+  darkSurface: "#1E293B", // slate-800
+  darkBorder: "rgba(255,255,255,0.09)",
+  darkTextPrimary: "#F1F5F9", // slate-100
+  darkTextSecondary: "#CBD5E1", // slate-300
+  darkTextMuted: "#94A3B8", // slate-400
+  darkAccent: "#A5B4FC", // indigo-300 — accent text on dark
 
   // Light palette (main app screens)
-  lightBg: '#F8FAFC',     // slate-50
-  lightSurface: '#FFFFFF',
-  lightBorder: 'rgba(0,0,0,0.07)',
-  textPrimary: '#0F172A',   // slate-900
-  textSecondary: '#475569', // slate-600
-  textMuted: '#94A3B8',     // slate-400
+  lightBg: "#F8FAFC", // slate-50
+  lightSurface: "#FFFFFF",
+  lightBorder: "rgba(0,0,0,0.07)",
+  textPrimary: "#0F172A", // slate-900
+  textSecondary: "#475569", // slate-600
+  textMuted: "#94A3B8", // slate-400
 
   // Semantic
-  success: '#0D9488',      // teal-600 — positive balance
-  successBg: '#F0FDFA',
-  danger: '#DC2626',       // red-600 — over budget
-  dangerBg: '#FEF2F2',
-  warning: '#D97706',      // amber-600
-  warningBg: '#FFFBEB',
-  warningBorder: '#FDE68A',
+  success: "#0D9488", // teal-600 — positive balance
+  successBg: "#F0FDFA",
+  danger: "#DC2626", // red-600 — over budget
+  dangerBg: "#FEF2F2",
+  warning: "#D97706", // amber-600
+  warningBg: "#FFFBEB",
+  warningBorder: "#FDE68A",
 
-  white: '#FFFFFF',
+  white: "#FFFFFF",
 };
 
 export const spacing = {
@@ -65,31 +65,69 @@ export const type = {
   display: 48,
 
   // Font weights
-  light: '300',
-  regular: '400',
-  medium: '500',
-  semibold: '600',
-  bold: '700',
-  heavy: '800',
+  light: "300",
+  regular: "400",
+  medium: "500",
+  semibold: "600",
+  bold: "700",
+  heavy: "800",
+};
+
+// ─── Transaction / notification card variants ─────────────────────────────────
+// Single source of truth for card type styling used across:
+//   - TransactionCard component
+//   - DepositReviewScreen   (type = "deposit")
+//   - ReviewLargeExpensesScreen (type = "largeExpense")
+//   - TransactionsScreen    (type = "spend")
+//
+// Do NOT use amount sign to determine type. Use screen context or SuggestedKind.
+export const notificationVariants = {
+  spend: {
+    label: "Transaction",
+    icon: "receipt",
+    backgroundColor: "#EEF4FF",
+    borderColor: "#7BA7F7",
+    chipBackground: "#DCEBFF",
+    chipTextColor: "#1E3A8A",
+    accentColor: "#7BA7F7",
+  },
+  deposit: {
+    label: "Deposit",
+    icon: "cash-plus",
+    backgroundColor: "#ECFDF5",
+    borderColor: "#6EE7B7",
+    chipBackground: "#D1FAE5",
+    chipTextColor: "#065F46",
+    accentColor: "#34D399",
+  },
+  largeExpense: {
+    label: "Large expense",
+    icon: "alert-circle-outline",
+    backgroundColor: "#FFF7ED",
+    borderColor: "#FDBA74",
+    chipBackground: "#FFEDD5",
+    chipTextColor: "#92400E",
+    accentColor: "#F97316",
+  },
 };
 
 export const shadow = {
   sm: {
-    shadowColor: '#000',
+    shadowColor: "#000",
     shadowOffset: { width: 0, height: 1 },
     shadowOpacity: 0.06,
     shadowRadius: 4,
     elevation: 2,
   },
   md: {
-    shadowColor: '#000',
+    shadowColor: "#000",
     shadowOffset: { width: 0, height: 2 },
     shadowOpacity: 0.09,
     shadowRadius: 10,
     elevation: 4,
   },
   lg: {
-    shadowColor: '#000',
+    shadowColor: "#000",
     shadowOffset: { width: 0, height: 4 },
     shadowOpacity: 0.12,
     shadowRadius: 18,
