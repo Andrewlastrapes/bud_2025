@@ -44,5 +44,19 @@ public class ApiDbContext : DbContext
             .HasIndex(t => new { t.UserId, t.PlaidTransactionId })
             .IsUnique()
             .HasDatabaseName("IX_Transactions_UserId_PlaidTransactionId");
+
+        // SQL DEFAULT values for the historical-backfill sentinel columns.
+        // These must match the defaultValue parameters used in migration
+        // 20260520200000_AddHistoricalBackfillFieldsToTransactions and the
+        // HasDefaultValue entries in ApiDbContextModelSnapshot.cs.
+        // Without these, EF's compiled model differs from the snapshot and
+        // throws PendingModelChangesWarning at production startup.
+        modelBuilder.Entity<Transaction>()
+            .Property(t => t.IsHistoricalBackfill)
+            .HasDefaultValue(false);
+
+        modelBuilder.Entity<Transaction>()
+            .Property(t => t.BudgetImpactEligible)
+            .HasDefaultValue(true);
     }
 }

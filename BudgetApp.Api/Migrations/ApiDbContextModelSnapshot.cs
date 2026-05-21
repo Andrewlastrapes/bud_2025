@@ -328,14 +328,14 @@ namespace BudgetApp.Api.Migrations
                         .HasColumnType("boolean")
                         .HasColumnName("hold_reviewed");
 
-                    b.Property<bool>("IsLargeExpenseCandidate")
-                        .HasColumnType("boolean")
-                        .HasColumnName("IsLargeExpenseCandidate");
-
                     b.Property<bool>("IsHistoricalBackfill")
                         .HasColumnType("boolean")
                         .HasDefaultValue(false)
                         .HasColumnName("is_historical_backfill");
+
+                    b.Property<bool>("IsLargeExpenseCandidate")
+                        .HasColumnType("boolean")
+                        .HasColumnName("IsLargeExpenseCandidate");
 
                     b.Property<bool>("IsSuspiciousHold")
                         .HasColumnType("boolean")
@@ -503,7 +503,7 @@ namespace BudgetApp.Api.Migrations
 
                     b.HasIndex("UserId");
 
-                    b.ToTable("UserDevices");
+                    b.ToTable("UserDevices", (string)null);
                 });
 
             modelBuilder.Entity("BudgetApp.Api.Data.Balance", b =>
