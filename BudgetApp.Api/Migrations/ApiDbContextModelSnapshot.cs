@@ -303,6 +303,11 @@ namespace BudgetApp.Api.Migrations
                         .HasColumnType("numeric")
                         .HasColumnName("budget_applied_amount");
 
+                    b.Property<bool>("BudgetImpactEligible")
+                        .HasColumnType("boolean")
+                        .HasDefaultValue(true)
+                        .HasColumnName("budget_impact_eligible");
+
                     b.Property<bool>("CountedAsIncome")
                         .HasColumnType("boolean")
                         .HasColumnName("counted_as_income");
@@ -326,6 +331,11 @@ namespace BudgetApp.Api.Migrations
                     b.Property<bool>("IsLargeExpenseCandidate")
                         .HasColumnType("boolean")
                         .HasColumnName("IsLargeExpenseCandidate");
+
+                    b.Property<bool>("IsHistoricalBackfill")
+                        .HasColumnType("boolean")
+                        .HasDefaultValue(false)
+                        .HasColumnName("is_historical_backfill");
 
                     b.Property<bool>("IsSuspiciousHold")
                         .HasColumnType("boolean")

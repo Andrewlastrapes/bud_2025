@@ -4,6 +4,10 @@ using Going.Plaid;
 using Going.Plaid.Transactions;
 using Sentry;
 using Microsoft.Extensions.Logging;
+// Alias to avoid clash with BudgetApp.Api.Data.Transaction when using
+// Going.Plaid.Entity types (e.g. TransactionsGetRequestOptions) below.
+using PlaidTransactionEntity = Going.Plaid.Entity.Transaction;
+using PlaidTxGetOptions = Going.Plaid.Entity.TransactionsGetRequestOptions;
 
 namespace BudgetApp.Api.Services
 {
@@ -20,6 +24,28 @@ namespace BudgetApp.Api.Services
         Task<TransactionsSyncResponse> SyncAndProcessTransactions(
             string itemId,
             string? webhookCode = null);
+
+        /// <summary>
+        /// Fetches up to <paramref name="monthsBack"/> months of historical transactions
+        /// from Plaid using date-range mode (TransactionsGetAsync — NOT cursor-based).
+        /// The live sync cursor is never touched.
+        ///
+        /// Each imported row is tagged:
+        ///   IsHistoricalBackfill = true
+        ///   BudgetImpactEligible = false
+        ///
+        /// This means the rows are invisible to all live-budget queries (balance, deposit
+        /// review, large-expense review, suspicious-hold review, notifications) but are
+        /// included in GET /api/recurring/suggestions for pattern detection.
+        ///
+        /// Only outflow transactions (raw Plaid Amount > 0) are imported.
+        /// Credits/income (raw Plaid Amount &lt;= 0) are skipped.
+        /// Idempotent: rows already stored for this user (by PlaidTransactionId) are skipped.
+        /// </summary>
+        /// <returns>Number of new rows inserted.</returns>
+        Task<int> BackfillHistoricalTransactionsForRecurringAnalysis(
+            string itemId,
+            int monthsBack = 6);
     }
 
     public class TransactionService : ITransactionService
@@ -1015,6 +1041,207 @@ namespace BudgetApp.Api.Services
                     itemId, webhookCode ?? "(manual)");
                 throw new Exception("Error syncing and processing transactions.", e);
             }
+        }
+
+        // ─────────────────────────────────────────────────────────────────────────────
+        // Historical recurring-analysis backfill
+        // ─────────────────────────────────────────────────────────────────────────────
+
+        public async Task<int> BackfillHistoricalTransactionsForRecurringAnalysis(
+            string itemId,
+            int monthsBack = 6)
+        {
+            var plaidItem = await _dbContext.PlaidItems
+                .FirstOrDefaultAsync(p => p.ItemId == itemId);
+
+            if (plaidItem == null)
+            {
+                _logger.LogWarning(
+                    "BackfillHistorical: PlaidItem not found. itemId={ItemId}", itemId);
+                return 0;
+            }
+
+            var user = await _dbContext.Users
+                .FirstOrDefaultAsync(u => u.Id == plaidItem.UserId);
+
+            if (user == null)
+            {
+                _logger.LogWarning(
+                    "BackfillHistorical: User not found for PlaidItem. " +
+                    "itemId={ItemId} userId={UserId}",
+                    itemId, plaidItem.UserId);
+                return 0;
+            }
+
+            var endDate = DateOnly.FromDateTime(DateTime.UtcNow.Date);
+            var startDate = endDate.AddMonths(-monthsBack);
+
+            _logger.LogInformation(
+                "BackfillHistorical: Starting. itemId={ItemId} userId={UserId} " +
+                "userEmail={UserEmail} startDate={StartDate} endDate={EndDate} monthsBack={MonthsBack}",
+                itemId, user.Id, user.Email,
+                startDate.ToString("yyyy-MM-dd"), endDate.ToString("yyyy-MM-dd"), monthsBack);
+
+            SentrySdk.AddBreadcrumb(
+                $"BackfillHistorical start: itemId={itemId} userEmail={user.Email} " +
+                $"startDate={startDate} endDate={endDate}",
+                level: BreadcrumbLevel.Info);
+
+            const int pageSize = 500;
+            int offset = 0;
+            int totalFromPlaid = 0;
+            int inserted = 0;
+            int skippedDuplicate = 0;
+            int skippedCredit = 0;
+
+            // ── Paginate through Plaid's date-range endpoint ───────────────────────────
+            // Using TransactionsGetAsync (legacy date-range API) so we don't touch
+            // the live sync cursor that TransactionsSyncAsync maintains.
+            do
+            {
+                var req = new TransactionsGetRequest
+                {
+                    AccessToken = plaidItem.AccessToken,
+                    StartDate = startDate,
+                    EndDate = endDate,
+                    Options = new PlaidTxGetOptions
+                    {
+                        Count = pageSize,
+                        Offset = offset
+                    }
+                };
+
+                var resp = await _plaidClient.TransactionsGetAsync(req);
+                var page = resp.Transactions
+                           ?? Array.Empty<PlaidTransactionEntity>();
+
+                if (offset == 0)
+                {
+                    totalFromPlaid = resp.TotalTransactions;
+                    _logger.LogInformation(
+                        "BackfillHistorical: Plaid reports totalTransactions={Total} " +
+                        "itemId={ItemId} userId={UserId}",
+                        totalFromPlaid, itemId, user.Id);
+                }
+
+                foreach (var t in page)
+                {
+                    // ── Amount convention ──────────────────────────────────────────────
+                    // Plaid raw positive amount = debit/outflow/spending (what we want).
+                    // Plaid raw negative amount = credit/income (skip).
+                    var rawAmount = t.Amount ?? 0m;
+                    if (rawAmount <= 0m)
+                    {
+                        skippedCredit++;
+                        continue;
+                    }
+
+                    decimal absAmount = rawAmount; // already positive
+
+                    // ── Idempotency guard ──────────────────────────────────────────────
+                    // Skip rows we have already stored for this user.
+                    // This covers both previously-backfilled rows and live-synced rows
+                    // (a transaction can exist from either source; we only store it once).
+                    bool alreadyExists = await _dbContext.Transactions
+                        .AnyAsync(x =>
+                            x.UserId == user.Id &&
+                            x.PlaidTransactionId == t.TransactionId);
+
+                    if (alreadyExists)
+                    {
+                        skippedDuplicate++;
+                        continue;
+                    }
+
+                    DateTime txDate = t.Date
+                        .GetValueOrDefault(DateOnly.FromDateTime(DateTime.UtcNow))
+                        .ToDateTime(TimeOnly.MinValue);
+                    DateTime txDateUtc = DateTime.SpecifyKind(txDate, DateTimeKind.Utc);
+
+                    var backfillTx = new Transaction
+                    {
+                        UserId = user.Id,
+                        PlaidTransactionId = t.TransactionId,
+                        AccountId = t.AccountId ?? string.Empty,
+                        Amount = absAmount,
+                        Date = txDateUtc,
+#pragma warning disable CS0612
+                        Name = t.Name ?? string.Empty,
+#pragma warning restore CS0612
+                        MerchantName = t.MerchantName,
+                        // Only import posted transactions — pending rows have unstable amounts
+                        // and no consistent merchant name, making them useless for pattern analysis.
+                        Pending = false,
+                        CreatedAt = DateTime.UtcNow,
+                        UpdatedAt = DateTime.UtcNow,
+                        SuggestedKind = TransactionSuggestedKind.Unknown,
+                        UserDecision = TransactionUserDecision.Undecided,
+                        CountedAsIncome = false,
+                        IsLargeExpenseCandidate = false,
+                        LargeExpenseHandled = false,
+                        IsSuspiciousHold = false,
+                        HoldReviewed = false,
+                        // Null: historical rows never alter the balance.
+                        BudgetAppliedAmount = null,
+                        // Tag as historical so all live-budget queries exclude this row.
+                        IsHistoricalBackfill = true,
+                        BudgetImpactEligible = false
+                    };
+
+                    await _dbContext.Transactions.AddAsync(backfillTx);
+                    inserted++;
+                }
+
+                offset += page.Count;
+
+                // Stop when we've received all reported transactions or got an empty page.
+                if (page.Count == 0 || offset >= totalFromPlaid)
+                    break;
+
+            } while (true);
+
+            // ── Persist to DB ─────────────────────────────────────────────────────────
+            if (inserted > 0)
+            {
+                try
+                {
+                    await _dbContext.SaveChangesAsync();
+                }
+                catch (Microsoft.EntityFrameworkCore.DbUpdateException dbEx)
+                    when (dbEx.InnerException is Npgsql.PostgresException pgEx
+                          && pgEx.SqlState == "23505")
+                {
+                    // Concurrent request already inserted some of these rows.
+                    // Roll back in-memory state; the next call will skip duplicates.
+                    _dbContext.ChangeTracker.Clear();
+
+                    _logger.LogWarning(
+                        "BackfillHistorical: Unique constraint collision — batch rolled back. " +
+                        "itemId={ItemId} userId={UserId} insertedAttempted={Inserted} " +
+                        "constraintName={ConstraintName}",
+                        itemId, user.Id, inserted,
+                        pgEx.ConstraintName ?? "(unknown)");
+
+                    SentrySdk.CaptureException(dbEx);
+                    inserted = 0;
+                }
+            }
+
+            _logger.LogInformation(
+                "BackfillHistorical: Complete. itemId={ItemId} userId={UserId} " +
+                "userEmail={UserEmail} totalFromPlaid={TotalFromPlaid} " +
+                "inserted={Inserted} skippedDuplicate={SkippedDuplicate} " +
+                "skippedCredit={SkippedCredit}",
+                itemId, user.Id, user.Email,
+                totalFromPlaid, inserted, skippedDuplicate, skippedCredit);
+
+            SentrySdk.AddBreadcrumb(
+                $"BackfillHistorical complete: itemId={itemId} userEmail={user.Email} " +
+                $"totalFromPlaid={totalFromPlaid} inserted={inserted} " +
+                $"skippedDuplicate={skippedDuplicate} skippedCredit={skippedCredit}",
+                level: BreadcrumbLevel.Info);
+
+            return inserted;
         }
     }
 }

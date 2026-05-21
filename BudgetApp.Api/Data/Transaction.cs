@@ -90,6 +90,30 @@ public class Transaction
     [Column("budget_applied_amount")]
     public decimal? BudgetAppliedAmount { get; set; }
 
+    // ─── Historical recurring-analysis backfill fields ────────────────────────
+    // Rows imported specifically to provide historical transaction data for the
+    // recurring-pattern analyzer (GET /api/recurring/suggestions).
+    // These rows are NOT discovered by the normal cursor-based Plaid sync.
+
+    /// <summary>
+    /// True for transactions imported by BackfillHistoricalTransactionsForRecurringAnalysis.
+    /// These rows exist solely to support recurring pattern detection.
+    /// They do NOT affect the live dynamic budget, balance, deposit review,
+    /// large-expense review, suspicious-hold review, or push notifications.
+    /// </summary>
+    [Column("is_historical_backfill")]
+    public bool IsHistoricalBackfill { get; set; } = false;
+
+    /// <summary>
+    /// True for transactions that participate in live budget calculations,
+    /// deposit review, large-expense review, suspicious-hold review, and notifications.
+    /// Always false for historical backfill rows (IsHistoricalBackfill = true).
+    /// Defaults to true for all normally cursor-synced transactions.
+    /// Existing DB rows receive DEFAULT true from the migration, preserving current behavior.
+    /// </summary>
+    [Column("budget_impact_eligible")]
+    public bool BudgetImpactEligible { get; set; } = true;
+
     // Navigation property
     [ForeignKey(nameof(UserId))]
     public virtual User? User { get; set; }

@@ -369,7 +369,8 @@ app.MapPost("/api/plaid/create_link_token", async (PlaidClient plaidClient, ICon
 .WithOpenApi();
 
 app.MapPost("/api/plaid/exchange_public_token",
-    async (PlaidClient plaidClient, ApiDbContext dbContext, ExchangeTokenRequest requestBody) =>
+    async (PlaidClient plaidClient, ApiDbContext dbContext, ExchangeTokenRequest requestBody,
+           ITransactionService transactionService) =>
     {
         Console.WriteLine("🚀 HIT /exchange_public_token");
         SentrySdk.CaptureMessage("exhange public token endpoint hit.s");
@@ -470,6 +471,29 @@ app.MapPost("/api/plaid/exchange_public_token",
                 SentrySdk.AddBreadcrumb("DB save success");
 
                 SentrySdk.CaptureMessage("exchange_public_token SUCCESS");
+
+                // ── Historical backfill for recurring-analysis (fire-and-forget) ──────
+                // Imports the last 6 months of Plaid transaction history tagged with
+                //   IsHistoricalBackfill = true
+                //   BudgetImpactEligible = false
+                // so they feed GET /api/recurring/suggestions without touching
+                // the live dynamic budget, notifications, or the sync cursor.
+                // Non-fatal: a backfill failure must NEVER break the onboarding flow.
+                _ = Task.Run(async () =>
+                {
+                    try
+                    {
+                        int inserted = await transactionService
+                            .BackfillHistoricalTransactionsForRecurringAnalysis(newItem.ItemId);
+                        Console.WriteLine($"[BackfillHistorical] itemId={newItem.ItemId} inserted={inserted}");
+                    }
+                    catch (Exception bfEx)
+                    {
+                        Console.Error.WriteLine(
+                            $"[BackfillHistorical] Non-fatal error: itemId={newItem.ItemId} {bfEx.Message}");
+                        SentrySdk.CaptureException(bfEx);
+                    }
+                });
 
                 Console.WriteLine("🎉 ENDPOINT SUCCESS");
 
@@ -776,7 +800,8 @@ app.MapGet("/api/transactions", async (ApiDbContext dbContext, HttpContext httpC
         if (user == null) return Results.NotFound("User not found.");
 
         var transactions = await dbContext.Transactions
-            .Where(t => t.UserId == user.Id)
+            .Where(t => t.UserId == user.Id
+                && t.BudgetImpactEligible)
             .OrderByDescending(t => t.Date)
             .ToListAsync();
 
@@ -797,6 +822,12 @@ app.MapGet("/api/transactions", async (ApiDbContext dbContext, HttpContext httpC
 // ─── Shared DTO helper — avoids the User navigation-property cycle ────────────
 // Used by POST and PUT endpoints.  GET uses an inline EF projection instead
 // so EF can translate the projection to SQL without loading the entity.
+// Normalizes a fixed-cost name for duplicate detection:
+// trims, lowercases, and collapses repeated whitespace to a single space.
+static string NormalizeFixedCostName(string? name) =>
+    System.Text.RegularExpressions.Regex
+        .Replace((name ?? "").Trim().ToLowerInvariant(), @"\s+", " ");
+
 static object ToFixedCostDto(FixedCost fc) => new
 {
     id = fc.Id,
@@ -873,6 +904,33 @@ app.MapPost("/api/fixed-costs", async (ApiDbContext dbContext, HttpContext httpC
         var decodedToken = await FirebaseAdmin.Auth.FirebaseAuth.DefaultInstance.VerifyIdTokenAsync(idToken);
         var user = await dbContext.Users.FirstOrDefaultAsync(u => u.FirebaseUuid == decodedToken.Uid);
         if (user == null) return Results.NotFound("User not found.");
+
+        // ── Idempotency: return the existing cost if an equivalent already exists ──
+        // Protects against repeated onboarding saves, double-taps, and back-navigation.
+        // Equivalence: same user + normalized name + amount within ±$1 + same due date
+        // (compared by calendar date only, ignoring time/timezone).
+        var normalizedIncoming = NormalizeFixedCostName(requestBody.Name);
+
+        var existingCosts = await dbContext.FixedCosts
+            .Where(fc => fc.UserId == user.Id)
+            .ToListAsync();
+
+        var duplicate = existingCosts.FirstOrDefault(fc =>
+        {
+            var fcName = NormalizeFixedCostName(fc.Name);
+            bool nameMatch = fcName == normalizedIncoming;
+            bool amountMatch = Math.Abs(fc.Amount - requestBody.Amount) <= 1.00m;
+            bool dateMatch =
+                (!fc.NextDueDate.HasValue && !requestBody.NextDueDate.HasValue) ||
+                (fc.NextDueDate.HasValue && requestBody.NextDueDate.HasValue &&
+                 fc.NextDueDate.Value.Date == requestBody.NextDueDate.Value.Date);
+            return nameMatch && amountMatch && dateMatch;
+        });
+
+        if (duplicate != null)
+        {
+            return Results.Ok(ToFixedCostDto(duplicate));
+        }
 
         var newCost = new FixedCost
         {
@@ -1811,6 +1869,7 @@ app.MapGet("/api/transactions/deposits/pending", async (ApiDbContext dbContext, 
 
         var pendingDeposits = await dbContext.Transactions
             .Where(t => t.UserId == user.Id
+                && t.BudgetImpactEligible
                 && depositKinds.Contains(t.SuggestedKind)
                 && t.UserDecision == TransactionUserDecision.Undecided
                 && !t.IsLargeExpenseCandidate)
@@ -2028,6 +2087,7 @@ app.MapGet("/api/transactions/suspicious-holds", async (ApiDbContext dbContext, 
 
         var holds = await dbContext.Transactions
             .Where(t => t.UserId == user.Id
+                && t.BudgetImpactEligible
                 && t.IsSuspiciousHold
                 && t.Pending
                 && !t.HoldReviewed)
@@ -2126,7 +2186,10 @@ app.MapGet("/api/transactions/large-expenses/pending", async (ApiDbContext dbCon
         if (user == null) return Results.NotFound("User not found.");
 
         var txs = await dbContext.Transactions
-            .Where(t => t.UserId == user.Id && t.IsLargeExpenseCandidate && !t.LargeExpenseHandled)
+            .Where(t => t.UserId == user.Id
+                && t.BudgetImpactEligible
+                && t.IsLargeExpenseCandidate
+                && !t.LargeExpenseHandled)
             .OrderByDescending(t => t.Date)
             .ToListAsync();
 
@@ -2159,7 +2222,10 @@ app.MapGet("/api/transactions/large-expenses/summary", async (ApiDbContext dbCon
         if (user == null) return Results.NotFound("User not found.");
 
         var unreviewedLargeExpenses = await dbContext.Transactions
-            .Where(t => t.UserId == user.Id && t.IsLargeExpenseCandidate && !t.LargeExpenseHandled)
+            .Where(t => t.UserId == user.Id
+                && t.BudgetImpactEligible
+                && t.IsLargeExpenseCandidate
+                && !t.LargeExpenseHandled)
             .ToListAsync();
 
         var count = unreviewedLargeExpenses.Count;
@@ -3290,6 +3356,7 @@ app.MapGet("/api/transactions/deposits/pending/summary", async (ApiDbContext dbC
 
         var pendingUnexpectedDeposits = await dbContext.Transactions
             .Where(t => t.UserId == user.Id
+                && t.BudgetImpactEligible
                 && unexpectedDepositKinds.Contains(t.SuggestedKind)
                 && t.UserDecision == TransactionUserDecision.Undecided
                 && !t.IsLargeExpenseCandidate)
@@ -3502,6 +3569,11 @@ app.MapGet("/api/admin/debug/users/{userId}/recurring-suggestions-audit",
                 groupsIncluded = groups.Count(g => g.Included),
                 groupsRejected = groups.Count(g => !g.Included),
                 recurringSuggestionCount = suggestions.Count,
+                // Breakdown: how many rows came from historical backfill vs live sync.
+                // historicalBackfillCount > 0 means BackfillHistoricalTransactionsForRecurringAnalysis
+                // has run for this user and contributed data to the analysis window.
+                historicalBackfillCount = allTransactions.Count(t => t.IsHistoricalBackfill),
+                liveTransactionCount = allTransactions.Count(t => !t.IsHistoricalBackfill),
             },
             suggestions,
             groups,
