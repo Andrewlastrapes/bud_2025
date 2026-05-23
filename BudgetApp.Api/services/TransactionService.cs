@@ -364,6 +364,15 @@ namespace BudgetApp.Api.Services
                     }
                 }
 
+                // ── Commit removals and modifications before the Added per-transaction loop ──
+                // A ChangeTracker.Clear() triggered by a 23505 race recovery in the Added loop
+                // would otherwise discard these pending deletions and updates. Committing them
+                // first ensures they survive any per-transaction race-condition recovery.
+                if (_dbContext.ChangeTracker.HasChanges())
+                {
+                    await _dbContext.SaveChangesAsync();
+                }
+
                 // ── 5. Added ───────────────────────────────────────────────────────────
                 if (response.Added != null)
                 {
@@ -384,31 +393,15 @@ namespace BudgetApp.Api.Services
                                 "itemId={ItemId} webhookCode={WebhookCode}",
                                 t.TransactionId, t.MerchantName ?? t.Name,
                                 Math.Abs(t.Amount ?? 0m), itemId, webhookCode ?? "(manual)");
+
+                            SentrySdk.AddBreadcrumb(
+                                $"tx-batch-duplicate-skip: plaidTxId={t.TransactionId}",
+                                level: BreadcrumbLevel.Warning);
+
                             continue;
                         }
 
-                        // ── Guard 2: already in DB for this user ──────────────────────
-                        // Scoped to the current user (x.UserId == user.Id) to match the
-                        // DB unique index on (user_id, plaid_transaction_id).
-                        // The original check was not user-scoped; in a multi-user environment
-                        // that was harmless but inconsistent with the index definition.
-                        var exists = await _dbContext.Transactions
-                            .AnyAsync(x => x.UserId == user.Id && x.PlaidTransactionId == t.TransactionId);
-
-                        if (exists)
-                        {
-                            // ⚠️  DUPLICATE: This is important for diagnosing repeated notifications.
-                            // If the same plaidTxId shows up across multiple webhook calls, it means
-                            // Plaid is replaying the same transaction — but we guard correctly here.
-                            _logger.LogWarning(
-                                "Duplicate transaction skipped (already in DB): " +
-                                "plaidTxId={PlaidTxId} merchant={Merchant} amount={Amount} " +
-                                "itemId={ItemId} webhookCode={WebhookCode}",
-                                t.TransactionId, t.MerchantName ?? t.Name,
-                                Math.Abs(t.Amount ?? 0m), itemId, webhookCode ?? "(manual)");
-                            continue;
-                        }
-
+                        // ── Parse date / amount first — needed by both update and insert paths ──
                         DateTime txDate = t.Date
                             .GetValueOrDefault(DateOnly.FromDateTime(DateTime.UtcNow))
                             .ToDateTime(TimeOnly.MinValue);
@@ -438,6 +431,80 @@ namespace BudgetApp.Api.Services
                         decimal absAmount = Math.Abs(rawAmount);
                         bool isPending = t.Pending ?? false;
                         DateTime createdAt = DateTime.UtcNow;
+
+                        // ── Guard 2 → Upsert: check for existing row by UserId + PlaidTransactionId ──
+                        // If a row already exists (e.g. repeated webhook, prior race-condition insert),
+                        // update it with the latest Plaid data instead of inserting a duplicate.
+                        // Preserves all user/manual fields. The DB unique index on
+                        // (user_id, plaid_transaction_id) is the authoritative duplicate guard.
+                        var existingTx = await _dbContext.Transactions
+                            .FirstOrDefaultAsync(x => x.UserId == user.Id && x.PlaidTransactionId == t.TransactionId);
+
+                        if (existingTx != null)
+                        {
+                            // ── UPSERT UPDATE PATH ─────────────────────────────────────────────────
+                            // Update Plaid-sourced fields. Preserve all user/manual decision fields.
+                            //
+                            // Updated from Plaid:   Amount, Date, Name, MerchantName, Pending,
+                            //                       AccountId, UpdatedAt
+                            // Preserved always:     UserDecision, CountedAsIncome, LargeExpenseHandled,
+                            //                       HoldReviewed, HoldOverrideAmount,
+                            //                       BudgetImpactEligible, IsHistoricalBackfill
+                            // Recalculated safely:  BudgetAppliedAmount (delta only, no double-apply)
+
+                            decimal oldApplied = existingTx.BudgetAppliedAmount ?? 0m;
+                            bool hadBudgetApplied = existingTx.BudgetAppliedAmount.HasValue;
+
+#pragma warning disable CS0612
+                            existingTx.Name = t.Name ?? existingTx.Name;
+#pragma warning restore CS0612
+                            existingTx.MerchantName = t.MerchantName ?? existingTx.MerchantName;
+                            existingTx.Amount = absAmount;
+                            existingTx.Date = txDateUtc;
+                            existingTx.Pending = isPending;
+                            existingTx.AccountId = t.AccountId ?? existingTx.AccountId;
+                            existingTx.UpdatedAt = DateTime.UtcNow;
+
+                            // Adjust balance only when all of:
+                            //   • this is a spend row (not credit)
+                            //   • it previously had a budget impact (BudgetAppliedAmount was set)
+                            //   • user hasn't already reviewed/overridden the hold
+                            //   • the amount actually changed (avoid a no-op delta)
+                            //
+                            // Formula mirrors the existing Modified handler:
+                            //   delta = oldApplied - newAbsAmount
+                            //   positive delta → balance goes up   (old over-deducted)
+                            //   negative delta → balance goes down  (new deduction is larger)
+                            if (!isCredit && hadBudgetApplied && !existingTx.HoldReviewed
+                                && oldApplied != absAmount)
+                            {
+                                decimal delta = oldApplied - absAmount;
+                                balanceDelta += delta;
+                                notifyRunningBalance += delta;
+                                existingTx.BudgetAppliedAmount = absAmount;
+                            }
+
+                            await _dbContext.SaveChangesAsync();
+
+                            _logger.LogInformation(
+                                "Upsert-updated existing transaction from Plaid added list: " +
+                                "plaidTxId={PlaidTxId} merchant={Merchant} amount={Amount} " +
+                                "itemId={ItemId} webhookCode={WebhookCode}",
+                                t.TransactionId, merchantName, absAmount,
+                                itemId, webhookCode ?? "(manual)");
+
+                            SentrySdk.AddBreadcrumb(
+                                $"tx-upsert-updated: plaidTxId={t.TransactionId} " +
+                                $"merchant={merchantName} amt={absAmount}",
+                                level: BreadcrumbLevel.Info);
+
+                            // Upsert-updated rows are not re-queued for notifications.
+                            // Notifications were already sent on the original insertion.
+                            continue;
+                        }
+
+                        // ── INSERT PATH ────────────────────────────────────────────────────────
+                        // No existing row found — classify and insert as new.
 
                         _logger.LogInformation(
                             "Processing added tx: plaidTxId={PlaidTxId} merchant={Merchant} " +
@@ -594,6 +661,127 @@ namespace BudgetApp.Api.Services
                         }
 
                         await _dbContext.Transactions.AddAsync(newTx);
+
+                        // ── Per-transaction save with 23505 race-condition recovery ─────────────
+                        // Each new transaction is saved individually so the 23505 handler has
+                        // full access to the current transaction's context without parsing
+                        // pgEx.Detail. A ChangeTracker.Clear() here only discards the current
+                        // entity — removals and modifications were already committed above.
+                        try
+                        {
+                            await _dbContext.SaveChangesAsync();
+
+                            SentrySdk.AddBreadcrumb(
+                                $"tx-insert: plaidTxId={t.TransactionId} " +
+                                $"merchant={merchantName} amt={absAmount}",
+                                level: BreadcrumbLevel.Info);
+                        }
+                        catch (Microsoft.EntityFrameworkCore.DbUpdateException dbEx)
+                            when (dbEx.InnerException is Npgsql.PostgresException pgEx
+                                  && pgEx.SqlState == "23505")
+                        {
+                            // Concurrent webhook inserted this transaction between our
+                            // FirstOrDefaultAsync check and our SaveChangesAsync.
+                            // Clear the failed entity from the change tracker, then re-query
+                            // and update the existing row using the same logic as the upsert
+                            // update path above. Context is already available (t, user.Id, etc.)
+                            // — no pgEx.Detail parsing needed.
+                            _dbContext.ChangeTracker.Clear();
+
+                            _logger.LogWarning(
+                                "23505 on insert — race condition: concurrent webhook inserted " +
+                                "this transaction first. Recovering by updating existing row: " +
+                                "plaidTxId={PlaidTxId} userId={UserId} itemId={ItemId} " +
+                                "constraintName={ConstraintName}",
+                                t.TransactionId, user.Id, itemId,
+                                pgEx.ConstraintName ?? "(unknown)");
+
+                            SentrySdk.AddBreadcrumb(
+                                $"23505-recovery-start: plaidTxId={t.TransactionId} userId={user.Id}",
+                                level: BreadcrumbLevel.Warning);
+
+                            SentrySdk.CaptureMessage(
+                                $"23505 insert race: plaidTxId={t.TransactionId} itemId={itemId}",
+                                scope =>
+                                {
+                                    scope.Level = SentryLevel.Warning;
+                                    scope.SetTag("event.type", "sync_23505_insert_race");
+                                    scope.SetTag("sync.itemId", itemId ?? "unknown");
+                                    scope.SetTag("sync.webhookCode", webhookCode ?? "(manual)");
+                                    scope.SetExtra("plaidTxId", t.TransactionId);
+                                    scope.SetExtra("userId", user.Id);
+                                    scope.SetExtra("pg.constraintName", pgEx.ConstraintName);
+                                });
+
+                            // Re-query by the known UserId + PlaidTransactionId — no Detail parsing.
+                            var raceExisting = await _dbContext.Transactions
+                                .FirstOrDefaultAsync(x =>
+                                    x.UserId == user.Id &&
+                                    x.PlaidTransactionId == t.TransactionId);
+
+                            if (raceExisting == null)
+                            {
+                                // 23505 means a row MUST exist — if not found, something is wrong.
+                                _logger.LogError(
+                                    "23505 recovery: existing row not found after conflict — " +
+                                    "re-throwing. plaidTxId={PlaidTxId} userId={UserId}",
+                                    t.TransactionId, user.Id);
+                                SentrySdk.CaptureMessage(
+                                    $"23505 recovery failed: row not found plaidTxId={t.TransactionId}",
+                                    s => s.Level = SentryLevel.Error);
+                                throw;
+                            }
+
+                            // Apply the same update field logic as the normal upsert update path.
+                            // Preserves all user/manual fields. Adjusts BudgetAppliedAmount if changed.
+                            decimal oldAppliedRace = raceExisting.BudgetAppliedAmount ?? 0m;
+                            bool hadBudgetAppliedRace = raceExisting.BudgetAppliedAmount.HasValue;
+
+#pragma warning disable CS0612
+                            raceExisting.Name = t.Name ?? raceExisting.Name;
+#pragma warning restore CS0612
+                            raceExisting.MerchantName = t.MerchantName ?? raceExisting.MerchantName;
+                            raceExisting.Amount = absAmount;
+                            raceExisting.Date = txDateUtc;
+                            raceExisting.Pending = isPending;
+                            raceExisting.AccountId = t.AccountId ?? raceExisting.AccountId;
+                            raceExisting.UpdatedAt = DateTime.UtcNow;
+
+                            if (!isCredit && hadBudgetAppliedRace && !raceExisting.HoldReviewed
+                                && oldAppliedRace != absAmount)
+                            {
+                                decimal recoveryDelta = oldAppliedRace - absAmount;
+                                balanceDelta += recoveryDelta;
+                                notifyRunningBalance += recoveryDelta;
+                                raceExisting.BudgetAppliedAmount = absAmount;
+                            }
+
+                            try
+                            {
+                                await _dbContext.SaveChangesAsync();
+                            }
+                            catch (Exception recoveryEx)
+                            {
+                                _logger.LogError(recoveryEx,
+                                    "23505 recovery SaveChanges failed — re-throwing: " +
+                                    "plaidTxId={PlaidTxId} userId={UserId} itemId={ItemId}",
+                                    t.TransactionId, user.Id, itemId);
+                                SentrySdk.CaptureException(recoveryEx);
+                                throw;
+                            }
+
+                            SentrySdk.AddBreadcrumb(
+                                $"23505-recovery-complete: plaidTxId={t.TransactionId}",
+                                level: BreadcrumbLevel.Info);
+
+                            _logger.LogInformation(
+                                "23505 recovery complete — existing row updated: " +
+                                "plaidTxId={PlaidTxId} userId={UserId} itemId={ItemId}",
+                                t.TransactionId, user.Id, itemId);
+
+                            // Recovery path: no notification (existing row was already notified).
+                            continue;
+                        }
 
                         // ── Notification eligibility ──────────────────────────────────
                         // A transaction qualifies for a push notification only when ALL of:
@@ -840,49 +1028,13 @@ namespace BudgetApp.Api.Services
                         });
                 }
 
-                // ── Save all changes atomically ────────────────────────────────────────
-                // The unique index on (user_id, plaid_transaction_id) is the authoritative
-                // guard against concurrent duplicate inserts. The application-level checks
-                // above are defense-in-depth. If a concurrent webhook beat us past all the
-                // app-level guards, Postgres will raise a 23505 unique violation here.
-                // We catch it, clear the change tracker (rolling back all in-memory state),
-                // log a warning, and re-throw so the caller can handle it. The next Plaid
-                // sync will find all already-inserted rows via the AnyAsync check and skip them.
-                try
-                {
-                    await _dbContext.SaveChangesAsync();
-                }
-                catch (Microsoft.EntityFrameworkCore.DbUpdateException dbEx)
-                    when (dbEx.InnerException is Npgsql.PostgresException pgEx
-                          && pgEx.SqlState == "23505")
-                {
-                    // Unique constraint violation — concurrent webhook race condition.
-                    // Clear the EF change tracker so we don't leave stale state in memory.
-                    _dbContext.ChangeTracker.Clear();
-
-                    _logger.LogWarning(
-                        "Unique constraint violation during transaction sync (concurrent webhook race) — " +
-                        "batch rolled back. Next Plaid sync will deduplicate correctly. " +
-                        "itemId={ItemId} webhookCode={WebhookCode} " +
-                        "constraintName={ConstraintName} detail={Detail}",
-                        itemId, webhookCode ?? "(manual)",
-                        pgEx.ConstraintName ?? "(unknown)", pgEx.Detail ?? pgEx.Message);
-
-                    SentrySdk.CaptureMessage(
-                        "Transaction sync unique-constraint collision (concurrent webhook race) — batch rolled back",
-                        scope =>
-                        {
-                            scope.Level = SentryLevel.Warning;
-                            scope.SetTag("event.type", "sync_unique_constraint_collision");
-                            scope.SetTag("sync.itemId", itemId ?? "unknown");
-                            scope.SetTag("sync.webhookCode", webhookCode ?? "(manual)");
-                            scope.SetExtra("pg.sqlState", pgEx.SqlState);
-                            scope.SetExtra("pg.constraintName", pgEx.ConstraintName);
-                            scope.SetExtra("pg.detail", pgEx.Detail);
-                        });
-
-                    throw; // Re-throw — the outer catch at the bottom of this method handles it
-                }
+                // ── Final save: balance record + cursor ────────────────────────────────
+                // Added transactions were committed individually inside the loop above.
+                // This save commits the accumulated balance delta and the cursor advancement.
+                // Only saved here — AFTER all transaction processing (including 23505 recovery)
+                // has completed successfully. If this save fails, the cursor does not advance
+                // and Plaid will retry; no data is lost.
+                await _dbContext.SaveChangesAsync();
 
                 var currentDynamicBalance = balanceRecord?.BalanceAmount ?? 0m;
 
