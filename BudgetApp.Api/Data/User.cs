@@ -78,6 +78,14 @@ public class User
     [Column("net_debt_starting_balance")]
     public decimal? NetDebtStartingBalance { get; set; }
 
+    /// <summary>
+    /// Set to true when a new Plaid item with credit accounts is linked after
+    /// onboarding is complete. Cleared when the user reviews or skips the
+    /// debt-plan update prompt. Never set for users who are still onboarding.
+    /// </summary>
+    [Column("debt_review_required")]
+    public bool DebtReviewRequired { get; set; } = false;
+
     // ...
 
     /// <summary>Savings contribution per paycheck. Stub [NotMapped] until a DB migration adds the column.</summary>

@@ -88,6 +88,228 @@ namespace BudgetApp.Api.Tests
         }
     }
 
+    // ─── Credit-card payment classification ──────────────────────────────────────
+    //
+    // Regression suite for the "Payment Thank You - Web" Windfall mis-classification.
+    //
+    // Root cause: ClassifyDeposit checked ctx.MerchantName only.
+    // When merchant_name is null, TransactionService falls back to the raw Plaid
+    // Name field:
+    //   string merchantName = t.MerchantName ?? t.Name ?? "(unknown)";
+    // That coalesced value is then assigned to DepositContext.MerchantName.
+    // So in tests we set MerchantName to the coalesced value (Name fallback).
+    //
+    // ALL of these names must produce InternalTransfer, NOT Windfall.
+    //
+    public class CreditCardPaymentClassificationTests
+    {
+        private readonly DynamicBudgetEngine _engine = new();
+
+        // ── "Payment Thank You - Web" — the exact transaction that triggered the bug ──
+        [Fact]
+        public void ClassifyDeposit_PaymentThankYouWeb_NullMerchant_ReturnsInternalTransfer()
+        {
+            // Simulates: merchant_name=null, name="Payment Thank You - Web"
+            // TransactionService coalesces: merchantName = null ?? "Payment Thank You - Web"
+            var ctx = new DepositContext
+            {
+                Amount = 236.67m,
+                Date = new DateTime(2026, 5, 20),
+                MerchantName = "Payment Thank You - Web",   // coalesced from t.Name
+                PayDay1 = 1,
+                PayDay2 = 15,
+                ExpectedPaycheckAmount = 3000m              // far from 236.67 → would be Windfall without keyword
+            };
+
+            var kind = _engine.ClassifyDeposit(ctx);
+
+            Assert.Equal(TransactionSuggestedKind.InternalTransfer, kind);
+        }
+
+        [Fact]
+        public void ClassifyDeposit_PaymentThankYou_ReturnsInternalTransfer()
+        {
+            var ctx = new DepositContext
+            {
+                Amount = 500m,
+                Date = new DateTime(2026, 5, 1),
+                MerchantName = "Payment Thank You",
+                PayDay1 = 1,
+                PayDay2 = 15,
+                ExpectedPaycheckAmount = 3000m
+            };
+
+            Assert.Equal(TransactionSuggestedKind.InternalTransfer, _engine.ClassifyDeposit(ctx));
+        }
+
+        [Fact]
+        public void ClassifyDeposit_AutopayPayment_ReturnsInternalTransfer()
+        {
+            var ctx = new DepositContext
+            {
+                Amount = 1200m,
+                Date = new DateTime(2026, 5, 10),
+                MerchantName = "Autopay Payment",
+                PayDay1 = 1,
+                PayDay2 = 15,
+                ExpectedPaycheckAmount = 3000m
+            };
+
+            Assert.Equal(TransactionSuggestedKind.InternalTransfer, _engine.ClassifyDeposit(ctx));
+        }
+
+        [Fact]
+        public void ClassifyDeposit_OnlinePayment_ReturnsInternalTransfer()
+        {
+            var ctx = new DepositContext
+            {
+                Amount = 800m,
+                Date = new DateTime(2026, 5, 7),
+                MerchantName = "Online Payment",
+                PayDay1 = 1,
+                PayDay2 = 15,
+                ExpectedPaycheckAmount = 3000m
+            };
+
+            Assert.Equal(TransactionSuggestedKind.InternalTransfer, _engine.ClassifyDeposit(ctx));
+        }
+
+        [Fact]
+        public void ClassifyDeposit_CreditCardPayment_ReturnsInternalTransfer()
+        {
+            var ctx = new DepositContext
+            {
+                Amount = 2500m,
+                Date = new DateTime(2026, 5, 3),
+                MerchantName = "Credit Card Payment",
+                PayDay1 = 1,
+                PayDay2 = 15,
+                ExpectedPaycheckAmount = 3000m
+            };
+
+            Assert.Equal(TransactionSuggestedKind.InternalTransfer, _engine.ClassifyDeposit(ctx));
+        }
+
+        [Fact]
+        public void ClassifyDeposit_MobilePayment_ReturnsInternalTransfer()
+        {
+            var ctx = new DepositContext
+            {
+                Amount = 150m,
+                Date = new DateTime(2026, 5, 12),
+                MerchantName = "Mobile Payment",
+                PayDay1 = 1,
+                PayDay2 = 15,
+                ExpectedPaycheckAmount = 3000m
+            };
+
+            Assert.Equal(TransactionSuggestedKind.InternalTransfer, _engine.ClassifyDeposit(ctx));
+        }
+
+        [Fact]
+        public void ClassifyDeposit_CardPayment_ReturnsInternalTransfer()
+        {
+            var ctx = new DepositContext
+            {
+                Amount = 350m,
+                Date = new DateTime(2026, 5, 9),
+                MerchantName = "Card Payment",
+                PayDay1 = 1,
+                PayDay2 = 15,
+                ExpectedPaycheckAmount = 3000m
+            };
+
+            Assert.Equal(TransactionSuggestedKind.InternalTransfer, _engine.ClassifyDeposit(ctx));
+        }
+
+        [Fact]
+        public void ClassifyDeposit_PaymentReceived_ReturnsInternalTransfer()
+        {
+            var ctx = new DepositContext
+            {
+                Amount = 400m,
+                Date = new DateTime(2026, 5, 14),
+                MerchantName = "Payment Received",
+                PayDay1 = 1,
+                PayDay2 = 15,
+                ExpectedPaycheckAmount = 3000m
+            };
+
+            Assert.Equal(TransactionSuggestedKind.InternalTransfer, _engine.ClassifyDeposit(ctx));
+        }
+
+        // ── Paycheck still works ──────────────────────────────────────────────────
+        [Fact]
+        public void ClassifyDeposit_PayrollDepositOnPayday_ReturnsPaycheck()
+        {
+            var ctx = new DepositContext
+            {
+                Amount = 2950m,
+                Date = new DateTime(2026, 5, 15),          // PayDay2
+                MerchantName = "ACME CORP PAYROLL",
+                PayDay1 = 1,
+                PayDay2 = 15,
+                ExpectedPaycheckAmount = 3000m             // within 15%
+            };
+
+            Assert.Equal(TransactionSuggestedKind.Paycheck, _engine.ClassifyDeposit(ctx));
+        }
+
+        // ── Refund still works ───────────────────────────────────────────────────
+        [Fact]
+        public void ClassifyDeposit_RefundKeyword_ReturnsRefund()
+        {
+            var ctx = new DepositContext
+            {
+                Amount = 49.99m,
+                Date = new DateTime(2026, 5, 11),
+                MerchantName = "Amazon Refund",
+                PayDay1 = 1,
+                PayDay2 = 15,
+                ExpectedPaycheckAmount = 3000m
+            };
+
+            Assert.Equal(TransactionSuggestedKind.Refund, _engine.ClassifyDeposit(ctx));
+        }
+
+        // ── Windfall still fires for unknown credits that don't match any keyword ──
+        [Fact]
+        public void ClassifyDeposit_UnknownCredit_NoKeyword_ReturnsWindfall()
+        {
+            // No keyword cues, amount far from paycheck → Windfall
+            var ctx = new DepositContext
+            {
+                Amount = 750m,
+                Date = new DateTime(2026, 5, 20),
+                MerchantName = "MYSTERY CREDIT",
+                PayDay1 = 1,
+                PayDay2 = 15,
+                ExpectedPaycheckAmount = 3000m
+            };
+
+            Assert.Equal(TransactionSuggestedKind.Windfall, _engine.ClassifyDeposit(ctx));
+        }
+
+        // ── Refund takes priority over payment keywords if both appear ────────────
+        [Fact]
+        public void ClassifyDeposit_RefundBeforePaymentKeyword_ReturnsRefund()
+        {
+            // If a string contains BOTH "REFUND" and "PAYMENT", Refund wins
+            // because the refund check runs first in ClassifyDeposit.
+            var ctx = new DepositContext
+            {
+                Amount = 100m,
+                Date = new DateTime(2026, 5, 6),
+                MerchantName = "REFUND OF PAYMENT",
+                PayDay1 = 1,
+                PayDay2 = 15,
+                ExpectedPaycheckAmount = 3000m
+            };
+
+            Assert.Equal(TransactionSuggestedKind.Refund, _engine.ClassifyDeposit(ctx));
+        }
+    }
+
     // ─── Deposit Filter Logic ─────────────────────────────────────────────────────
     //
     // These tests verify the whitelist logic used by:

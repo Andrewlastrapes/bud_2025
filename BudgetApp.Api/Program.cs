@@ -451,7 +451,9 @@ app.MapPost("/api/plaid/exchange_public_token",
                     UserId = user.Id,
                     AccessToken = response.AccessToken,
                     ItemId = response.ItemId,
-                    InstitutionName = "New Institution",
+                    InstitutionName = !string.IsNullOrWhiteSpace(requestBody.InstitutionName)
+                        ? requestBody.InstitutionName
+                        : "Unknown Institution",
                     InstitutionLogo = null,
                     CreatedAt = DateTime.UtcNow,
                     UpdatedAt = DateTime.UtcNow
@@ -497,7 +499,72 @@ app.MapPost("/api/plaid/exchange_public_token",
 
                 Console.WriteLine("🎉 ENDPOINT SUCCESS");
 
-                return Results.Ok(new { message = "Public token exchanged and saved successfully." });
+                // ── STEP 5: Debt-review detection (post-onboarding only) ──────────────
+                // For users who have already completed onboarding, check whether the
+                // newly linked Plaid item has any credit accounts with a positive balance.
+                // If so, flag the user's account for a debt-plan review — the user will
+                // be prompted to update their per-paycheck debt amount next time they
+                // open the app (or immediately from Settings).
+                //
+                // Convention matches /api/debt/snapshot:
+                //   AccountType.Credit → current balance = amount owed (positive = debt)
+                //   bal <= 0 means no debt on that card — skip it.
+                //
+                // NON-FATAL: any Plaid error here must never block the exchange response.
+                // We return the exchange as successful with debtDetectionError:true so the
+                // frontend still shows "account linked" and can retry debt detection later.
+                var newDebtAmount = 0m;
+                var debtDetectionError = false;
+                var requiresDebtPlanReview = false;
+
+                if (user.OnboardingComplete)
+                {
+                    try
+                    {
+                        var acctReq = new AccountsGetRequest { AccessToken = newItem.AccessToken };
+                        var acctResp = await plaidClient.AccountsGetAsync(acctReq);
+
+                        foreach (var acct in acctResp.Accounts)
+                        {
+                            if (acct.Type == AccountType.Credit)
+                            {
+                                // Positive current balance = amount owed on the card.
+                                // This mirrors the exact convention used in /api/debt/snapshot.
+                                var bal = acct.Balances.Current ?? 0m;
+                                if (bal > 0m) newDebtAmount += bal;
+                            }
+                        }
+
+                        if (newDebtAmount > 0m)
+                        {
+                            requiresDebtPlanReview = true;
+                            user.DebtReviewRequired = true;
+                            user.UpdatedAt = DateTime.UtcNow;
+                            await dbContext.SaveChangesAsync();
+                            Console.WriteLine($"[DebtDetection] New credit debt detected: {newDebtAmount:C} → DebtReviewRequired=true");
+                        }
+                        else
+                        {
+                            Console.WriteLine($"[DebtDetection] No new credit debt on new item. DebtReviewRequired unchanged.");
+                        }
+                    }
+                    catch (Exception debtEx)
+                    {
+                        // Non-fatal: log and continue. The exchange itself succeeded.
+                        debtDetectionError = true;
+                        Console.Error.WriteLine($"[DebtDetection] Non-fatal Plaid error during debt check: {debtEx.Message}");
+                        SentrySdk.CaptureException(debtEx);
+                    }
+                }
+
+                return Results.Ok(new
+                {
+                    message = "Public token exchanged and saved successfully.",
+                    newDebtDetected = newDebtAmount > 0m,
+                    newDebtAmount,
+                    requiresDebtPlanReview,
+                    debtDetectionError
+                });
             }
             catch (ApiException e)
             {
@@ -1099,7 +1166,10 @@ app.MapGet("/api/users/profile", async (ApiDbContext dbContext, HttpContext http
                 u.Name,
                 u.Email,
                 u.FirebaseUuid,
-                u.OnboardingComplete
+                u.OnboardingComplete,
+                // Signals that a newly linked credit account needs debt-plan review.
+                // App.js uses this to route to DebtReviewScreen on next app open.
+                u.DebtReviewRequired
             })
             .FirstOrDefaultAsync();
 
@@ -2653,6 +2723,99 @@ app.MapGet("/api/debt/summary", async (ApiDbContext dbContext, HttpContext httpC
 .WithName("GetDebtSummary")
 .WithOpenApi();
 
+// ─────────────────────────────────────────────────────────────────────────────
+// PUT /api/debt/update-plan
+//
+// Allows a post-onboarding user to update their debt payoff plan after linking
+// a new credit card account.  Called by DebtReviewScreen (and from Settings).
+//
+// Accepts:
+//   debtPerPaycheck?           (decimal | null) — new per-paycheck debt payment.
+//                              If omitted / null, the existing value is kept as-is.
+//   newDebtStartingBalance?    (decimal | null) — fresh total credit card balance.
+//                              If omitted / null, the existing value is kept as-is.
+//
+// Clears DebtReviewRequired unconditionally (covers both "update" and "skip" flows).
+//
+// "Skip" path → send an empty body: {}
+//   → clears DebtReviewRequired, changes nothing else.
+//
+// "Update" path → send: { debtPerPaycheck: 250, newDebtStartingBalance: 8500 }
+//   → updates those fields AND clears DebtReviewRequired.
+// ─────────────────────────────────────────────────────────────────────────────
+app.MapPut("/api/debt/update-plan", async (
+    ApiDbContext dbContext,
+    HttpContext httpContext,
+    UpdateDebtPlanRequest? request) =>
+{
+    try
+    {
+        string? idToken = httpContext.Request.Headers["Authorization"]
+            .FirstOrDefault()?.Split(" ").Last();
+        if (string.IsNullOrEmpty(idToken)) return Results.Unauthorized();
+
+        var decoded = await FirebaseAdmin.Auth.FirebaseAuth.DefaultInstance
+            .VerifyIdTokenAsync(idToken);
+
+        var user = await dbContext.Users
+            .FirstOrDefaultAsync(u => u.FirebaseUuid == decoded.Uid);
+
+        if (user == null) return Results.NotFound("User not found.");
+
+        bool anyChange = false;
+
+        if (request?.DebtPerPaycheck is decimal dpp)
+        {
+            user.DebtPerPaycheck = dpp;
+            anyChange = true;
+        }
+
+        if (request?.NewDebtStartingBalance is decimal nsb)
+        {
+            user.DebtStartingBalance = nsb;
+            // Recalculate net starting balance using stored cash-cushion fields.
+            // If the user never set cash fields they stay null — that's fine.
+            var creditDebt = Math.Max(0m, nsb);
+            var cashBalance = Math.Max(0m, user.CashBalanceAtOnboarding ?? 0m);
+            var cashCushion = Math.Max(0m, user.CashCushionAtOnboarding ?? 0m);
+            var requestedApplied = Math.Max(0m, user.CashAppliedToDebtAtOnboarding ?? 0m);
+
+            var netResult = DebtSummaryCalculator.CalculateNetDebt(
+                creditDebt, cashBalance, cashCushion, requestedApplied);
+
+            user.NetDebtStartingBalance = netResult.NetDebt;
+            anyChange = true;
+        }
+
+        // Always clear the review flag regardless of whether values changed.
+        user.DebtReviewRequired = false;
+        user.UpdatedAt = DateTime.UtcNow;
+
+        await dbContext.SaveChangesAsync();
+
+        Console.WriteLine(
+            $"[DebtUpdatePlan] userId={user.Id} anyChange={anyChange} " +
+            $"debtPerPaycheck={user.DebtPerPaycheck} debtStartingBalance={user.DebtStartingBalance} " +
+            $"netDebtStartingBalance={user.NetDebtStartingBalance} DebtReviewRequired=false");
+
+        return Results.Ok(new
+        {
+            message = anyChange ? "Debt plan updated." : "Debt review dismissed.",
+            debtPerPaycheck = user.DebtPerPaycheck,
+            debtStartingBalance = user.DebtStartingBalance,
+            netDebtStartingBalance = user.NetDebtStartingBalance,
+            debtReviewRequired = user.DebtReviewRequired
+        });
+    }
+    catch (Exception e)
+    {
+        SentrySdk.CaptureException(e);
+        return Results.Problem(e.Message);
+    }
+})
+.WithName("UpdateDebtPlan")
+.WithOpenApi();
+
 // ─── AUDIT ENDPOINT ──────────────────────────────────────────────────────────
 // GET /api/admin/debug/users/{userId}/transaction-balance-audit
 //
@@ -3595,6 +3758,16 @@ app.Run();
 
 public record MarkRecurringFromTransactionRequest(
     DateTime? FirstDueDate  // optional override; can be null for now
+);
+
+/// <summary>
+/// Body for PUT /api/debt/update-plan.
+/// Both fields are optional — omitting them (or sending null) leaves the stored
+/// value unchanged.  The endpoint always clears DebtReviewRequired regardless.
+/// </summary>
+public record UpdateDebtPlanRequest(
+    decimal? DebtPerPaycheck,
+    decimal? NewDebtStartingBalance
 );
 
 public record PaycheckDecisionRequest(string Decision, decimal? Amount = null);

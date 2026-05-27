@@ -1,21 +1,21 @@
-import React, { useState, useCallback } from 'react';
+import React, { useState, useCallback } from "react";
 import {
   View,
   StyleSheet,
   ActivityIndicator,
   Text as RNText,
   Platform,
-} from 'react-native';
-import { Text, Button } from 'react-native-paper';
-import { SafeAreaView } from 'react-native-safe-area-context';
-import axios from 'axios';
-import { auth } from '../../firebaseConfig';
-import { API_BASE_URL } from '../../config/api';
+} from "react-native";
+import { Text, Button } from "react-native-paper";
+import { SafeAreaView } from "react-native-safe-area-context";
+import axios from "axios";
+import { auth } from "../../firebaseConfig";
+import { API_BASE_URL } from "../../config/api";
 
 // --- Helper to get auth headers ---
 const getAuthHeader = async () => {
   const user = auth.currentUser;
-  if (!user) throw new Error('No user logged in.');
+  if (!user) throw new Error("No user logged in.");
   const token = await user.getIdToken();
   return { headers: { Authorization: `Bearer ${token}` } };
 };
@@ -32,7 +32,7 @@ function WebPlaidContent({
   navigation,
   error,
 }) {
-  const { usePlaidLink } = require('react-plaid-link');
+  const { usePlaidLink } = require("react-plaid-link");
 
   // usePlaidLink re-initialises whenever linkToken changes.
   // 'ready' is false until a valid token is loaded.
@@ -77,7 +77,7 @@ function WebPlaidContent({
 
       <Button
         mode="outlined"
-        onPress={() => navigation.navigate('DepositOnboarding')}
+        onPress={() => navigation.navigate("DepositOnboarding")}
         style={styles.postConnectButton}
       >
         Continue: Enter Your Income
@@ -89,13 +89,14 @@ function WebPlaidContent({
     <>
       <View style={styles.instructionBox}>
         <RNText style={styles.mainInstruction}>
-          Please connect all credit cards, debit cards, and your primary checking account.
+          Please connect all credit cards, debit cards, and your primary
+          checking account.
         </RNText>
 
         <RNText style={styles.warningInstruction}>
-          ⚠️ It is essential to connect every account you use to spend money. If you
-          skip an account, your Dynamic Budget will be inaccurate because we will miss
-          those charges going forward.
+          ⚠️ It is essential to connect every account you use to spend money. If
+          you skip an account, your Dynamic Budget will be inaccurate because we
+          will miss those charges going forward.
         </RNText>
       </View>
 
@@ -105,11 +106,7 @@ function WebPlaidContent({
           <Text style={styles.loadingText}>Fetching Token...</Text>
         </View>
       ) : ready ? (
-        <Button
-          mode="contained"
-          onPress={() => open()}
-          style={styles.button}
-        >
+        <Button mode="contained" onPress={() => open()} style={styles.button}>
           Open Plaid Link
         </Button>
       ) : (
@@ -119,7 +116,7 @@ function WebPlaidContent({
           disabled={isFetchingToken || !auth.currentUser}
           style={styles.button}
         >
-          {isFetchingToken ? 'Fetching token…' : 'Connect Now'}
+          {isFetchingToken ? "Fetching token…" : "Connect Now"}
         </Button>
       )}
     </>
@@ -136,7 +133,11 @@ function WebPlaidContent({
           </Text>
         )}
 
-        {numAccountsConnected > 0 ? <PostConnectContent /> : <PreConnectContent />}
+        {numAccountsConnected > 0 ? (
+          <PostConnectContent />
+        ) : (
+          <PreConnectContent />
+        )}
       </View>
 
       <Button
@@ -162,7 +163,7 @@ function NativePlaidContent({
   navigation,
   error,
 }) {
-  const plaid = require('react-native-plaid-link-sdk');
+  const plaid = require("react-native-plaid-link-sdk");
 
   const { create, open } = plaid;
 
@@ -178,7 +179,7 @@ function NativePlaidContent({
         onExit: onPlaidExit,
       });
     } catch (e) {
-      console.error('[PlaidConnect] open failed raw:', e);
+      console.error("[PlaidConnect] open failed raw:", e);
     }
   };
 
@@ -217,7 +218,7 @@ function NativePlaidContent({
 
       <Button
         mode="outlined"
-        onPress={() => navigation.navigate('DepositOnboarding')}
+        onPress={() => navigation.navigate("DepositOnboarding")}
         style={styles.postConnectButton}
       >
         Continue: Enter Your Income
@@ -229,13 +230,14 @@ function NativePlaidContent({
     <>
       <View style={styles.instructionBox}>
         <RNText style={styles.mainInstruction}>
-          Please connect all credit cards, debit cards, and your primary checking account.
+          Please connect all credit cards, debit cards, and your primary
+          checking account.
         </RNText>
 
         <RNText style={styles.warningInstruction}>
-          ⚠️ It is essential to connect every account you use to spend money. If you
-          skip an account, your Dynamic Budget will be inaccurate because we will miss
-          those charges going forward.
+          ⚠️ It is essential to connect every account you use to spend money. If
+          you skip an account, your Dynamic Budget will be inaccurate because we
+          will miss those charges going forward.
         </RNText>
       </View>
 
@@ -285,7 +287,11 @@ function NativePlaidContent({
           </Text>
         )}
 
-        {numAccountsConnected > 0 ? <PostConnectContent /> : <PreConnectContent />}
+        {numAccountsConnected > 0 ? (
+          <PostConnectContent />
+        ) : (
+          <PreConnectContent />
+        )}
       </View>
 
       <Button
@@ -311,39 +317,49 @@ export default function PlaidConnectScreen({ navigation }) {
     // - react-plaid-link (web)               → onSuccess(publicToken: string, metadata)
     // - react-native-plaid-link-sdk (native) → onSuccess({ publicToken, metadata })
     const publicToken =
-      typeof publicTokenOrSuccess === 'string'
+      typeof publicTokenOrSuccess === "string"
         ? publicTokenOrSuccess
         : publicTokenOrSuccess?.publicToken;
+
+    // Extract institution metadata from whichever callback shape was used
+    const normalizedMeta =
+      typeof publicTokenOrSuccess === "string"
+        ? metadata
+        : publicTokenOrSuccess?.metadata;
+    const institutionName = normalizedMeta?.institution?.name ?? null;
+    const institutionId = normalizedMeta?.institution?.institution_id ?? null;
 
     setError(null);
     setIsFetchingToken(true);
 
     try {
       const user = auth.currentUser;
-      if (!user) throw new Error('Authentication error.');
+      if (!user) throw new Error("Authentication error.");
 
       await axios.post(
         `${API_BASE_URL}/api/plaid/exchange_public_token`,
         {
           publicToken,
           firebaseUuid: user.uid,
+          institutionName,
+          institutionId,
         },
         await getAuthHeader(),
       );
 
-      console.log('[PlaidConnect] exchange success:', metadata);
+      console.log("[PlaidConnect] exchange success:", metadata);
       setNumAccountsConnected((prev) => prev + 1);
       setLinkToken(null);
     } catch (e) {
-      console.error('[PlaidConnect] Error exchanging token:', e?.message || e);
-      setError('Failed to save accounts. Please try again.');
+      console.error("[PlaidConnect] Error exchanging token:", e?.message || e);
+      setError("Failed to save accounts. Please try again.");
     } finally {
       setIsFetchingToken(false);
     }
   }, []);
 
   const onPlaidExit = useCallback((errorObj, metadata) => {
-    console.log('[PlaidConnect] Plaid Link exited:', errorObj, metadata);
+    console.log("[PlaidConnect] Plaid Link exited:", errorObj, metadata);
     setLinkToken(null);
     setIsFetchingToken(false);
   }, []);
@@ -354,7 +370,7 @@ export default function PlaidConnectScreen({ navigation }) {
 
     try {
       const user = auth.currentUser;
-      if (!user) throw new Error('Please log in again.');
+      if (!user) throw new Error("Please log in again.");
 
       const response = await axios.post(
         `${API_BASE_URL}/api/plaid/create_link_token`,
@@ -363,10 +379,15 @@ export default function PlaidConnectScreen({ navigation }) {
       );
 
       setLinkToken(response.data.linkToken);
-      console.log('[PlaidConnect] token fetched — waiting for user to open Plaid');
+      console.log(
+        "[PlaidConnect] token fetched — waiting for user to open Plaid",
+      );
     } catch (e) {
-      console.error('[PlaidConnect] Error creating link token:', e?.message || e);
-      setError('Could not generate link token. Please try again.');
+      console.error(
+        "[PlaidConnect] Error creating link token:",
+        e?.message || e,
+      );
+      setError("Could not generate link token. Please try again.");
     } finally {
       setIsFetchingToken(false);
     }
@@ -384,7 +405,7 @@ export default function PlaidConnectScreen({ navigation }) {
   };
 
   // Web: use react-plaid-link (iframe-based Plaid Link)
-  if (Platform.OS === 'web') {
+  if (Platform.OS === "web") {
     return <WebPlaidContent {...sharedProps} />;
   }
 
@@ -395,86 +416,86 @@ export default function PlaidConnectScreen({ navigation }) {
 const styles = StyleSheet.create({
   safeArea: {
     flex: 1,
-    backgroundColor: '#fff',
+    backgroundColor: "#fff",
   },
   contentContainer: {
     flex: 1,
     paddingHorizontal: 25,
     paddingTop: 50,
-    justifyContent: 'flex-start',
-    alignItems: 'center',
+    justifyContent: "flex-start",
+    alignItems: "center",
   },
   loadingContainer: {
     flex: 1,
-    justifyContent: 'center',
-    alignItems: 'center',
-    backgroundColor: '#fff',
+    justifyContent: "center",
+    alignItems: "center",
+    backgroundColor: "#fff",
   },
   header: {
     fontSize: 26,
-    fontWeight: 'bold',
-    textAlign: 'center',
+    fontWeight: "bold",
+    textAlign: "center",
     marginBottom: 20,
-    color: '#333',
+    color: "#333",
   },
   instructionBox: {
     marginBottom: 30,
     paddingHorizontal: 10,
-    borderColor: '#f0f0f0',
+    borderColor: "#f0f0f0",
     padding: 15,
     borderRadius: 8,
   },
   mainInstruction: {
     fontSize: 18,
-    textAlign: 'center',
+    textAlign: "center",
     marginBottom: 10,
     lineHeight: 25,
   },
   warningInstruction: {
     fontSize: 14,
-    textAlign: 'center',
-    color: 'red',
-    fontWeight: 'bold',
+    textAlign: "center",
+    color: "red",
+    fontWeight: "bold",
   },
   button: {
-    width: '100%',
+    width: "100%",
     marginVertical: 10,
     paddingVertical: 4,
   },
   loadingPlaceholder: {
     paddingVertical: 10,
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'center',
-    width: '100%',
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    width: "100%",
   },
   loadingText: {
     marginLeft: 10,
     fontSize: 16,
   },
   postConnectBox: {
-    width: '100%',
-    alignItems: 'center',
+    width: "100%",
+    alignItems: "center",
     padding: 20,
     borderWidth: 1,
-    borderColor: '#6200ee',
+    borderColor: "#6200ee",
     borderRadius: 10,
     marginTop: 40,
   },
   successHeader: {
     fontSize: 22,
-    fontWeight: 'bold',
-    color: 'green',
+    fontWeight: "bold",
+    color: "green",
     marginBottom: 20,
   },
   postConnectButton: {
-    width: '100%',
+    width: "100%",
     marginVertical: 8,
     paddingVertical: 4,
   },
   errorText: {
-    color: 'red',
-    textAlign: 'center',
+    color: "red",
+    textAlign: "center",
     marginTop: 10,
   },
   backButton: {
