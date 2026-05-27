@@ -660,4 +660,241 @@ namespace BudgetApp.Api.Tests
             Assert.Equal(result1.BaseRemaining, result2.BaseRemaining);
         }
     }
+
+    // ─── Deposit Classification: Payment / Bill-Pay Keywords ──────────────────
+    //
+    // Regression guard for the bug where "Payment Thank You - Web" was classified
+    // as Windfall instead of InternalTransfer.
+    //
+    // Rule order in ClassifyDeposit:
+    //   1. Refund keywords  (REFUND, RETURN, REVERSAL, CASHBACK, CASH BACK, CHARGEBACK)
+    //   2. Bill-pay keywords (PAYMENT THANK YOU, AUTOPAY, ONLINE PAYMENT, …)
+    //   3. Transfer-FROM keywords (TRANSFER FROM, FROM SAVINGS, FROM CHECKING, XFER)
+    //   4. Amount / payday tolerance logic → Paycheck or Windfall
+    //
+    // The amount 236.67 is used for payment tests — it is far from any paycheck
+    // amount (3000), so without the keyword rules these would all fall to Windfall.
+
+    public class DepositClassificationPaymentKeywordTests
+    {
+        private readonly DynamicBudgetEngine _engine = new();
+
+        // ── Regression: the exact reported transaction ────────────────────────
+
+        [Fact]
+        public void PaymentThankYouWeb_IsInternalTransfer()
+        {
+            // The exact transaction that was mis-classified as Windfall.
+            var ctx = new DepositContext
+            {
+                Amount = 236.67m,
+                Date = new DateTime(2026, 5, 20),
+                MerchantName = "Payment Thank You - Web",
+                PayDay1 = 1,
+                PayDay2 = 15,
+                ExpectedPaycheckAmount = 3000m
+            };
+
+            Assert.Equal(TransactionSuggestedKind.InternalTransfer, _engine.ClassifyDeposit(ctx));
+        }
+
+        // ── Other payment / bill-pay phrase variants ──────────────────────────
+
+        [Fact]
+        public void PaymentThankYou_IsInternalTransfer()
+        {
+            var ctx = new DepositContext
+            {
+                Amount = 236.67m,
+                Date = new DateTime(2026, 5, 20),
+                MerchantName = "Payment Thank You",
+                ExpectedPaycheckAmount = 3000m
+            };
+
+            Assert.Equal(TransactionSuggestedKind.InternalTransfer, _engine.ClassifyDeposit(ctx));
+        }
+
+        [Fact]
+        public void AutopayPayment_IsInternalTransfer()
+        {
+            var ctx = new DepositContext
+            {
+                Amount = 150m,
+                Date = new DateTime(2026, 5, 20),
+                MerchantName = "Autopay Payment",
+                ExpectedPaycheckAmount = 3000m
+            };
+
+            Assert.Equal(TransactionSuggestedKind.InternalTransfer, _engine.ClassifyDeposit(ctx));
+        }
+
+        [Fact]
+        public void OnlinePayment_IsInternalTransfer()
+        {
+            var ctx = new DepositContext
+            {
+                Amount = 500m,
+                Date = new DateTime(2026, 5, 20),
+                MerchantName = "Online Payment",
+                ExpectedPaycheckAmount = 3000m
+            };
+
+            Assert.Equal(TransactionSuggestedKind.InternalTransfer, _engine.ClassifyDeposit(ctx));
+        }
+
+        [Fact]
+        public void CreditCardPayment_IsInternalTransfer()
+        {
+            var ctx = new DepositContext
+            {
+                Amount = 800m,
+                Date = new DateTime(2026, 5, 20),
+                MerchantName = "Credit Card Payment",
+                ExpectedPaycheckAmount = 3000m
+            };
+
+            Assert.Equal(TransactionSuggestedKind.InternalTransfer, _engine.ClassifyDeposit(ctx));
+        }
+
+        [Fact]
+        public void MobilePayment_IsInternalTransfer()
+        {
+            var ctx = new DepositContext
+            {
+                Amount = 200m,
+                Date = new DateTime(2026, 5, 20),
+                MerchantName = "Mobile Payment",
+                ExpectedPaycheckAmount = 3000m
+            };
+
+            Assert.Equal(TransactionSuggestedKind.InternalTransfer, _engine.ClassifyDeposit(ctx));
+        }
+
+        [Fact]
+        public void CardPayment_IsInternalTransfer()
+        {
+            var ctx = new DepositContext
+            {
+                Amount = 350m,
+                Date = new DateTime(2026, 5, 20),
+                MerchantName = "Card Payment",
+                ExpectedPaycheckAmount = 3000m
+            };
+
+            Assert.Equal(TransactionSuggestedKind.InternalTransfer, _engine.ClassifyDeposit(ctx));
+        }
+
+        [Fact]
+        public void PaymentReceived_IsInternalTransfer()
+        {
+            var ctx = new DepositContext
+            {
+                Amount = 400m,
+                Date = new DateTime(2026, 5, 20),
+                MerchantName = "Payment Received",
+                ExpectedPaycheckAmount = 3000m
+            };
+
+            Assert.Equal(TransactionSuggestedKind.InternalTransfer, _engine.ClassifyDeposit(ctx));
+        }
+
+        [Fact]
+        public void BillPayment_IsInternalTransfer()
+        {
+            var ctx = new DepositContext
+            {
+                Amount = 125m,
+                Date = new DateTime(2026, 5, 20),
+                MerchantName = "Bill Payment",
+                ExpectedPaycheckAmount = 3000m
+            };
+
+            Assert.Equal(TransactionSuggestedKind.InternalTransfer, _engine.ClassifyDeposit(ctx));
+        }
+
+        [Fact]
+        public void AchPayment_IsInternalTransfer()
+        {
+            var ctx = new DepositContext
+            {
+                Amount = 600m,
+                Date = new DateTime(2026, 5, 20),
+                MerchantName = "ACH Payment",
+                ExpectedPaycheckAmount = 3000m
+            };
+
+            Assert.Equal(TransactionSuggestedKind.InternalTransfer, _engine.ClassifyDeposit(ctx));
+        }
+
+        [Fact]
+        public void WebPayment_IsInternalTransfer()
+        {
+            var ctx = new DepositContext
+            {
+                Amount = 236.67m,
+                Date = new DateTime(2026, 5, 20),
+                MerchantName = "Web Payment",
+                ExpectedPaycheckAmount = 3000m
+            };
+
+            Assert.Equal(TransactionSuggestedKind.InternalTransfer, _engine.ClassifyDeposit(ctx));
+        }
+
+        // ── Refund still wins over payment keywords ───────────────────────────
+        // Ensure refund detection fires before bill-pay detection in all orderings.
+
+        [Fact]
+        public void RefundKeyword_StillClassifiesAsRefund_NotInternalTransfer()
+        {
+            // "REFUND" contains no bill-pay keyword, but even if a name contained
+            // both, Refund must win because it is checked first.
+            var ctx = new DepositContext
+            {
+                Amount = 50m,
+                Date = new DateTime(2026, 5, 20),
+                MerchantName = "Amazon Refund",
+                ExpectedPaycheckAmount = 3000m
+            };
+
+            Assert.Equal(TransactionSuggestedKind.Refund, _engine.ClassifyDeposit(ctx));
+        }
+
+        // ── Paycheck detection still works ────────────────────────────────────
+
+        [Fact]
+        public void PaycheckLikeDeposit_OnPayday_WithinTolerance_IsPaycheck()
+        {
+            var ctx = new DepositContext
+            {
+                Amount = 3000m,
+                Date = new DateTime(2025, 2, 15),
+                MerchantName = "ACME PAYROLL",
+                PayDay1 = 1,
+                PayDay2 = 15,
+                ExpectedPaycheckAmount = 3100m  // within 15%
+            };
+
+            Assert.Equal(TransactionSuggestedKind.Paycheck, _engine.ClassifyDeposit(ctx));
+        }
+
+        // ── Windfall still works for bonus / reward / interest ────────────────
+
+        [Fact]
+        public void BonusCredit_FarFromPaycheck_IsWindfall()
+        {
+            // "BONUS CREDIT" has no payment, refund, or transfer keywords.
+            // Amount is far from the expected paycheck → Windfall.
+            var ctx = new DepositContext
+            {
+                Amount = 500m,
+                Date = new DateTime(2025, 2, 16),
+                MerchantName = "BONUS CREDIT",
+                PayDay1 = 1,
+                PayDay2 = 15,
+                ExpectedPaycheckAmount = 3000m
+            };
+
+            Assert.Equal(TransactionSuggestedKind.Windfall, _engine.ClassifyDeposit(ctx));
+        }
+    }
 }

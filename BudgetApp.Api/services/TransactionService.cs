@@ -943,8 +943,61 @@ namespace BudgetApp.Api.Services
                 }
 
                 // ── 7. Advance the cursor ──────────────────────────────────────────────
+                // Guard: never overwrite a valid existing cursor with null/empty.
+                // If Plaid returns null NextCursor we retain the prior cursor so the next
+                // sync can resume from the correct position rather than re-fetching from
+                // the beginning. Both cases (existing cursor present / no prior cursor)
+                // are logged and reported to Sentry for observability.
                 string? cursorAfterSync = response.NextCursor;
-                plaidItem.Cursor = cursorAfterSync;
+
+                if (!string.IsNullOrEmpty(cursorAfterSync))
+                {
+                    plaidItem.Cursor = cursorAfterSync;
+                }
+                else if (!string.IsNullOrEmpty(cursorBeforeSync))
+                {
+                    // Plaid returned null but we have a valid existing cursor — retain it.
+                    _logger.LogWarning(
+                        "CURSOR_NULL_GUARD: retaining existing cursor because Plaid returned null NextCursor. " +
+                        "itemId={ItemId} plaidItemDbId={PlaidItemDbId}",
+                        itemId,
+                        plaidItem.Id);
+
+                    SentrySdk.CaptureMessage(
+                        $"CURSOR_NULL_GUARD: itemId={itemId} plaidItemDbId={plaidItem.Id}",
+                        scope =>
+                        {
+                            scope.Level = SentryLevel.Warning;
+                            scope.SetTag("event.type", "cursor_null_guard_retained");
+                            scope.SetTag("sync.itemId", itemId);
+                            scope.SetExtra("plaidItemDbId", plaidItem.Id);
+                            scope.SetExtra("hadExistingCursor", true);
+                        });
+
+                    // Do not assign plaidItem.Cursor — keep the existing value.
+                }
+                else
+                {
+                    // Both before and after are null: first sync with no prior cursor.
+                    // This is acceptable before notifications are live, but still logged
+                    // so the post-save verification block can escalate to Error if needed.
+                    _logger.LogWarning(
+                        "CURSOR_NULL_FIRST_SYNC: Plaid returned null NextCursor and no previous cursor exists. " +
+                        "itemId={ItemId} plaidItemDbId={PlaidItemDbId}",
+                        itemId,
+                        plaidItem.Id);
+
+                    SentrySdk.CaptureMessage(
+                        $"CURSOR_NULL_FIRST_SYNC: itemId={itemId} plaidItemDbId={plaidItem.Id}",
+                        scope =>
+                        {
+                            scope.Level = SentryLevel.Warning;
+                            scope.SetTag("event.type", "cursor_null_first_sync");
+                            scope.SetTag("sync.itemId", itemId);
+                            scope.SetExtra("plaidItemDbId", plaidItem.Id);
+                            scope.SetExtra("hadExistingCursor", false);
+                        });
+                }
 
                 _logger.LogInformation(
                     "Cursor advanced: itemId={ItemId} cursorBefore={CursorBefore} cursorAfter={CursorAfter}",
@@ -1086,6 +1139,33 @@ namespace BudgetApp.Api.Services
                             scope.SetExtra("sync.webhookCode", webhookCode ?? "(manual)");
                             scope.SetExtra("sync.cursorBeforeSync", cursorBeforeSync ?? "(null)");
                             scope.SetExtra("sync.cursorAfterSync", cursorAfterSync ?? "(null)");
+                        });
+                }
+
+                // ── ESCALATION: notifications live but cursor still null ────────────────
+                // This is the dangerous combination: the next webhook will start from the
+                // beginning of Plaid's history (cursor=null) and may re-process and
+                // re-notify transactions that were already seen. Captured at Error level
+                // so it pages on-call regardless of general warning thresholds.
+                if (savedCursorIsNull && plaidItem.NotificationsEnabledAt.HasValue)
+                {
+                    _logger.LogError(
+                        "NOTIFICATIONS_ENABLED_BUT_CURSOR_NULL: PlaidItem has notifications enabled " +
+                        "but cursor is null after save. The next sync may re-fetch from the beginning. " +
+                        "itemId={ItemId} plaidItemDbId={PlaidItemDbId}",
+                        itemId,
+                        plaidItem.Id);
+
+                    SentrySdk.CaptureMessage(
+                        $"NOTIFICATIONS_ENABLED_BUT_CURSOR_NULL: itemId={itemId} plaidItemDbId={plaidItem.Id}",
+                        scope =>
+                        {
+                            scope.Level = SentryLevel.Error;
+                            scope.SetTag("event.type", "notifications_enabled_but_cursor_null");
+                            scope.SetTag("sync.itemId", itemId);
+                            scope.SetExtra("plaidItemDbId", plaidItem.Id);
+                            scope.SetExtra("notificationsEnabledAt",
+                                plaidItem.NotificationsEnabledAt?.ToString("O"));
                         });
                 }
 

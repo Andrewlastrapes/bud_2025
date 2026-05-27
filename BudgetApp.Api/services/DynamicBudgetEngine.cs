@@ -128,7 +128,7 @@ public class DynamicBudgetEngine : IDynamicBudgetEngine
         // amount or payday schedule.
         var m = ctx.MerchantName ?? string.Empty;
 
-        // Refund keywords
+        // ── Refund keywords (checked first — takes priority over payment keywords) ──
         if (m.Contains("REFUND", StringComparison.OrdinalIgnoreCase) ||
             m.Contains("RETURN", StringComparison.OrdinalIgnoreCase) ||
             m.Contains("REVERSAL", StringComparison.OrdinalIgnoreCase) ||
@@ -137,7 +137,25 @@ public class DynamicBudgetEngine : IDynamicBudgetEngine
             m.Contains("CHARGEBACK", StringComparison.OrdinalIgnoreCase))
             return TransactionSuggestedKind.Refund;
 
-        // Internal transfer keywords — require directional "FROM" context so that
+        // ── Credit-card / bill-payment keywords ────────────────────────────────
+        // These are online payments, autopay confirmations, and card-payment credits
+        // that banks echo back as an inflow on the paying account. They should never
+        // be treated as income windfalls.
+        // NOTE: "PAYMENT THANK YOU" intentionally catches both
+        //   "Payment Thank You" and "Payment Thank You - Web".
+        if (m.Contains("PAYMENT THANK YOU", StringComparison.OrdinalIgnoreCase) ||
+            m.Contains("AUTOPAY", StringComparison.OrdinalIgnoreCase) ||
+            m.Contains("ONLINE PAYMENT", StringComparison.OrdinalIgnoreCase) ||
+            m.Contains("CREDIT CARD PAYMENT", StringComparison.OrdinalIgnoreCase) ||
+            m.Contains("MOBILE PAYMENT", StringComparison.OrdinalIgnoreCase) ||
+            m.Contains("CARD PAYMENT", StringComparison.OrdinalIgnoreCase) ||
+            m.Contains("PAYMENT RECEIVED", StringComparison.OrdinalIgnoreCase) ||
+            m.Contains("BILL PAYMENT", StringComparison.OrdinalIgnoreCase) ||
+            m.Contains("ACH PAYMENT", StringComparison.OrdinalIgnoreCase) ||
+            m.Contains("WEB PAYMENT", StringComparison.OrdinalIgnoreCase))
+            return TransactionSuggestedKind.InternalTransfer;
+
+        // ── Internal transfer keywords — require directional "FROM" context so that
         // "WIRE TRANSFER" (a large inflow) is not mis-classified as InternalTransfer.
         if (m.Contains("TRANSFER FROM", StringComparison.OrdinalIgnoreCase) ||
             m.Contains("FROM SAVINGS", StringComparison.OrdinalIgnoreCase) ||
