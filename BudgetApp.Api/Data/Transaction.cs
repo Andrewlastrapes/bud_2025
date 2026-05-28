@@ -90,6 +90,23 @@ public class Transaction
     [Column("budget_applied_amount")]
     public decimal? BudgetAppliedAmount { get; set; }
 
+    /// <summary>
+    /// Plaid's pending_transaction_id field — populated on a POSTED transaction when it
+    /// replaced a prior PENDING transaction.  The value is the PlaidTransactionId of the
+    /// original pending row.
+    ///
+    /// Used for delta reconciliation in the edge case where Plaid delivers a posted
+    /// transaction in the Added list WITHOUT the corresponding pending transaction appearing
+    /// in the Removed list.  When found, we apply only the delta between the pending
+    /// BudgetAppliedAmount and the posted desired impact rather than re-applying the full
+    /// posted amount (which would double-count the spend).
+    ///
+    /// Null for pending transactions themselves and for posted transactions that were never
+    /// preceded by a pending row.
+    /// </summary>
+    [Column("pending_transaction_id")]
+    public string? PendingTransactionId { get; set; }
+
     // ─── Historical recurring-analysis backfill fields ────────────────────────
     // Rows imported specifically to provide historical transaction data for the
     // recurring-pattern analyzer (GET /api/recurring/suggestions).

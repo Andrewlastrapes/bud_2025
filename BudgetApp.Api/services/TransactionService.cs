@@ -102,6 +102,63 @@ namespace BudgetApp.Api.Services
                     throw new InvalidOperationException($"Plaid Item {itemId} not found.");
                 }
 
+                // ── Per-item advisory lock ─────────────────────────────────────────────
+                // Prevents concurrent syncs for the same Plaid item (same or different ECS
+                // task) from racing on Removed/Added/Modified processing.
+                //
+                // We use pg_try_advisory_xact_lock, which is:
+                //   • transaction-scoped — auto-released on commit or rollback;
+                //     safe with EF connection pooling
+                //   • non-blocking — returns false immediately if another holder exists
+                //   • database-level — works across multiple ECS tasks sharing one PG
+                //
+                // Key: PlaidItem.Id (stable int PK, fits safely in bigint lock keyspace).
+                // Different items have different IDs → syncs for different items are independent.
+                //
+                // TRADEOFF NOTE: The lock is acquired before the Plaid API network call
+                // (below) so it is held across the outbound HTTP request.  This is
+                // intentional — it prevents two concurrent webhooks from both calling
+                // Plaid with the same cursor and then racing on the resulting write set.
+                // A large refactor would be required to acquire the lock after the API
+                // call, and the risk/benefit is not worth it in this pass.
+                await using var syncTx = await _dbContext.Database.BeginTransactionAsync();
+
+                long advisoryLockKey = (long)plaidItem.Id;
+                bool lockAcquired = await _dbContext.Database
+                    .SqlQuery<bool>($"SELECT pg_try_advisory_xact_lock({advisoryLockKey})")
+                    .FirstAsync();
+
+                if (!lockAcquired)
+                {
+                    _logger.LogWarning(
+                        "SYNC_LOCK_BUSY: advisory lock already held for this Plaid item — " +
+                        "skipping duplicate concurrent sync. Returning empty response (200). " +
+                        "itemId={ItemId} plaidItemDbId={PlaidItemDbId} webhookCode={WebhookCode}",
+                        itemId, plaidItem.Id, webhookCode ?? "(manual)");
+
+                    SentrySdk.AddBreadcrumb(
+                        $"sync-lock-busy: itemId={itemId} plaidItemDbId={plaidItem.Id} " +
+                        $"webhookCode={webhookCode ?? "(manual)"}",
+                        level: BreadcrumbLevel.Warning);
+
+                    SentrySdk.CaptureMessage(
+                        $"SYNC_LOCK_BUSY: itemId={itemId} plaidItemDbId={plaidItem.Id}",
+                        scope =>
+                        {
+                            scope.Level = SentryLevel.Warning;
+                            scope.SetTag("event.type", "sync_lock_busy");
+                            scope.SetTag("sync.itemId", itemId);
+                            scope.SetTag("sync.plaidItemDbId", plaidItem.Id.ToString());
+                            scope.SetTag("sync.webhookCode", webhookCode ?? "(manual)");
+                            scope.SetExtra("sync.userId", plaidItem.UserId);
+                        });
+
+                    // Return a safe empty response — the webhook endpoint returns 200.
+                    // No transaction mutations occurred; the outer try/finally will roll
+                    // back (nothing to roll back) and the caller is unaffected.
+                    return new TransactionsSyncResponse();
+                }
+
                 var user = await _dbContext.Users
                     .FirstOrDefaultAsync(u => u.Id == plaidItem.UserId);
 
@@ -368,9 +425,50 @@ namespace BudgetApp.Api.Services
                 // A ChangeTracker.Clear() triggered by a 23505 race recovery in the Added loop
                 // would otherwise discard these pending deletions and updates. Committing them
                 // first ensures they survive any per-transaction race-condition recovery.
+                //
+                // Defense-in-depth: if DbUpdateConcurrencyException still fires here despite
+                // the advisory lock (e.g. due to an out-of-order webhook that somehow bypassed
+                // the lock), we capture it clearly and rethrow rather than silently continuing
+                // with a potentially inconsistent balance state.
                 if (_dbContext.ChangeTracker.HasChanges())
                 {
-                    await _dbContext.SaveChangesAsync();
+                    try
+                    {
+                        await _dbContext.SaveChangesAsync();
+                    }
+                    catch (Microsoft.EntityFrameworkCore.DbUpdateConcurrencyException concEx)
+                    {
+                        // Another sync already deleted or modified the same rows.
+                        // This should not occur when the advisory lock is working correctly.
+                        // Log at Error (not Warning) so it is immediately visible in Sentry
+                        // — if this fires it means the lock did not prevent the race.
+                        _logger.LogError(concEx,
+                            "SYNC_CONCURRENCY_DEFENSE: DbUpdateConcurrencyException during " +
+                            "Removed/Modified save — advisory lock may not have prevented the race. " +
+                            "itemId={ItemId} userId={UserId} " +
+                            "removedCount={RemovedCount} modifiedCount={ModifiedCount}",
+                            itemId, user.Id, removedCount, modifiedCount);
+
+                        SentrySdk.CaptureException(concEx, scope =>
+                        {
+                            scope.Level = SentryLevel.Error;
+                            scope.SetTag("event.type", "sync_concurrency_defense");
+                            scope.SetTag("sync.itemId", itemId);
+                            scope.SetTag("sync.plaidItemDbId", plaidItem.Id.ToString());
+                            scope.SetExtra("sync.userId", user.Id);
+                            scope.SetExtra("sync.removedCount", removedCount);
+                            scope.SetExtra("sync.modifiedCount", modifiedCount);
+                            scope.SetExtra("sync.webhookCode", webhookCode ?? "(manual)");
+                        });
+
+                        // Clear stale tracked entities — do NOT apply further balance or
+                        // cursor mutations from the now-inconsistent EF state.
+                        _dbContext.ChangeTracker.Clear();
+
+                        // Rethrow so the outer catch logs SYNC EXCEPTION and the webhook
+                        // handler returns a 500, causing Plaid to retry this sync.
+                        throw;
+                    }
                 }
 
                 // ── 5. Added ───────────────────────────────────────────────────────────
@@ -519,6 +617,11 @@ namespace BudgetApp.Api.Services
                         {
                             UserId = user.Id,
                             PlaidTransactionId = t.TransactionId,
+                            // Populated on posted transactions — references the PlaidTransactionId
+                            // of the prior pending row this posted transaction replaced.
+                            // Null for pending transactions and for posted transactions with no
+                            // prior pending row.
+                            PendingTransactionId = t.PendingTransactionId,
                             AccountId = t.AccountId,
                             Amount = absAmount,
                             Date = txDateUtc,
@@ -638,14 +741,74 @@ namespace BudgetApp.Api.Services
                                     newTx.IsSuspiciousHold = true;
                                     newTx.HoldReviewed = false;
                                     _logger.LogInformation(
-                                        "Transaction flagged as suspicious hold: " +
+                                        "Transaction flagged as suspicious hold " +
+                                        "(BudgetAppliedAmount=0, awaiting user override): " +
                                         "plaidTxId={PlaidTxId} merchant={Merchant} amount={Amount}",
                                         t.TransactionId, merchantName, absAmount);
                                 }
 
-                                newTx.BudgetAppliedAmount = absAmount;
-                                balanceDelta -= absAmount;
-                                notifyRunningBalance -= absAmount;
+                                // ── Pending-to-posted reconciliation ──────────────────────────────
+                                // A posted transaction that carries a PendingTransactionId is
+                                // replacing a prior pending row.  Normally the pending row also
+                                // appears in the Removed list and its BudgetAppliedAmount has
+                                // already been reversed above.  But if the pending row did NOT
+                                // appear in Removed (out-of-order webhook, prior sync gap, etc.)
+                                // we look it up and apply only the DELTA to prevent double-counting.
+                                Transaction? priorPending = null;
+                                if (!string.IsNullOrEmpty(t.PendingTransactionId))
+                                {
+                                    priorPending = await _dbContext.Transactions
+                                        .FirstOrDefaultAsync(x =>
+                                            x.UserId == user.Id &&
+                                            x.PlaidTransactionId == t.PendingTransactionId);
+                                }
+
+                                // The amount that SHOULD affect the dynamic balance going forward:
+                                //   suspicious hold → 0   (user sets override via hold review flow)
+                                //   normal spend    → absAmount
+                                decimal desiredImpact = PendingReconciliationCalculator
+                                    .ComputeDesiredBudgetImpact(
+                                        absAmount,
+                                        isFixedCostMatch: false,
+                                        isSuspiciousHold,
+                                        holdOverrideAmount: null);
+
+                                // Amount already applied via the prior pending row (0 if none).
+                                decimal existingApplied = priorPending?.BudgetAppliedAmount ?? 0m;
+
+                                // Net balance change (negative = balance drops, positive = rises).
+                                decimal netDelta = PendingReconciliationCalculator
+                                    .ComputeBalanceDelta(desiredImpact, existingApplied);
+
+                                newTx.BudgetAppliedAmount = desiredImpact;
+                                balanceDelta += netDelta;
+                                notifyRunningBalance += netDelta;
+
+                                if (priorPending != null)
+                                {
+                                    // Neutralize prior pending so the Removed handler cannot
+                                    // double-reverse it if Plaid sends it in a future Removed list.
+                                    priorPending.BudgetAppliedAmount = 0m;
+
+                                    _logger.LogInformation(
+                                        "PENDING_TO_POSTED_RECONCILIATION: " +
+                                        "postedPlaidTxId={PostedId} " +
+                                        "priorPendingPlaidTxId={PendingId} " +
+                                        "priorApplied={PriorApplied} " +
+                                        "desiredImpact={Desired} " +
+                                        "netBalanceDelta={Delta}",
+                                        t.TransactionId, t.PendingTransactionId,
+                                        existingApplied, desiredImpact, netDelta);
+
+                                    SentrySdk.AddBreadcrumb(
+                                        $"pending-to-posted-reconciliation: " +
+                                        $"posted={t.TransactionId} " +
+                                        $"pending={t.PendingTransactionId} " +
+                                        $"priorApplied={existingApplied} " +
+                                        $"desiredImpact={desiredImpact} " +
+                                        $"netDelta={netDelta}",
+                                        level: BreadcrumbLevel.Info);
+                                }
 
                                 if (user.ExpectedPaycheckAmount > 0 &&
                                     _budgetEngine.IsLargeExpense(absAmount, user.ExpectedPaycheckAmount))
@@ -1263,6 +1426,13 @@ namespace BudgetApp.Api.Services
                     itemId, webhookCode ?? "(manual)", user.Email,
                     (int)syncDuration.TotalMilliseconds,
                     notifyQueue.Count, recurringNotifyQueue.Count);
+
+                // ── Commit the advisory-lock transaction ───────────────────────────────
+                // Committing here releases the pg_try_advisory_xact_lock and makes all
+                // SaveChanges calls within the sync permanently visible.
+                // The advisory lock is auto-released on commit regardless of connection
+                // pooling — no explicit pg_advisory_unlock call needed.
+                await syncTx.CommitAsync();
 
                 return response;
             }
