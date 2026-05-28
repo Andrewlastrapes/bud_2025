@@ -446,14 +446,35 @@ app.MapPost("/api/plaid/exchange_public_token",
                 // --- STEP 3: Save item ---
                 Console.WriteLine("➡️ Creating PlaidItem...");
 
+                // ── Diagnostic: log received institution metadata ──────────────────
+                // This confirms whether the frontend is sending institutionName and
+                // institutionId from the Plaid Link success callback metadata.
+                // Access token and public token are deliberately excluded from logs.
+                var finalInstitutionName = !string.IsNullOrWhiteSpace(requestBody.InstitutionName)
+                    ? requestBody.InstitutionName
+                    : "Unknown Institution";
+
+                Console.WriteLine(
+                    $"📥 Institution metadata received: " +
+                    $"name={requestBody.InstitutionName ?? "(null)"} " +
+                    $"id={requestBody.InstitutionId ?? "(null)"} " +
+                    $"nameIsNullOrBlank={string.IsNullOrWhiteSpace(requestBody.InstitutionName)} " +
+                    $"finalSavedName={finalInstitutionName}");
+
+                SentrySdk.AddBreadcrumb(
+                    $"exchange-token-institution: " +
+                    $"received={requestBody.InstitutionName ?? "(null)"} " +
+                    $"id={requestBody.InstitutionId ?? "(null)"} " +
+                    $"nameIsNullOrBlank={string.IsNullOrWhiteSpace(requestBody.InstitutionName)} " +
+                    $"final={finalInstitutionName}",
+                    level: BreadcrumbLevel.Info);
+
                 var newItem = new PlaidItem
                 {
                     UserId = user.Id,
                     AccessToken = response.AccessToken,
                     ItemId = response.ItemId,
-                    InstitutionName = !string.IsNullOrWhiteSpace(requestBody.InstitutionName)
-                        ? requestBody.InstitutionName
-                        : "Unknown Institution",
+                    InstitutionName = finalInstitutionName,
                     InstitutionLogo = null,
                     CreatedAt = DateTime.UtcNow,
                     UpdatedAt = DateTime.UtcNow
