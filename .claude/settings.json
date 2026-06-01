@@ -1,0 +1,39 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node .claude/hooks/validate-bash.js"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node .claude/hooks/log-write.js"
+          }
+        ]
+      },
+      {
+        "matcher": "write_file|replace_in_file|edit_file|create_file",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node .claude/hooks/migration-safety-check.js"
+          },
+          {
+            "type": "command",
+            "command": "node .claude/hooks/test-runner.js"
+          }
+        ]
+      }
+    ]
+  }
+}
