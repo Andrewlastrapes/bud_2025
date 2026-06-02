@@ -2815,7 +2815,7 @@ app.MapPut("/api/debt/update-plan", async (
         await dbContext.SaveChangesAsync();
 
         Console.WriteLine(
-            $"[DebtUpdatePlan] userId={user.Id} anyChange={anyChange} " +
+            $"[DebtUpdatePlan] userId={user.Id} anyChange={anyChange} and test" +
             $"debtPerPaycheck={user.DebtPerPaycheck} debtStartingBalance={user.DebtStartingBalance} " +
             $"netDebtStartingBalance={user.NetDebtStartingBalance} DebtReviewRequired=false");
 
