@@ -124,8 +124,16 @@ namespace BudgetApp.Api.Services
                 await using var syncTx = await _dbContext.Database.BeginTransactionAsync();
 
                 long advisoryLockKey = (long)plaidItem.Id;
+
+                // EF Core's SqlQuery<T> wraps the raw SQL in a subquery and selects
+                // s."Value" from it:
+                //   SELECT s."Value" FROM ( <your sql> ) AS s LIMIT 1
+                // The inner query MUST alias the scalar result as "Value" — EF requires
+                // that exact column name. Without the alias, Postgres names the column
+                // after the function ("pg_try_advisory_xact_lock") and the outer
+                // SELECT s."Value" throws 42703: column s.Value does not exist.
                 bool lockAcquired = await _dbContext.Database
-                    .SqlQuery<bool>($"SELECT pg_try_advisory_xact_lock({advisoryLockKey})")
+                    .SqlQuery<bool>($"SELECT pg_try_advisory_xact_lock({advisoryLockKey}) AS \"Value\"")
                     .FirstAsync();
 
                 if (!lockAcquired)
