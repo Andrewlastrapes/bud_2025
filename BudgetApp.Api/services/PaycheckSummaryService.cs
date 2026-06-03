@@ -1,6 +1,7 @@
 using Microsoft.EntityFrameworkCore;
 using BudgetApp.Api.Data;
 using BudgetApp.Api.Services;
+using Microsoft.Extensions.Logging;
 
 public interface IPaycheckSummaryService
 {
@@ -53,15 +54,18 @@ public class PaycheckSummaryService : IPaycheckSummaryService
     private readonly ApiDbContext _db;
     private readonly DynamicBudgetEngine _engine;
     private readonly INotificationService _notificationService;
+    private readonly ILogger<PaycheckSummaryService> _logger;
 
     public PaycheckSummaryService(
         ApiDbContext db,
         DynamicBudgetEngine engine,
-        INotificationService notificationService)
+        INotificationService notificationService,
+        ILogger<PaycheckSummaryService> logger)
     {
         _db = db;
         _engine = engine;
         _notificationService = notificationService;
+        _logger = logger;
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -228,16 +232,56 @@ public class PaycheckSummaryService : IPaycheckSummaryService
         // ── Prior-period spend ───────────────────────────────────────────────
         // Settled (non-pending) debit transactions in the prior period, excluding
         // income and any the user marked IgnoreForDynamic.
-        var priorPeriodSpend = await _db.Transactions
-            .Where(t =>
-                t.UserId == user.Id
-                && !t.Pending
-                && t.Amount > 0                             // debit / expense
-                && !t.CountedAsIncome
-                && t.UserDecision != TransactionUserDecision.IgnoreForDynamic
-                && t.Date >= periodStartDate
-                && t.Date < paycheckDate)
-            .SumAsync(t => (decimal?)t.Amount) ?? 0m;
+
+        _logger.LogInformation(
+            "PaycheckSummary prior-period spend query: userId={UserId} " +
+            "periodStartDate={PeriodStartDate} periodStartDateType={PeriodStartDateType} " +
+            "paycheckDate={PaycheckDate} paycheckDateType={PaycheckDateType} " +
+            "nominalPayday={NominalPayday}",
+            user.Id,
+            periodStartDate.ToString("O"),
+            periodStartDate.GetType().Name,
+            paycheckDate.ToString("O"),
+            paycheckDate.GetType().Name,
+            nominalPayday.ToString("yyyy-MM-dd"));
+
+        decimal priorPeriodSpend;
+        try
+        {
+            priorPeriodSpend = await _db.Transactions
+                .Where(t =>
+                    t.UserId == user.Id
+                    && !t.Pending
+                    && t.Amount > 0                             // debit / expense
+                    && !t.CountedAsIncome
+                    && t.UserDecision != TransactionUserDecision.IgnoreForDynamic
+                    && t.Date >= periodStartDate
+                    && t.Date < paycheckDate)
+                .SumAsync(t => (decimal?)t.Amount) ?? 0m;
+
+            _logger.LogInformation(
+                "PaycheckSummary prior-period spend query succeeded: userId={UserId} " +
+                "priorPeriodSpend={PriorPeriodSpend}",
+                user.Id,
+                priorPeriodSpend);
+        }
+        catch (Exception queryEx)
+        {
+            _logger.LogError(
+                queryEx,
+                "PaycheckSummary prior-period spend query FAILED: userId={UserId} " +
+                "periodStartDate={PeriodStartDate} paycheckDate={PaycheckDate} " +
+                "exceptionType={ExceptionType} message={Message} innerMessage={InnerMessage}",
+                user.Id,
+                periodStartDate.ToString("O"),
+                paycheckDate.ToString("O"),
+                queryEx.GetType().Name,
+                queryEx.Message,
+                queryEx.InnerException?.Message ?? "(none)");
+
+            // Rethrow so Program.cs can capture it in Sentry with full webhook context
+            throw;
+        }
 
         // ── Prior-period budget & under/over metrics ─────────────────────────
         decimal priorPeriodStartingBudget = _engine.ComputeBudgetForUser(user, periodStartDate);

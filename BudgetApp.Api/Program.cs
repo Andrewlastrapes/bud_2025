@@ -1847,36 +1847,120 @@ ITransactionService transactionService,
                 scope.SetExtra("sync.durationMs", (int)syncDuration.TotalMilliseconds);
             });
 
-        // ── Paycheck Summary: schedule-based trigger ─────────────────────────
-        // Fires when today is inside the ±window around a configured nominal payday.
-        // Uses the nominal payday date (not today) as the PaycheckSummary key,
-        // so repeated webhook calls within the same window are idempotent.
-        try
-        {
-            await paycheckSummaryService.CreateOrUpdateSummaryIfPaycheckDayAsync(
-                requestBody.ItemId ?? string.Empty,
-                DateTime.UtcNow);
-        }
-        catch (Exception pex)
-        {
-            Console.Error.WriteLine($"[PaycheckSummary] Scheduled trigger error for itemId={requestBody.ItemId}: {pex.Message}");
-        }
+        // ── Skip paycheck summary generation for no-op TRANSACTIONS_REMOVED ───
+        // If webhook code is TRANSACTIONS_REMOVED and no transactions were actually
+        // added, modified, or removed, skip paycheck summary generation entirely.
+        // This is a no-op webhook that should not trigger budget recalculation.
+        bool isNoOpTransactionsRemoved =
+            string.Equals(requestBody.WebhookCode, "TRANSACTIONS_REMOVED", StringComparison.OrdinalIgnoreCase)
+            && addedCount == 0
+            && modifiedCount == 0
+            && removedCount == 0;
 
-        // ── Paycheck Summary: paycheck-deposit fallback trigger ───────────────
-        // Queries the DB for Paycheck transactions created during THIS sync batch
-        // (scoped by UserId + SuggestedKind + CreatedAt >= receivedAt − 1 min).
-        // For each distinct nominal payday not yet covered, creates/updates a summary.
-        // Non-fatal — failure here must not block the webhook response.
-        try
+        if (isNoOpTransactionsRemoved)
         {
-            await paycheckSummaryService.TriggerSummaryForRecentPaycheckTransactionsAsync(
-                requestBody.ItemId ?? string.Empty,
-                receivedAt,
-                DateTime.UtcNow);
+            logger.LogInformation(
+                "Webhook skipping paycheck summary generation: no-op TRANSACTIONS_REMOVED " +
+                "with zero changes. code={WebhookCode} itemId={ItemId} userId={UserId} userEmail={UserEmail}",
+                requestBody.WebhookCode,
+                requestBody.ItemId,
+                userId,
+                userEmail);
+
+            Console.WriteLine(
+                $"[WEBHOOK] Skipping paycheck summary: no-op TRANSACTIONS_REMOVED " +
+                $"code={requestBody.WebhookCode} itemId={requestBody.ItemId} userId={userId}");
         }
-        catch (Exception pfEx)
+        else
         {
-            Console.Error.WriteLine($"[PaycheckSummary] Fallback trigger error for itemId={requestBody.ItemId}: {pfEx.Message}");
+            // ── Paycheck Summary: schedule-based trigger ─────────────────────────
+            // Fires when today is inside the ±window around a configured nominal payday.
+            // Uses the nominal payday date (not today) as the PaycheckSummary key,
+            // so repeated webhook calls within the same window are idempotent.
+            // Non-fatal — failure here must not block the webhook response.
+            try
+            {
+                await paycheckSummaryService.CreateOrUpdateSummaryIfPaycheckDayAsync(
+                    requestBody.ItemId ?? string.Empty,
+                    DateTime.UtcNow);
+            }
+            catch (Exception pex)
+            {
+                logger.LogError(
+                    pex,
+                    "Webhook paycheck summary (scheduled) FAILED: code={WebhookCode} itemId={ItemId} " +
+                    "userId={UserId} userEmail={UserEmail} exceptionType={ExceptionType} " +
+                    "message={Message} innerMessage={InnerMessage}",
+                    requestBody.WebhookCode,
+                    requestBody.ItemId,
+                    userId,
+                    userEmail,
+                    pex.GetType().Name,
+                    pex.Message,
+                    pex.InnerException?.Message ?? "(none)");
+
+                Console.Error.WriteLine(
+                    $"[PaycheckSummary] Scheduled trigger FAILED: itemId={requestBody.ItemId} " +
+                    $"userId={userId} error={pex.Message}");
+
+                SentrySdk.CaptureException(pex, scope =>
+                {
+                    scope.SetTag("event.type", "paycheck_summary_scheduled_failure");
+                    scope.SetTag("webhook.code", requestBody.WebhookCode ?? "unknown");
+                    scope.SetTag("webhook.itemId", requestBody.ItemId ?? "unknown");
+                    scope.SetTag("budget.userId", userId.ToString());
+                    scope.SetExtra("debug.rawUserEmail", userEmail);
+                    scope.SetExtra("sync.added", addedCount);
+                    scope.SetExtra("sync.modified", modifiedCount);
+                    scope.SetExtra("sync.removed", removedCount);
+                    scope.SetExtra("paycheck_summary.trigger", "scheduled");
+                });
+            }
+
+            // ── Paycheck Summary: paycheck-deposit fallback trigger ───────────────
+            // Queries the DB for Paycheck transactions created during THIS sync batch
+            // (scoped by UserId + SuggestedKind + CreatedAt >= receivedAt − 1 min).
+            // For each distinct nominal payday not yet covered, creates/updates a summary.
+            // Non-fatal — failure here must not block the webhook response.
+            try
+            {
+                await paycheckSummaryService.TriggerSummaryForRecentPaycheckTransactionsAsync(
+                    requestBody.ItemId ?? string.Empty,
+                    receivedAt,
+                    DateTime.UtcNow);
+            }
+            catch (Exception pfEx)
+            {
+                logger.LogError(
+                    pfEx,
+                    "Webhook paycheck summary (fallback) FAILED: code={WebhookCode} itemId={ItemId} " +
+                    "userId={UserId} userEmail={UserEmail} exceptionType={ExceptionType} " +
+                    "message={Message} innerMessage={InnerMessage}",
+                    requestBody.WebhookCode,
+                    requestBody.ItemId,
+                    userId,
+                    userEmail,
+                    pfEx.GetType().Name,
+                    pfEx.Message,
+                    pfEx.InnerException?.Message ?? "(none)");
+
+                Console.Error.WriteLine(
+                    $"[PaycheckSummary] Fallback trigger FAILED: itemId={requestBody.ItemId} " +
+                    $"userId={userId} error={pfEx.Message}");
+
+                SentrySdk.CaptureException(pfEx, scope =>
+                {
+                    scope.SetTag("event.type", "paycheck_summary_fallback_failure");
+                    scope.SetTag("webhook.code", requestBody.WebhookCode ?? "unknown");
+                    scope.SetTag("webhook.itemId", requestBody.ItemId ?? "unknown");
+                    scope.SetTag("budget.userId", userId.ToString());
+                    scope.SetExtra("debug.rawUserEmail", userEmail);
+                    scope.SetExtra("sync.added", addedCount);
+                    scope.SetExtra("sync.modified", modifiedCount);
+                    scope.SetExtra("sync.removed", removedCount);
+                    scope.SetExtra("paycheck_summary.trigger", "paycheck-fallback");
+                });
+            }
         }
 
         return Results.Ok(new
