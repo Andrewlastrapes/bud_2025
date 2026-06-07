@@ -1665,19 +1665,29 @@ ITransactionService transactionService,
         }
         else
         {
+            // PlaidItem not found — this is a stale/deleted item.
+            // Log warning and return 200 OK to Plaid so they stop retrying.
+            // Do NOT call SyncAndProcessTransactions.
             logger.LogWarning(
-                "Webhook PlaidItem NOT FOUND: itemId={ItemId} webhookCode={WebhookCode} — sync will fail",
-                requestBody.ItemId, requestBody.WebhookCode);
+                "Ignoring webhook for unknown Plaid item: itemId={ItemId} webhookType={WebhookType} webhookCode={WebhookCode}",
+                requestBody.ItemId,
+                requestBody.WebhookType,
+                requestBody.WebhookCode);
 
-            SentrySdk.CaptureMessage(
-                $"Webhook PlaidItem NOT FOUND: itemId={requestBody.ItemId ?? "(null)"}",
-                scope =>
-                {
-                    scope.Level = SentryLevel.Warning;
-                    scope.SetTag("event.type", "webhook_item_not_found");
-                    scope.SetTag("webhook.itemId", requestBody.ItemId ?? "unknown");
-                    scope.SetTag("webhook.code", requestBody.WebhookCode ?? "unknown");
-                });
+            Console.WriteLine(
+                $"[WEBHOOK] IGNORED: unknown Plaid item itemId={requestBody.ItemId} " +
+                $"webhookType={requestBody.WebhookType} webhookCode={requestBody.WebhookCode}");
+
+            SentrySdk.AddBreadcrumb(
+                $"Webhook ignored: unknown Plaid item {requestBody.ItemId}",
+                level: BreadcrumbLevel.Info);
+
+            return Results.Ok(new
+            {
+                ignored = true,
+                reason = "unknown_plaid_item",
+                itemId = requestBody.ItemId
+            });
         }
 
         logger.LogInformation(
