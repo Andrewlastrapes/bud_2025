@@ -297,16 +297,32 @@ export default function FixedCostsSetupScreen({ navigation, route }) {
   const fetchDetectedSuggestions = async () => {
     try {
       const config = await getAuthHeader();
-      const response = await axios.get(
-        `${API_BASE_URL}/api/recurring/suggestions`,
+      const response = await axios.post(
+        `${API_BASE_URL}/api/recurring/suggestions/refresh`,
+        {},
         config,
       );
 
-      const suggestions = (response.data || []).map((item) => ({
+      // Handle both response shapes:
+      // - Old: bare array
+      // - New: { suggestions, diagnostics }
+      const rawSuggestions = Array.isArray(response.data)
+        ? response.data
+        : (response.data?.suggestions ?? []);
+
+      const suggestions = rawSuggestions.map((item) => ({
         ...item,
         isChecked: true,
         classification: null,
       }));
+
+      // Log diagnostics if present (helps debug sync issues)
+      if (response.data?.diagnostics) {
+        console.log(
+          "[FixedCostsSetup] Recurring refresh diagnostics:",
+          response.data.diagnostics,
+        );
+      }
 
       setDetectedSuggestions(suggestions);
     } catch (e) {

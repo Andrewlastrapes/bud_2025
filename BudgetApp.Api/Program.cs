@@ -1211,8 +1211,10 @@ app.MapGet("/api/users/profile", async (ApiDbContext dbContext, HttpContext http
 .WithOpenApi();
 
 // GET: /api/plaid/recurring
-app.MapGet("/api/plaid/recurring", async (ApiDbContext dbContext, PlaidClient plaidClient, HttpContext httpContext) =>
+app.MapGet("/api/plaid/recurring", async (ApiDbContext dbContext, PlaidClient plaidClient, HttpContext httpContext, ILoggerFactory loggerFactory) =>
 {
+    var logger = loggerFactory.CreateLogger("PlaidRecurring");
+
     try
     {
         string? idToken = httpContext.Request.Headers["Authorization"].FirstOrDefault()?.Split(" ").Last();
@@ -1222,15 +1224,22 @@ app.MapGet("/api/plaid/recurring", async (ApiDbContext dbContext, PlaidClient pl
         var user = await dbContext.Users.FirstOrDefaultAsync(u => u.FirebaseUuid == decodedToken.Uid);
         if (user == null) return Results.NotFound("User not found.");
 
-        var plaidItem = await dbContext.PlaidItems.FirstOrDefaultAsync(p => p.UserId == user.Id);
-        if (plaidItem == null) return Results.Ok(new { message = "No bank linked." });
+        // Load ALL PlaidItems for this user — previously only FirstOrDefault was checked.
+        var plaidItems = await dbContext.PlaidItems
+            .Where(p => p.UserId == user.Id)
+            .ToListAsync();
 
-        var request = new Going.Plaid.Transactions.TransactionsRecurringGetRequest
+        if (!plaidItems.Any())
         {
-            AccessToken = plaidItem.AccessToken,
-        };
+            logger.LogInformation(
+                "PlaidRecurring: No PlaidItems linked. userId={UserId} userEmail={UserEmail}",
+                user.Id, user.Email);
+            return Results.Ok(new { message = "No bank linked." });
+        }
 
-        var response = await plaidClient.TransactionsRecurringGetAsync(request);
+        logger.LogInformation(
+            "PlaidRecurring: Starting. userId={UserId} userEmail={UserEmail} plaidItemCount={Count}",
+            user.Id, user.Email, plaidItems.Count);
 
         // Map each stream to a stable DTO with explicit snake_case field names.
         // This ensures:
@@ -1288,10 +1297,89 @@ app.MapGet("/api/plaid/recurring", async (ApiDbContext dbContext, PlaidClient pl
             };
         }
 
+        var allInflowStreams = new List<object>();
+        var allOutflowStreams = new List<object>();
+        int itemsWithStreams = 0;
+        int itemsFailed = 0;
+
+        foreach (var plaidItem in plaidItems)
+        {
+            try
+            {
+                logger.LogInformation(
+                    "PlaidRecurring: Fetching streams for item. userId={UserId} plaidItemDbId={PlaidItemDbId} " +
+                    "itemId={ItemId} institutionName={InstitutionName}",
+                    user.Id, plaidItem.Id, plaidItem.ItemId, plaidItem.InstitutionName ?? "(unknown)");
+
+                var request = new Going.Plaid.Transactions.TransactionsRecurringGetRequest
+                {
+                    AccessToken = plaidItem.AccessToken,
+                };
+
+                var response = await plaidClient.TransactionsRecurringGetAsync(request);
+
+                int inflowCount = response.InflowStreams?.Count ?? 0;
+                int outflowCount = response.OutflowStreams?.Count ?? 0;
+
+                if (inflowCount > 0 || outflowCount > 0)
+                {
+                    itemsWithStreams++;
+                }
+
+                logger.LogInformation(
+                    "PlaidRecurring: Item streams fetched. userId={UserId} plaidItemDbId={PlaidItemDbId} " +
+                    "itemId={ItemId} inflowCount={InflowCount} outflowCount={OutflowCount}",
+                    user.Id, plaidItem.Id, plaidItem.ItemId, inflowCount, outflowCount);
+
+                if (response.InflowStreams != null)
+                {
+                    allInflowStreams.AddRange(response.InflowStreams.Select(MapStream));
+                }
+
+                if (response.OutflowStreams != null)
+                {
+                    allOutflowStreams.AddRange(response.OutflowStreams.Select(MapStream));
+                }
+            }
+            catch (Exception itemEx)
+            {
+                itemsFailed++;
+                logger.LogError(itemEx,
+                    "PlaidRecurring: Failed to fetch streams for item. userId={UserId} plaidItemDbId={PlaidItemDbId} " +
+                    "itemId={ItemId} institutionName={InstitutionName}",
+                    user.Id, plaidItem.Id, plaidItem.ItemId, plaidItem.InstitutionName ?? "(unknown)");
+
+                SentrySdk.CaptureException(itemEx, scope =>
+                {
+                    scope.SetTag("endpoint", "plaid_recurring");
+                    scope.SetTag("userId", user.Id.ToString());
+                    scope.SetTag("plaidItemDbId", plaidItem.Id.ToString());
+                    scope.SetTag("itemId", plaidItem.ItemId);
+                    scope.SetExtra("institutionName", plaidItem.InstitutionName);
+                });
+
+                // Continue with remaining items — do not fail the entire endpoint
+            }
+        }
+
+        logger.LogInformation(
+            "PlaidRecurring: Complete. userId={UserId} userEmail={UserEmail} " +
+            "totalPlaidItems={TotalItems} itemsWithStreams={ItemsWithStreams} itemsFailed={ItemsFailed} " +
+            "totalInflowStreams={TotalInflowStreams} totalOutflowStreams={TotalOutflowStreams}",
+            user.Id, user.Email,
+            plaidItems.Count, itemsWithStreams, itemsFailed,
+            allInflowStreams.Count, allOutflowStreams.Count);
+
+        SentrySdk.AddBreadcrumb(
+            $"PlaidRecurring complete: userId={user.Id} totalItems={plaidItems.Count} " +
+            $"itemsWithStreams={itemsWithStreams} totalInflowStreams={allInflowStreams.Count} " +
+            $"totalOutflowStreams={allOutflowStreams.Count}",
+            level: BreadcrumbLevel.Info);
+
         return Results.Ok(new
         {
-            inflow_streams = response.InflowStreams?.Select(MapStream).ToList(),
-            outflow_streams = response.OutflowStreams?.Select(MapStream).ToList()
+            inflow_streams = allInflowStreams,
+            outflow_streams = allOutflowStreams
         });
     }
     catch (Exception e)
@@ -3714,6 +3802,118 @@ app.MapGet("/api/recurring/suggestions", async (ApiDbContext dbContext, HttpCont
     }
 })
 .WithName("GetRecurringSuggestions")
+.WithOpenApi();
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /api/recurring/suggestions/refresh
+//
+// Deterministic recurring discovery for onboarding: syncs all PlaidItems for the
+// user, fully drains Plaid transaction pages, then analyzes stored transactions.
+//
+// Unlike GET /api/recurring/suggestions (which only analyzes existing DB data),
+// this endpoint ensures transactions are up-to-date before running the analyzer.
+//
+// Returns the same suggestion shape as GET, plus optional diagnostics.
+// ─────────────────────────────────────────────────────────────────────────────
+app.MapPost("/api/recurring/suggestions/refresh", async (
+    ApiDbContext dbContext,
+    HttpContext httpContext,
+    ITransactionService transactionService) =>
+{
+    try
+    {
+        string? idToken = httpContext.Request.Headers["Authorization"]
+            .FirstOrDefault()
+            ?.Split(" ")
+            .Last();
+
+        if (string.IsNullOrEmpty(idToken)) return Results.Unauthorized();
+
+        var decodedToken = await FirebaseAdmin.Auth.FirebaseAuth.DefaultInstance
+            .VerifyIdTokenAsync(idToken);
+
+        var user = await dbContext.Users
+            .FirstOrDefaultAsync(u => u.FirebaseUuid == decodedToken.Uid);
+
+        if (user == null) return Results.NotFound("User not found.");
+
+        // ── 1. Load all PlaidItems for the user ────────────────────────────────
+        var plaidItems = await dbContext.PlaidItems
+            .Where(p => p.UserId == user.Id)
+            .ToListAsync();
+
+        // ── 2. Sync all PlaidItems ─────────────────────────────────────────────
+        // For each item, call SyncAndProcessTransactions which now fully drains
+        // Plaid pages (HasMore loop). Track sync results for diagnostics.
+        int plaidItemsSynced = 0;
+        var syncErrors = new List<string>();
+
+        foreach (var item in plaidItems)
+        {
+            try
+            {
+                await transactionService.SyncAndProcessTransactions(item.ItemId);
+                plaidItemsSynced++;
+            }
+            catch (Exception syncEx)
+            {
+                // Log error but continue to next item — don't block onboarding
+                // if one account fails (e.g. Plaid API issue, expired token).
+                var errorMsg = $"{item.InstitutionName ?? item.ItemId}: {syncEx.Message}";
+                syncErrors.Add(errorMsg);
+
+                SentrySdk.CaptureException(syncEx, scope =>
+                {
+                    scope.SetTag("event.type", "recurring_refresh_sync_failure");
+                    scope.SetTag("user.id", user.Id.ToString());
+                    scope.SetTag("plaid.itemId", item.ItemId);
+                    scope.SetExtra("institutionName", item.InstitutionName);
+                });
+            }
+        }
+
+        // ── 3. Query all non-pending transactions for analysis ─────────────────
+        // Same logic as GET /api/recurring/suggestions: no account/item filter.
+        DateTime cutoff = DateTime.UtcNow.Date.AddMonths(-6);
+
+        var transactions = await dbContext.Transactions
+            .Where(t => t.UserId == user.Id
+                && !t.Pending
+                && t.Date >= cutoff)
+            .OrderBy(t => t.Date)
+            .ToListAsync();
+
+        // ── 4. Run analyzer ────────────────────────────────────────────────────
+        var suggestions = RecurringSuggestionsAnalyzer.Analyze(transactions, cutoff);
+
+        // ── 5. Return enhanced response with diagnostics ───────────────────────
+        // Note: SyncAndProcessTransactions returns TransactionsSyncResponse from
+        // Going.Plaid, which we don't aggregate here. We only track success/failure
+        // per item. If detailed metrics are needed in the future, we can extend
+        // ITransactionService to return a custom DTO.
+        var response = new
+        {
+            suggestions,
+            diagnostics = new
+            {
+                plaidItemsTotal = plaidItems.Count,
+                plaidItemsSynced,
+                plaidItemsFailed = syncErrors.Count,
+                transactionsAnalyzed = transactions.Count,
+                suggestionsReturned = suggestions.Count,
+                syncErrors = syncErrors.Count > 0 ? syncErrors : null
+            }
+        };
+
+        return Results.Ok(response);
+    }
+    catch (Exception e)
+    {
+        SentrySdk.CaptureException(e);
+        return Results.Problem(e.Message);
+    }
+})
+.WithName("RefreshRecurringSuggestions")
 .WithOpenApi();
 
 // ─────────────────────────────────────────────────────────────────────────────
