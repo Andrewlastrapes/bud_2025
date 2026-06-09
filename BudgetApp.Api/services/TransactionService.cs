@@ -290,7 +290,7 @@ namespace BudgetApp.Api.Services
                         $"hasMore={response.HasMore}",
                         scope =>
                         {
-                            scope.Level = SentryLevel.Warning;
+                            scope.Level = SentryLevel.Info;
                             scope.SetTag("event.type", "cursor_null_from_plaid");
                             scope.SetTag("sync.itemId", itemId);
                             scope.SetTag("sync.plaidItemDbId", plaidItem.Id.ToString());
@@ -996,7 +996,7 @@ namespace BudgetApp.Api.Services
                         bool gate_todayOrYesterday = plaidTxDate.HasValue &&
                             (plaidTxDate.Value == todayEastern || plaidTxDate.Value == yesterdayEastern);
 
-                        bool gate_notPending = !newTx.Pending;
+                        bool gate_notSuspiciousHold = !newTx.IsSuspiciousHold;
 
                         bool notifyEligible =
                             gate_notBackfill &&
@@ -1004,13 +1004,14 @@ namespace BudgetApp.Api.Services
                             gate_realDateAfterCutoff &&
                             gate_afterRegistration &&
                             gate_todayOrYesterday &&
-                            gate_notPending;
+                            gate_notSuspiciousHold;
 
                         // ── CRITICAL LOG: full eligibility breakdown for every transaction ──
                         _logger.LogInformation(
                             "Transaction notification evaluation: " +
                             "plaidTxId={PlaidTxId} merchant={Merchant} amount={Amount} " +
                             "createdAt={CreatedAt} plaidTxDate={PlaidTxDate} pending={Pending} " +
+                            "isSuspiciousHold={IsSuspiciousHold} budgetAppliedAmount={BudgetAppliedAmount} " +
                             "isBackfill={IsBackfill} " +
                             "notificationsEnabledAt={NotificationsEnabledAt} " +
                             "notifyCutoff={NotifyCutoff} " +
@@ -1021,12 +1022,14 @@ namespace BudgetApp.Api.Services
                             "gate_realDateAfterCutoff={GateRealDateAfterCutoff} " +
                             "gate_afterRegistration={GateAfterRegistration} " +
                             "gate_todayOrYesterday={GateTodayOrYesterday} " +
-                            "gate_notPending={GateNotPending} " +
+                            "gate_notSuspiciousHold={GateNotSuspiciousHold} " +
                             "shouldNotify={ShouldNotify}",
                             t.TransactionId, merchantName, absAmount,
                             createdAt.ToString("O"),
                             plaidTxDate?.ToString("yyyy-MM-dd") ?? "(null)",
                             isPending,
+                            newTx.IsSuspiciousHold,
+                            newTx.BudgetAppliedAmount?.ToString("F2") ?? "null",
                             isBackfill,
                             plaidItem.NotificationsEnabledAt?.ToString("O") ?? "(null)",
                             notifyCutoff == DateTime.MaxValue
@@ -1040,17 +1043,18 @@ namespace BudgetApp.Api.Services
                             gate_realDateAfterCutoff,
                             gate_afterRegistration,
                             gate_todayOrYesterday,
-                            gate_notPending,
+                            gate_notSuspiciousHold,
                             notifyEligible);
 
                         SentrySdk.AddBreadcrumb(
                             $"Tx eval: plaidTxId={t.TransactionId} merchant={merchantName} " +
-                            $"shouldNotify={notifyEligible} " +
+                            $"shouldNotify={notifyEligible} pending={isPending} " +
+                            $"isSuspiciousHold={newTx.IsSuspiciousHold} budgetAppliedAmount={newTx.BudgetAppliedAmount?.ToString("F2") ?? "null"} " +
                             $"isBackfill={isBackfill} notificationsEnabled={gate_notificationsEnabled} " +
                             $"realDateAfterCutoff={gate_realDateAfterCutoff} " +
                             $"afterRegistration={gate_afterRegistration} " +
                             $"todayOrYesterday={gate_todayOrYesterday} " +
-                            $"notPending={gate_notPending}",
+                            $"notSuspiciousHold={gate_notSuspiciousHold}",
                             level: notifyEligible ? BreadcrumbLevel.Info : BreadcrumbLevel.Debug);
 
                         if (notifyEligible)
@@ -1085,7 +1089,7 @@ namespace BudgetApp.Api.Services
                                                 !gate_realDateAfterCutoff ? "skipped: backfill (before cutoff)" :
                                                 !gate_afterRegistration ? "skipped: before user registration" :
                                                 !gate_todayOrYesterday ? "skipped: older than yesterday Eastern" :
-                                                !gate_notPending ? "skipped: pending" :
+                                                !gate_notSuspiciousHold ? "skipped: suspicious hold" :
                                                                               "skipped: unknown";
 
                             _logger.LogInformation(
@@ -1138,7 +1142,7 @@ namespace BudgetApp.Api.Services
                         $"CURSOR_NULL_GUARD: itemId={itemId} plaidItemDbId={plaidItem.Id}",
                         scope =>
                         {
-                            scope.Level = SentryLevel.Warning;
+                            scope.Level = SentryLevel.Info;
                             scope.SetTag("event.type", "cursor_null_guard_retained");
                             scope.SetTag("sync.itemId", itemId);
                             scope.SetExtra("plaidItemDbId", plaidItem.Id);
@@ -1162,7 +1166,7 @@ namespace BudgetApp.Api.Services
                         $"CURSOR_NULL_FIRST_SYNC: itemId={itemId} plaidItemDbId={plaidItem.Id}",
                         scope =>
                         {
-                            scope.Level = SentryLevel.Warning;
+                            scope.Level = SentryLevel.Info;
                             scope.SetTag("event.type", "cursor_null_first_sync");
                             scope.SetTag("sync.itemId", itemId);
                             scope.SetExtra("plaidItemDbId", plaidItem.Id);
