@@ -276,12 +276,14 @@ namespace BudgetApp.Api.Services
                     pagesFetched++;
 
                     _logger.LogInformation(
-                        "Plaid sync page: itemId={ItemId} webhookCode={WebhookCode} page={Page} " +
+                        "Plaid sync page: userId={UserId} plaidItemDbId={PlaidItemDbId} itemId={ItemId} " +
+                        "webhookCode={WebhookCode} page={Page} cursorPresent={CursorPresent} " +
                         "added={Added} modified={Modified} removed={Removed} " +
-                        "hasMore={HasMore} nextCursor={NextCursor}",
-                        itemId, webhookCode ?? "(manual)", pagesFetched,
+                        "hasMore={HasMore} nextCursorPresent={NextCursorPresent}",
+                        user.Id, plaidItem.Id, itemId, webhookCode ?? "(manual)", pagesFetched,
+                        !string.IsNullOrEmpty(workingCursor),
                         addedCount, modifiedCount, removedCount,
-                        response.HasMore, response.NextCursor ?? "(null)");
+                        response.HasMore, !string.IsNullOrEmpty(response.NextCursor));
 
                     SentrySdk.AddBreadcrumb(
                         $"Plaid sync page {pagesFetched}: itemId={itemId} added={addedCount} " +
@@ -341,21 +343,26 @@ namespace BudgetApp.Api.Services
                         foreach (var removed in response.Removed)
                         {
                             var existing = await _dbContext.Transactions
-                                .FirstOrDefaultAsync(x => x.PlaidTransactionId == removed.TransactionId);
+                                .FirstOrDefaultAsync(x => x.UserId == user.Id && x.PlaidTransactionId == removed.TransactionId);
 
                             if (existing == null)
                             {
-                                _logger.LogDebug(
-                                    "Removed tx not in DB (skip): plaidTxId={PlaidTxId}",
-                                    removed.TransactionId);
+                                _logger.LogInformation(
+                                    "Removed tx not in DB (skip): userId={UserId} plaidItemDbId={PlaidItemDbId} " +
+                                    "itemId={ItemId} webhookCode={WebhookCode} plaidTxId={PlaidTxId}",
+                                    user.Id, plaidItem.Id, itemId, webhookCode ?? "(manual)", removed.TransactionId);
                                 continue;
                             }
 
                             _logger.LogInformation(
-                                "Removing transaction: txId={TxId} plaidTxId={PlaidTxId} " +
-                                "amount={Amount} budgetAppliedAmount={BudgetAppliedAmount}",
-                                existing.Id, removed.TransactionId,
-                                existing.Amount, existing.BudgetAppliedAmount);
+                                "Removing transaction: userId={UserId} plaidItemDbId={PlaidItemDbId} itemId={ItemId} " +
+                                "webhookCode={WebhookCode} plaidTxId={PlaidTxId} localTxId={TxId} " +
+                                "accountId={AccountId} date={Date} merchant={Merchant} amount={Amount} " +
+                                "pending={Pending} budgetAppliedAmount={BudgetAppliedAmount}",
+                                user.Id, plaidItem.Id, itemId, webhookCode ?? "(manual)",
+                                removed.TransactionId, existing.Id, existing.AccountId,
+                                existing.Date.ToString("yyyy-MM-dd"), existing.MerchantName ?? existing.Name,
+                                existing.Amount, existing.Pending, existing.BudgetAppliedAmount);
 
                             if (existing.BudgetAppliedAmount.HasValue && existing.BudgetAppliedAmount.Value != 0)
                             {
@@ -373,13 +380,14 @@ namespace BudgetApp.Api.Services
                         foreach (var modified in response.Modified)
                         {
                             var existing = await _dbContext.Transactions
-                                .FirstOrDefaultAsync(x => x.PlaidTransactionId == modified.TransactionId);
+                                .FirstOrDefaultAsync(x => x.UserId == user.Id && x.PlaidTransactionId == modified.TransactionId);
 
                             if (existing == null)
                             {
-                                _logger.LogDebug(
-                                    "Modified tx not in DB (skip): plaidTxId={PlaidTxId}",
-                                    modified.TransactionId);
+                                _logger.LogInformation(
+                                    "Modified tx not in DB (skip): userId={UserId} plaidItemDbId={PlaidItemDbId} " +
+                                    "itemId={ItemId} webhookCode={WebhookCode} plaidTxId={PlaidTxId}",
+                                    user.Id, plaidItem.Id, itemId, webhookCode ?? "(manual)", modified.TransactionId);
                                 continue;
                             }
 
@@ -388,10 +396,14 @@ namespace BudgetApp.Api.Services
                             decimal newAbs = Math.Abs(rawAmount);
 
                             _logger.LogInformation(
-                                "Modifying transaction: txId={TxId} plaidTxId={PlaidTxId} " +
-                                "oldAmount={OldAmount} newAmount={NewAmount} isCredit={IsCredit}",
-                                existing.Id, modified.TransactionId,
-                                existing.Amount, newAbs, isCredit);
+                                "Modifying transaction: userId={UserId} plaidItemDbId={PlaidItemDbId} itemId={ItemId} " +
+                                "webhookCode={WebhookCode} plaidTxId={PlaidTxId} localTxId={TxId} " +
+                                "oldAmount={OldAmount} newAmount={NewAmount} isCredit={IsCredit} " +
+                                "oldPending={OldPending} newPending={NewPending}",
+                                user.Id, plaidItem.Id, itemId, webhookCode ?? "(manual)",
+                                modified.TransactionId, existing.Id,
+                                existing.Amount, newAbs, isCredit,
+                                existing.Pending, modified.Pending ?? existing.Pending);
 
                             if (!isCredit && existing.BudgetAppliedAmount.HasValue)
                             {
@@ -404,6 +416,14 @@ namespace BudgetApp.Api.Services
                             existing.Amount = newAbs;
                             existing.Pending = modified.Pending ?? existing.Pending;
                             existing.UpdatedAt = DateTime.UtcNow;
+
+                            _logger.LogInformation(
+                                "Modified transaction updated: localTxId={TxId} accountId={AccountId} " +
+                                "date={Date} merchant={Merchant} amount={Amount} pending={Pending} " +
+                                "pendingTransactionId={PendingTxId} budgetAppliedAmount={BudgetAppliedAmount}",
+                                existing.Id, existing.AccountId, existing.Date.ToString("yyyy-MM-dd"),
+                                existing.MerchantName ?? existing.Name, existing.Amount, existing.Pending,
+                                existing.PendingTransactionId ?? "(null)", existing.BudgetAppliedAmount);
                         }
                     }
 
