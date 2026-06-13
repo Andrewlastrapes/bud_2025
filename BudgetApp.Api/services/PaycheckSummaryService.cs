@@ -183,6 +183,14 @@ public class PaycheckSummaryService : IPaycheckSummaryService
     // ─────────────────────────────────────────────────────────────────────────
 
     /// <summary>
+    /// Normalizes a date-only value to UTC midnight.
+    /// Uses SpecifyKind to avoid shifting the calendar date.
+    /// Required for PostgreSQL timestamp with time zone columns.
+    /// </summary>
+    private static DateTime AsUtcDate(DateTime dt) =>
+        DateTime.SpecifyKind(dt.Date, DateTimeKind.Utc);
+
+    /// <summary>
     /// Loads the <see cref="User"/> (with FixedCosts) linked to a Plaid item.
     /// Returns null and logs a message when the item is not found.
     /// </summary>
@@ -225,9 +233,10 @@ public class PaycheckSummaryService : IPaycheckSummaryService
         var paycheckDate = nominalPayday.ToDateTime(TimeOnly.MinValue, DateTimeKind.Utc);
 
         // ── Period dates ─────────────────────────────────────────────────────
-        var periodStartDate = _engine.GetPreviousPaycheckDate(user, paycheckDate);
+        // Normalize to UTC to satisfy PostgreSQL timestamp with time zone requirements
+        var periodStartDate = AsUtcDate(_engine.GetPreviousPaycheckDate(user, paycheckDate));
         var periodEndDate = paycheckDate;
-        var nextPaycheckDate = _engine.GetNextPaycheckDate(user, paycheckDate);
+        var nextPaycheckDate = AsUtcDate(_engine.GetNextPaycheckDate(user, paycheckDate));
 
         // ── Prior-period spend ───────────────────────────────────────────────
         // Settled (non-pending) debit transactions in the prior period, excluding
@@ -318,11 +327,15 @@ public class PaycheckSummaryService : IPaycheckSummaryService
                  (s.PaycheckDate >= windowStart && s.PaycheckDate < windowEndExclusive)));
 
         bool isNewRecord = existing == null;
+
+        // Ensure utcNow is actually UTC before using in CreatedAt/UpdatedAt
+        var utcNowSafe = utcNow.Kind == DateTimeKind.Utc ? utcNow : utcNow.ToUniversalTime();
+
         var summary = existing ?? new PaycheckSummary
         {
             UserId = user.Id,
             PaycheckDate = paycheckDate,   // canonical nominal-date key
-            CreatedAt = utcNow
+            CreatedAt = utcNowSafe
         };
 
         // Migrate a pre-existing row that was keyed to a non-nominal date.
@@ -349,7 +362,7 @@ public class PaycheckSummaryService : IPaycheckSummaryService
         summary.SavingsContribution = savingsContribution;
         summary.DebtPaymentAmount = debtPaymentAmount;
         summary.NewDynamicBudgetAmount = newDynamicBudgetAmount;
-        summary.UpdatedAt = utcNow;
+        summary.UpdatedAt = utcNowSafe;
 
         if (isNewRecord)
             _db.PaycheckSummaries.Add(summary);
