@@ -1,6 +1,6 @@
 // File: App.js
 // NOTE: Sentry must be initialized FIRST, before any other imports render components.
-import * as Sentry from '@sentry/react-native';
+import * as Sentry from "@sentry/react-native";
 
 Sentry.init({
   dsn: process.env.EXPO_PUBLIC_SENTRY_DSN,
@@ -12,49 +12,51 @@ Sentry.init({
 });
 
 // debugLog patches console — must come after Sentry.init so Sentry is ready
-import './config/debugLog';
+import "./config/debugLog";
 
-import React, { useState, useEffect } from 'react';
-import { View, ActivityIndicator, StyleSheet, Alert } from 'react-native';
-import { createNavigationContainerRef, NavigationContainer } from '@react-navigation/native';
-import { createNativeStackNavigator } from '@react-navigation/native-stack';
-import { PaperProvider, DefaultTheme, Button } from 'react-native-paper';
-import { colors } from './config/theme';
-import { SafeAreaProvider } from 'react-native-safe-area-context';
-import MaterialCommunityIcons from 'react-native-vector-icons/MaterialCommunityIcons';
-import axios from 'axios';
-import * as Notifications from 'expo-notifications';
-import * as Device from 'expo-device';
-import { Platform } from 'react-native';
+import React, { useState, useEffect } from "react";
+import { View, ActivityIndicator, StyleSheet, Alert } from "react-native";
+import {
+  createNavigationContainerRef,
+  NavigationContainer,
+} from "@react-navigation/native";
+import { createNativeStackNavigator } from "@react-navigation/native-stack";
+import { PaperProvider, DefaultTheme, Button } from "react-native-paper";
+import { colors } from "./config/theme";
+import { SafeAreaProvider } from "react-native-safe-area-context";
+import MaterialCommunityIcons from "react-native-vector-icons/MaterialCommunityIcons";
+import axios from "axios";
+import * as Notifications from "expo-notifications";
+import * as Device from "expo-device";
+import { Platform } from "react-native";
 
-import { auth } from './firebaseConfig';
-import { onAuthStateChanged, signOut } from 'firebase/auth';
+import { auth } from "./firebaseConfig";
+import { onAuthStateChanged, signOut } from "firebase/auth";
 
 // --- Screens & Navigators ---
-import HomeScreen from './screens/HomeScreen';
-import TransactionsScreen from './screens/TransactionsScreen';
-import SettingsScreen from './screens/SettingsScreen';
-import LoginScreen from './screens/LoginScreen';
-import FixedCostsScreen from './screens/FixedCostsScreen';
-import OnboardingStack from './navigation/OnboardingStack';
-import DepositReviewScreen from './screens/DepositReviewScreen';
-import { createBottomTabNavigator } from '@react-navigation/bottom-tabs';
-import ReviewLargeExpensesScreen from './screens/ReviewLargeExpensesScreen';
-import ReviewSuspiciousHoldsScreen from './screens/ReviewSuspiciousHoldsScreen';
+import HomeScreen from "./screens/HomeScreen";
+import TransactionsScreen from "./screens/TransactionsScreen";
+import SettingsScreen from "./screens/SettingsScreen";
+import LoginScreen from "./screens/LoginScreen";
+import FixedCostsScreen from "./screens/FixedCostsScreen";
+import OnboardingStack from "./navigation/OnboardingStack";
+import DepositReviewScreen from "./screens/DepositReviewScreen";
+import { createBottomTabNavigator } from "@react-navigation/bottom-tabs";
+import ReviewLargeExpensesScreen from "./screens/ReviewLargeExpensesScreen";
+import ReviewSuspiciousHoldsScreen from "./screens/ReviewSuspiciousHoldsScreen";
+import PaycheckSummaryScreen from "./screens/PaycheckSummaryScreen";
 export const navigationRef = createNavigationContainerRef();
 
-
-
 // --- API Base URL ---
-import { API_BASE_URL } from './config/api';
+import { API_BASE_URL } from "./config/api";
 
 // --- Paper theme — modern indigo replaces the default Material purple ---
 const appTheme = {
   ...DefaultTheme,
   colors: {
     ...DefaultTheme.colors,
-    primary: colors.primary,       // #4F46E5
-    accent: colors.primaryLight,   // #6366F1
+    primary: colors.primary, // #4F46E5
+    accent: colors.primaryLight, // #6366F1
   },
 };
 
@@ -72,26 +74,24 @@ Notifications.setNotificationHandler({
 
 async function registerForPushNotificationsAsync() {
   if (!Device.isDevice) {
-    console.log('Push notifications require a physical device/emulator.');
+    console.log("Push notifications require a physical device/emulator.");
     return null;
   }
 
   const { status: existingStatus } = await Notifications.getPermissionsAsync();
   let finalStatus = existingStatus;
-  if (existingStatus !== 'granted') {
+  if (existingStatus !== "granted") {
     const { status } = await Notifications.requestPermissionsAsync();
     finalStatus = status;
   }
-  if (finalStatus !== 'granted') {
-    console.log('Notification permission not granted.');
+  if (finalStatus !== "granted") {
+    console.log("Notification permission not granted.");
     return null;
   }
 
   const tokenData = await Notifications.getExpoPushTokenAsync();
   return tokenData.data;
 }
-
-
 
 /**
  * Bottom tab navigator for the main app
@@ -100,7 +100,7 @@ function AppTabs() {
   return (
     <Tab.Navigator
       screenOptions={{
-        tabBarActiveTintColor: '#6200ee',
+        tabBarActiveTintColor: "#6200ee",
         headerShown: false,
       }}
     >
@@ -108,7 +108,7 @@ function AppTabs() {
         name="Home"
         component={HomeScreen}
         options={{
-          tabBarLabel: 'Home',
+          tabBarLabel: "Home",
           tabBarIcon: ({ color, size }) => (
             <MaterialCommunityIcons name="home" color={color} size={size} />
           ),
@@ -118,7 +118,7 @@ function AppTabs() {
         name="Transactions"
         component={TransactionsScreen}
         options={{
-          tabBarLabel: 'Spending',
+          tabBarLabel: "Spending",
           tabBarIcon: ({ color, size }) => (
             <MaterialCommunityIcons
               name="format-list-bulleted"
@@ -132,7 +132,7 @@ function AppTabs() {
         name="FixedCosts"
         component={FixedCostsScreen}
         options={{
-          tabBarLabel: 'Fixed',
+          tabBarLabel: "Fixed",
           tabBarIcon: ({ color, size }) => (
             <MaterialCommunityIcons
               name="currency-usd"
@@ -146,7 +146,7 @@ function AppTabs() {
         name="Settings"
         component={SettingsScreen}
         options={{
-          tabBarLabel: 'Settings',
+          tabBarLabel: "Settings",
           tabBarIcon: ({ color, size }) => (
             <MaterialCommunityIcons name="cog" color={color} size={size} />
           ),
@@ -183,13 +183,14 @@ function MainContentNavigator({ fbUser }) {
         headers: { Authorization: `Bearer ${idToken}` },
       });
 
-      console.log('Fetched user profile:', response.data);
+      console.log("Fetched user profile:", response.data);
       setDbUser(response.data);
       setIsLoading(false);
     } catch (e) {
       if (e.response && e.response.status === 404 && retryCount < 5) {
         console.warn(
-          `[RETRYING] User not in DB yet. Waiting... (Attempt ${retryCount + 1
+          `[RETRYING] User not in DB yet. Waiting... (Attempt ${
+            retryCount + 1
           })`,
         );
         await new Promise((resolve) => setTimeout(resolve, 1000));
@@ -197,7 +198,7 @@ function MainContentNavigator({ fbUser }) {
         return;
       }
 
-      console.error('Failed to fetch user profile:', e);
+      console.error("Failed to fetch user profile:", e);
       setDbUser(null);
       setIsLoading(false);
     }
@@ -214,12 +215,16 @@ function MainContentNavigator({ fbUser }) {
   if (!dbUser) {
     // Profile fetch failed after all retries — log clearly and fall back to onboarding
     // so the user isn't silently dropped into the main app without a profile.
-    console.error('[MainContent] dbUser is null after retries — cannot determine onboarding status');
+    console.error(
+      "[MainContent] dbUser is null after retries — cannot determine onboarding status",
+    );
   }
 
   const onboardingComplete = dbUser?.onboardingComplete ?? false;
-  const initialRouteName = onboardingComplete ? 'App' : 'OnboardingFlow';
-  console.log(`[MainContent] onboardingComplete=${onboardingComplete} → initialRouteName=${initialRouteName}`);
+  const initialRouteName = onboardingComplete ? "App" : "OnboardingFlow";
+  console.log(
+    `[MainContent] onboardingComplete=${onboardingComplete} → initialRouteName=${initialRouteName}`,
+  );
 
   return (
     <Stack.Navigator
@@ -232,14 +237,9 @@ function MainContentNavigator({ fbUser }) {
         component={AppTabs}
         options={{
           headerShown: true,
-          title:
-            dbUser?.name ||
-            fbUser?.email?.split('@')[0] ||
-            'Budget App',
+          title: dbUser?.name || fbUser?.email?.split("@")[0] || "Budget App",
           headerRight: () => (
-            <Button onPress={() => signOut(auth)}>
-              Logout
-            </Button>
+            <Button onPress={() => signOut(auth)}>Logout</Button>
           ),
         }}
       />
@@ -249,20 +249,24 @@ function MainContentNavigator({ fbUser }) {
         component={DepositReviewScreen}
         options={{
           headerShown: true,
-          title: 'Review Deposits',
+          title: "Review Deposits",
         }}
       />
       <Stack.Screen
         name="ReviewLargeExpenses"
         component={ReviewLargeExpensesScreen}
-        options={{ title: 'Review Large Expenses' }}
+        options={{ title: "Review Large Expenses" }}
       />
       <Stack.Screen
         name="ReviewSuspiciousHolds"
         component={ReviewSuspiciousHoldsScreen}
-        options={{ headerShown: true, title: 'Review Pending Holds' }}
+        options={{ headerShown: true, title: "Review Pending Holds" }}
       />
-
+      <Stack.Screen
+        name="PaycheckSummary"
+        component={PaycheckSummaryScreen}
+        options={{ headerShown: true, title: "Paycheck Summary" }}
+      />
 
       {/* Onboarding flow – only present while onboarding is incomplete */}
       {!dbUser?.onboardingComplete && (
@@ -284,14 +288,16 @@ function App() {
   const [isLoading, setIsLoading] = useState(true);
 
   useEffect(() => {
-    console.log('[Auth] onAuthStateChanged listener attached');
+    console.log("[Auth] onAuthStateChanged listener attached");
     const unsubscribe = onAuthStateChanged(auth, async (user) => {
       if (user) {
-        console.log(`[Auth] User resolved: uid=${user.uid} email=${user.email}`);
+        console.log(
+          `[Auth] User resolved: uid=${user.uid} email=${user.email}`,
+        );
         // Tag Sentry events with the authenticated user
         Sentry.setUser({ id: user.uid, email: user.email });
       } else {
-        console.log('[Auth] No user — showing Login screen');
+        console.log("[Auth] No user — showing Login screen");
         Sentry.setUser(null);
       }
       setFbUser(user);
@@ -302,35 +308,34 @@ function App() {
   }, []);
 
   useEffect(() => {
-  const setupNotifications = async () => {
+    const setupNotifications = async () => {
+      if (Platform.OS === "web") {
+        console.log("Skipping push notification registration on web");
+        return;
+      }
 
-     if (Platform.OS === 'web') {
-      console.log('Skipping push notification registration on web');
-      return;
-    }
-    
-    if (!fbUser) return;
+      if (!fbUser) return;
 
-    try {
-      const expoPushToken = await registerForPushNotificationsAsync();
-      if (!expoPushToken) return;
+      try {
+        const expoPushToken = await registerForPushNotificationsAsync();
+        if (!expoPushToken) return;
 
-      const idToken = await fbUser.getIdToken();
+        const idToken = await fbUser.getIdToken();
 
-      await axios.post(
-        `${API_BASE_URL}/api/notifications/register-device`,
-        { expoPushToken, platform: Platform.OS },
-        { headers: { Authorization: `Bearer ${idToken}` } },
-      );
+        await axios.post(
+          `${API_BASE_URL}/api/notifications/register-device`,
+          { expoPushToken, platform: Platform.OS },
+          { headers: { Authorization: `Bearer ${idToken}` } },
+        );
 
-      console.log('Push token registered:', expoPushToken);
-    } catch (e) {
-      console.error('Failed to register push notifications:', e);
-    }
-  };
+        console.log("Push token registered:", expoPushToken);
+      } catch (e) {
+        console.error("Failed to register push notifications:", e);
+      }
+    };
 
-  setupNotifications();
-}, [fbUser]);
+    setupNotifications();
+  }, [fbUser]);
 
   useEffect(() => {
     const sub = Notifications.addNotificationResponseReceivedListener(
@@ -341,14 +346,14 @@ function App() {
         if (!fbUser || !transactionId) return;
 
         // For now, only handle the recurring question on "spend" notifications
-        if (type === 'spend' && canMarkRecurring) {
+        if (type === "spend" && canMarkRecurring) {
           Alert.alert(
-            'Recurring charge?',
-            'Do you want to treat this as a recurring bill going forward?',
+            "Recurring charge?",
+            "Do you want to treat this as a recurring bill going forward?",
             [
-              { text: 'No', style: 'cancel' },
+              { text: "No", style: "cancel" },
               {
-                text: 'Yes',
+                text: "Yes",
                 onPress: async () => {
                   try {
                     const idToken = await fbUser.getIdToken();
@@ -357,10 +362,13 @@ function App() {
                       { firstDueDate: null }, // let backend guess for now
                       { headers: { Authorization: `Bearer ${idToken}` } },
                     );
-                    Alert.alert('Saved', 'This charge is now tracked as a recurring cost.');
+                    Alert.alert(
+                      "Saved",
+                      "This charge is now tracked as a recurring cost.",
+                    );
                   } catch (e) {
-                    console.error('Failed to mark recurring:', e);
-                    Alert.alert('Error', 'Could not save recurring cost.');
+                    console.error("Failed to mark recurring:", e);
+                    Alert.alert("Error", "Could not save recurring cost.");
                   }
                 },
               },
@@ -382,7 +390,7 @@ function App() {
 
   return (
     <SafeAreaProvider>
-        <PaperProvider theme={appTheme}>
+      <PaperProvider theme={appTheme}>
         <NavigationContainer
           ref={navigationRef}
           onStateChange={(state) => {
@@ -392,9 +400,9 @@ function App() {
             const activeRoute = getActiveRouteName(state);
             if (activeRoute) {
               Sentry.addBreadcrumb({
-                category: 'navigation',
+                category: "navigation",
                 message: `Navigated to ${activeRoute}`,
-                level: 'info',
+                level: "info",
               });
             }
           }}
@@ -431,8 +439,8 @@ function getActiveRouteName(state) {
 const styles = StyleSheet.create({
   loadingContainer: {
     flex: 1,
-    justifyContent: 'center',
-    alignItems: 'center',
+    justifyContent: "center",
+    alignItems: "center",
   },
 });
 

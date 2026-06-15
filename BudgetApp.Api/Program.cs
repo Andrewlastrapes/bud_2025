@@ -3474,11 +3474,27 @@ SentrySdk.AddBreadcrumb("BOOT: before app.Run()", level: BreadcrumbLevel.Info);
 // ─── Paycheck Summary ─────────────────────────────────────────────────────────
 app.MapGet("/api/paycheck-summary/current", async (HttpContext http, ApiDbContext db) =>
 {
-    var userId = http.User.FindFirst(System.Security.Claims.ClaimTypes.NameIdentifier)?.Value;
-    if (userId == null) return Results.Unauthorized();
+    // ── Firebase auth (same as /api/users/profile, /api/transactions, etc.) ──
+    var authHeader = http.Request.Headers["Authorization"].FirstOrDefault();
+    if (authHeader == null || !authHeader.StartsWith("Bearer "))
+        return Results.Unauthorized();
+
+    var idToken = authHeader.Substring("Bearer ".Length);
+    FirebaseToken decodedToken;
+    try
+    {
+        decodedToken = await FirebaseAuth.DefaultInstance.VerifyIdTokenAsync(idToken);
+    }
+    catch
+    {
+        return Results.Unauthorized();
+    }
+
+    var user = await db.Users.FirstOrDefaultAsync(u => u.FirebaseUuid == decodedToken.Uid);
+    if (user == null) return Results.Unauthorized();
 
     var summary = await db.PaycheckSummaries
-        .Where(s => s.UserId == int.Parse(userId) && !s.IsDismissed)
+        .Where(s => s.UserId == user.Id && !s.IsDismissed)
         .OrderByDescending(s => s.PaycheckDate)
         .FirstOrDefaultAsync();
 
@@ -3517,11 +3533,27 @@ app.MapPost("/api/paycheck-summary/{id}/decision", async (
     int id,
     [Microsoft.AspNetCore.Mvc.FromBody] PaycheckDecisionRequest req) =>
 {
-    var userId = http.User.FindFirst(System.Security.Claims.ClaimTypes.NameIdentifier)?.Value;
-    if (userId == null) return Results.Unauthorized();
+    // ── Firebase auth (same as /api/users/profile, /api/transactions, etc.) ──
+    var authHeader = http.Request.Headers["Authorization"].FirstOrDefault();
+    if (authHeader == null || !authHeader.StartsWith("Bearer "))
+        return Results.Unauthorized();
+
+    var idToken = authHeader.Substring("Bearer ".Length);
+    FirebaseToken decodedToken;
+    try
+    {
+        decodedToken = await FirebaseAuth.DefaultInstance.VerifyIdTokenAsync(idToken);
+    }
+    catch
+    {
+        return Results.Unauthorized();
+    }
+
+    var user = await db.Users.FirstOrDefaultAsync(u => u.FirebaseUuid == decodedToken.Uid);
+    if (user == null) return Results.Unauthorized();
 
     var summary = await db.PaycheckSummaries
-        .FirstOrDefaultAsync(s => s.Id == id && s.UserId == int.Parse(userId));
+        .FirstOrDefaultAsync(s => s.Id == id && s.UserId == user.Id);
 
     if (summary == null) return Results.NotFound();
 

@@ -40,6 +40,9 @@ export default function HomeScreen({ navigation }) {
     count: 0,
     totalAmount: 0,
   });
+  // paycheckSummary: full summary object from /api/paycheck-summary/current
+  // null = not yet loaded or no active summary
+  const [paycheckSummary, setPaycheckSummary] = useState(null);
   const isFocused = useIsFocused();
 
   // Helper to get auth headers
@@ -127,6 +130,27 @@ export default function HomeScreen({ navigation }) {
     }
   };
 
+  // Fetches the current paycheck summary (if one exists and is not dismissed).
+  // Non-fatal: banner just won't show if this fails or returns 204 No Content.
+  const fetchPaycheckSummary = async () => {
+    try {
+      const config = await getAuthHeader();
+      const response = await axios.get(
+        `${API_BASE_URL}/api/paycheck-summary/current`,
+        config,
+      );
+      if (response.status === 200 && response.data) {
+        setPaycheckSummary(response.data);
+      } else {
+        // 204 No Content = no active summary
+        setPaycheckSummary(null);
+      }
+    } catch (e) {
+      console.error("Failed to fetch paycheck summary:", e);
+      setPaycheckSummary(null);
+    }
+  };
+
   useEffect(() => {
     if (isFocused) {
       fetchBalance();
@@ -134,6 +158,7 @@ export default function HomeScreen({ navigation }) {
       fetchLargeExpenseSummary();
       fetchDebtSummary();
       fetchDepositSummary();
+      fetchPaycheckSummary();
     }
   }, [isFocused]);
 
@@ -259,6 +284,25 @@ export default function HomeScreen({ navigation }) {
               </Text>
             </View>
             <Text style={styles.depositChevron}>›</Text>
+          </TouchableOpacity>
+        )}
+
+        {/* ── Paycheck summary banner ── */}
+        {/* Shown when a paycheck summary exists and has not been dismissed. */}
+        {paycheckSummary && !paycheckSummary.isDismissed && (
+          <TouchableOpacity
+            style={styles.paycheckBanner}
+            onPress={() => navigation.navigate("PaycheckSummary")}
+            activeOpacity={0.8}
+          >
+            <Text style={styles.paycheckIcon}>💰</Text>
+            <View style={styles.holdTextBlock}>
+              <Text style={styles.paycheckTitle}>Paycheck Summary Ready</Text>
+              <Text style={styles.paycheckSub}>
+                Review your last paycheck period
+              </Text>
+            </View>
+            <Text style={styles.paycheckChevron}>›</Text>
           </TouchableOpacity>
         )}
 
@@ -528,6 +572,41 @@ const styles = StyleSheet.create({
   depositChevron: {
     fontSize: 22,
     color: "#0D9488",
+    marginLeft: 8,
+    fontWeight: "300",
+  },
+
+  // ── Paycheck summary banner ───────────────────────────────────
+  // Indigo palette (#4F46E5 family) — visually distinct from other banners
+  paycheckBanner: {
+    flexDirection: "row",
+    alignItems: "center",
+    backgroundColor: "#EEF2FF",
+    borderWidth: 1,
+    borderColor: "#C7D2FE",
+    borderRadius: 14,
+    paddingVertical: 14,
+    paddingHorizontal: 16,
+    marginBottom: 16,
+  },
+  paycheckIcon: {
+    fontSize: 20,
+    marginRight: 12,
+  },
+  paycheckTitle: {
+    fontSize: 14,
+    fontWeight: "700",
+    color: "#3730A3",
+  },
+  paycheckSub: {
+    fontSize: 12,
+    color: "#4F46E5",
+    marginTop: 2,
+    lineHeight: 18,
+  },
+  paycheckChevron: {
+    fontSize: 22,
+    color: "#4F46E5",
     marginLeft: 8,
     fontWeight: "300",
   },
