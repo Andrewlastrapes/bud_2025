@@ -31,21 +31,26 @@ public static class RecurringSuggestionsAnalyzer
     // These are clearly not user-controlled recurring fixed costs.
     // Payment apps (Venmo, Zelle, Cash App, PayPal) are intentionally absent —
     // they may represent real recurring fixed costs like rent or daycare.
+    //
+    // NOTE: This list is now supplemented by TransferLikeClassifier for more
+    // precise transfer detection. The classifier handles:
+    //   - CreditCardPayment (ONLINE PAYMENT - THANK YOU, PAYMENT THANK YOU, etc.)
+    //   - WalletLoad (AMEX SEND)
+    //   - OwnAccountTransfer (TRANSFER TO SAVINGS, ACCOUNT TRANSFER, etc.)
+    //   - InvestmentTransfer (FIDELITY, VANGUARD, SCHWAB, ROBINHOOD, etc.)
+    //
+    // This legacy list is retained for backwards compatibility and as a fallback.
     private static readonly string[] HardExcludeFragments =
     {
         "ATM WITHDRAWAL", "ATM CASH", "ATM FEE", "CASH WITHDRAWAL",
         "WIRE TRANSFER", "WIRE XFER",
-        "SAVINGS TRANSFER", "TRANSFER TO SAVINGS", "TRANSFER TO CHECKING",
-        "ACCOUNT TRANSFER", "INTERNAL TRANSFER", "OWN ACCOUNT",
-        "BROKERAGE TRANSFER", "INVESTMENT TRANSFER",
-        "FIDELITY", "VANGUARD", "SCHWAB", "ETRADE", "E*TRADE", "ROBINHOOD",
-        "CREDIT CARD PAYMENT", "CREDIT CARD PMT",
-        "AUTOPAY", "AUTO-PAY",
         "LOAN PAYMENT", "LOAN PMT",
         "MORTGAGE PAYMENT",
     };
 
     // ── Payment-app keyword fragments — ambiguous, higher threshold required ──
+    // These are intentionally NOT hard-excluded because they can represent real
+    // recurring fixed costs like rent or daycare payments.
     private static readonly string[] PaymentAppFragments =
     {
         "VENMO", "ZELLE", "CASH APP", "CASHAPP", "PAYPAL",
@@ -253,7 +258,19 @@ public static class RecurringSuggestionsAnalyzer
         int incomeCount = group.Count(t => t.SuggestedKind != TransactionSuggestedKind.Unknown);
         if (incomeCount > group.Count / 2) return true;
 
-        // Keyword-based hard exclusions
+        // Use TransferLikeClassifier for precise transfer detection
+        // Check a representative transaction from the group (use the first one)
+        var sampleTx = group.First();
+        var transferClassification = TransferLikeClassifier.Classify(
+            sampleTx.Name,
+            sampleTx.MerchantName,
+            sampleTx.Amount,
+            isCredit: false);
+
+        if (transferClassification.ShouldExcludeFromRecurringSuggestions)
+            return true;
+
+        // Legacy keyword-based hard exclusions (fallback)
         return ContainsAny(normalizedName, HardExcludeFragments);
     }
 

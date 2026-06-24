@@ -666,138 +666,176 @@ namespace BudgetApp.Api.Services
                             }
                             else
                             {
-                                // ── Fixed-cost / recurring match ───────────────────────────────
-                                // Priority 1: exact PlaidMerchantName (plaid_discovered or previously
-                                //   enriched manual cost).
-                                // Priority 2: manual cost — amount within tolerance + date window OR
-                                //   amount within tolerance + name-token overlap (null-due-date path).
-                                // MatchType is captured BEFORE enrichment so logs are not polluted.
-                                var (matchedFc, matchType) = FixedCostMatcher.TryMatch(
-                                    fixedCosts, merchantName, absAmount, txDateUtc);
+                                // ── Transfer-like classification ──────────────────────────────
+                                // Check if this debit is a transfer-like transaction (credit card
+                                // payment, wallet load, account transfer, investment transfer).
+                                // Zero-impact transfers (CreditCardPayment, WalletLoad) are marked
+                                // as InternalTransfer + IgnoreForDynamic and skip budget impact.
+                                // Other transfer types (OwnAccountTransfer, InvestmentTransfer) are
+                                // excluded from recurring suggestions but process through normal
+                                // budget logic (deferred to separate transfer-review feature).
+                                var transferClassification = TransferLikeClassifier.Classify(
+                                    t.Name, t.MerchantName, absAmount, isCredit: false);
 
-                                if (matchedFc != null)
+                                if (transferClassification.ShouldZeroBudgetImpact)
                                 {
-                                    matchedFcForNotification = matchedFc;
-                                    isFixedCostMatch = true;
-
-                                    // Enrich manual cost with Plaid merchant info so future syncs
-                                    // fall through to the faster Priority 1 merchant-name path.
-                                    if (string.IsNullOrEmpty(matchedFc.PlaidMerchantName) &&
-                                        !string.IsNullOrEmpty(t.MerchantName))
-                                    {
-                                        matchedFc.PlaidMerchantName = t.MerchantName;
-                                        matchedFc.PlaidAccountId = t.AccountId;
-                                    }
-
-                                    // ── Advance NextDueDate for recurring fixed costs ───────────
-                                    // Advance the due date past the matched transaction so the cost
-                                    // participates correctly in the NEXT budget period and the
-                                    // matcher can re-match next month.
-                                    //
-                                    // OneTime costs are NOT advanced — they retain their original
-                                    // NextDueDate so they remain visible but won't auto-advance.
-                                    //
-                                    // OriginalDueDayOfMonth is used by FixedCostAdvancer to
-                                    // restore the intended day after short-month clamping
-                                    // (e.g. Jan 31 → Feb 28 → Mar 31).
-                                    // We intentionally do NOT update OriginalDueDayOfMonth here —
-                                    // only explicit user edits via PUT /api/fixed-costs/{id} may
-                                    // change it.
-                                    string fcFreq = matchedFc.RecurrenceFrequency ?? "Monthly";
-                                    bool isRecurring = !string.Equals(
-                                        fcFreq, "OneTime", StringComparison.OrdinalIgnoreCase);
-
-                                    if (matchedFc.NextDueDate.HasValue && isRecurring)
-                                    {
-                                        DateTime oldDueDate = matchedFc.NextDueDate.Value;
-                                        matchedFc.NextDueDate = FixedCostAdvancer.AdvanceNextDueDate(
-                                            oldDueDate,
-                                            fcFreq,
-                                            txDateUtc,
-                                            matchedFc.OriginalDueDayOfMonth);
-                                        matchedFc.UpdatedAt = DateTime.UtcNow;
-
-                                        _logger.LogInformation(
-                                            "Fixed cost NextDueDate advanced: " +
-                                            "fixedCostId={FixedCostId} fixedCostName={FixedCostName} " +
-                                            "recurrenceFrequency={Frequency} " +
-                                            "oldDueDate={OldDueDate} newDueDate={NewDueDate} " +
-                                            "triggeredByTx={PlaidTxId}",
-                                            matchedFc.Id, matchedFc.Name, fcFreq,
-                                            oldDueDate.ToString("yyyy-MM-dd"),
-                                            matchedFc.NextDueDate.Value.ToString("yyyy-MM-dd"),
-                                            t.TransactionId);
-                                    }
+                                    // CreditCardPayment or WalletLoad — zero budget impact
+                                    newTx.SuggestedKind = TransactionSuggestedKind.InternalTransfer;
+                                    newTx.UserDecision = TransactionUserDecision.IgnoreForDynamic;
+                                    newTx.BudgetAppliedAmount = null;
 
                                     _logger.LogInformation(
-                                        "Transaction matched as fixed cost (no budget impact): " +
+                                        "Transaction classified as zero-impact transfer: " +
                                         "plaidTxId={PlaidTxId} merchant={Merchant} amount={Amount} " +
-                                        "matchedFixedCostId={FixedCostId} matchedFixedCostName={FixedCostName} " +
-                                        "matchType={MatchType}",
+                                        "subtype={Subtype} reason={Reason}",
                                         t.TransactionId, merchantName, absAmount,
-                                        matchedFc.Id, matchedFc.Name, matchType);
+                                        transferClassification.Subtype, transferClassification.Reason);
+
+                                    // Skip large expense detection, fixed-cost matching, and
+                                    // spend notification for zero-impact transfers.
+                                    // These transactions will not appear in pending deposits
+                                    // because UserDecision = IgnoreForDynamic.
                                 }
                                 else
                                 {
-                                    bool isSuspiciousHold = SuspiciousHoldDetector.IsSuspiciousHold(
-                                        t.MerchantName, t.Name, absAmount, isPending);
+                                    // Not a zero-impact transfer — process through normal budget logic.
+                                    // This includes:
+                                    //   - Normal merchant spend
+                                    //   - OwnAccountTransfer (deferred to separate review feature)
+                                    //   - InvestmentTransfer (deferred to separate review feature)
 
-                                    if (isSuspiciousHold)
+                                    // ── Fixed-cost / recurring match ───────────────────────────────
+                                    // Priority 1: exact PlaidMerchantName (plaid_discovered or previously
+                                    //   enriched manual cost).
+                                    // Priority 2: manual cost — amount within tolerance + date window OR
+                                    //   amount within tolerance + name-token overlap (null-due-date path).
+                                    // MatchType is captured BEFORE enrichment so logs are not polluted.
+                                    var (matchedFc, matchType) = FixedCostMatcher.TryMatch(
+                                        fixedCosts, merchantName, absAmount, txDateUtc);
+
+                                    if (matchedFc != null)
                                     {
-                                        newTx.IsSuspiciousHold = true;
-                                        newTx.HoldReviewed = false;
+                                        matchedFcForNotification = matchedFc;
+                                        isFixedCostMatch = true;
+
+                                        // Enrich manual cost with Plaid merchant info so future syncs
+                                        // fall through to the faster Priority 1 merchant-name path.
+                                        if (string.IsNullOrEmpty(matchedFc.PlaidMerchantName) &&
+                                            !string.IsNullOrEmpty(t.MerchantName))
+                                        {
+                                            matchedFc.PlaidMerchantName = t.MerchantName;
+                                            matchedFc.PlaidAccountId = t.AccountId;
+                                        }
+
+                                        // ── Advance NextDueDate for recurring fixed costs ───────────
+                                        // Advance the due date past the matched transaction so the cost
+                                        // participates correctly in the NEXT budget period and the
+                                        // matcher can re-match next month.
+                                        //
+                                        // OneTime costs are NOT advanced — they retain their original
+                                        // NextDueDate so they remain visible but won't auto-advance.
+                                        //
+                                        // OriginalDueDayOfMonth is used by FixedCostAdvancer to
+                                        // restore the intended day after short-month clamping
+                                        // (e.g. Jan 31 → Feb 28 → Mar 31).
+                                        // We intentionally do NOT update OriginalDueDayOfMonth here —
+                                        // only explicit user edits via PUT /api/fixed-costs/{id} may
+                                        // change it.
+                                        string fcFreq = matchedFc.RecurrenceFrequency ?? "Monthly";
+                                        bool isRecurring = !string.Equals(
+                                            fcFreq, "OneTime", StringComparison.OrdinalIgnoreCase);
+
+                                        if (matchedFc.NextDueDate.HasValue && isRecurring)
+                                        {
+                                            DateTime oldDueDate = matchedFc.NextDueDate.Value;
+                                            matchedFc.NextDueDate = FixedCostAdvancer.AdvanceNextDueDate(
+                                                oldDueDate,
+                                                fcFreq,
+                                                txDateUtc,
+                                                matchedFc.OriginalDueDayOfMonth);
+                                            matchedFc.UpdatedAt = DateTime.UtcNow;
+
+                                            _logger.LogInformation(
+                                                "Fixed cost NextDueDate advanced: " +
+                                                "fixedCostId={FixedCostId} fixedCostName={FixedCostName} " +
+                                                "recurrenceFrequency={Frequency} " +
+                                                "oldDueDate={OldDueDate} newDueDate={NewDueDate} " +
+                                                "triggeredByTx={PlaidTxId}",
+                                                matchedFc.Id, matchedFc.Name, fcFreq,
+                                                oldDueDate.ToString("yyyy-MM-dd"),
+                                                matchedFc.NextDueDate.Value.ToString("yyyy-MM-dd"),
+                                                t.TransactionId);
+                                        }
+
                                         _logger.LogInformation(
-                                            "Transaction flagged as suspicious hold " +
-                                            "(BudgetAppliedAmount=0, awaiting user override): " +
-                                            "plaidTxId={PlaidTxId} merchant={Merchant} amount={Amount}",
-                                            t.TransactionId, merchantName, absAmount);
+                                            "Transaction matched as fixed cost (no budget impact): " +
+                                            "plaidTxId={PlaidTxId} merchant={Merchant} amount={Amount} " +
+                                            "matchedFixedCostId={FixedCostId} matchedFixedCostName={FixedCostName} " +
+                                            "matchType={MatchType}",
+                                            t.TransactionId, merchantName, absAmount,
+                                            matchedFc.Id, matchedFc.Name, matchType);
                                     }
-
-                                    // ── Pending-to-posted reconciliation ──────────────────────────────
-                                    // A posted transaction that carries a PendingTransactionId is
-                                    // replacing a prior pending row.  Normally the pending row also
-                                    // appears in the Removed list and its BudgetAppliedAmount has
-                                    // already been reversed above.  But if the pending row did NOT
-                                    // appear in Removed (out-of-order webhook, prior sync gap, etc.)
-                                    // we look it up and apply only the DELTA to prevent double-counting.
-                                    Transaction? priorPending = null;
-                                    if (!string.IsNullOrEmpty(t.PendingTransactionId))
+                                    else
                                     {
-                                        priorPending = await _dbContext.Transactions
-                                            .FirstOrDefaultAsync(x =>
-                                                x.UserId == user.Id &&
-                                                x.PlaidTransactionId == t.PendingTransactionId);
-                                    }
+                                        bool isSuspiciousHold = SuspiciousHoldDetector.IsSuspiciousHold(
+                                            t.MerchantName, t.Name, absAmount, isPending);
 
-                                    // The amount that SHOULD affect the dynamic balance going forward:
-                                    //   suspicious hold → 0   (user sets override via hold review flow)
-                                    //   normal spend    → absAmount
-                                    decimal desiredImpact = PendingReconciliationCalculator
-                                        .ComputeDesiredBudgetImpact(
-                                            absAmount,
-                                            isFixedCostMatch: false,
-                                            isSuspiciousHold,
-                                            holdOverrideAmount: null);
+                                        if (isSuspiciousHold)
+                                        {
+                                            newTx.IsSuspiciousHold = true;
+                                            newTx.HoldReviewed = false;
+                                            _logger.LogInformation(
+                                                "Transaction flagged as suspicious hold " +
+                                                "(BudgetAppliedAmount=0, awaiting user override): " +
+                                                "plaidTxId={PlaidTxId} merchant={Merchant} amount={Amount}",
+                                                t.TransactionId, merchantName, absAmount);
+                                        }
 
-                                    // Amount already applied via the prior pending row (0 if none).
-                                    decimal existingApplied = priorPending?.BudgetAppliedAmount ?? 0m;
+                                        // ── Pending-to-posted reconciliation ──────────────────────────────
+                                        // A posted transaction that carries a PendingTransactionId is
+                                        // replacing a prior pending row.  Normally the pending row also
+                                        // appears in the Removed list and its BudgetAppliedAmount has
+                                        // already been reversed above.  But if the pending row did NOT
+                                        // appear in Removed (out-of-order webhook, prior sync gap, etc.)
+                                        // we look it up and apply only the DELTA to prevent double-counting.
+                                        Transaction? priorPending = null;
+                                        if (!string.IsNullOrEmpty(t.PendingTransactionId))
+                                        {
+                                            priorPending = await _dbContext.Transactions
+                                                .FirstOrDefaultAsync(x =>
+                                                    x.UserId == user.Id &&
+                                                    x.PlaidTransactionId == t.PendingTransactionId);
+                                        }
 
-                                    // Net balance change (negative = balance drops, positive = rises).
-                                    decimal netDelta = PendingReconciliationCalculator
-                                        .ComputeBalanceDelta(desiredImpact, existingApplied);
+                                        // The amount that SHOULD affect the dynamic balance going forward:
+                                        //   suspicious hold → 0   (user sets override via hold review flow)
+                                        //   normal spend    → absAmount
+                                        decimal desiredImpact = PendingReconciliationCalculator
+                                            .ComputeDesiredBudgetImpact(
+                                                absAmount,
+                                                isFixedCostMatch: false,
+                                                isSuspiciousHold,
+                                                holdOverrideAmount: null);
 
-                                    newTx.BudgetAppliedAmount = desiredImpact;
-                                    balanceDelta += netDelta;
-                                    notifyRunningBalance += netDelta;
+                                        // Amount already applied via the prior pending row (0 if none).
+                                        decimal existingApplied = priorPending?.BudgetAppliedAmount ?? 0m;
 
-                                    if (priorPending != null)
-                                    {
-                                        // Neutralize prior pending so the Removed handler cannot
-                                        // double-reverse it if Plaid sends it in a future Removed list.
-                                        priorPending.BudgetAppliedAmount = 0m;
+                                        // Net balance change (negative = balance drops, positive = rises).
+                                        decimal netDelta = PendingReconciliationCalculator
+                                            .ComputeBalanceDelta(desiredImpact, existingApplied);
 
-                                        _logger.LogInformation(
-                                            "PENDING_TO_POSTED_RECONCILIATION: " +
+                                        newTx.BudgetAppliedAmount = desiredImpact;
+                                        balanceDelta += netDelta;
+                                        notifyRunningBalance += netDelta;
+
+                                        if (priorPending != null)
+                                        {
+                                            // Neutralize prior pending so the Removed handler cannot
+                                            // double-reverse it if Plaid sends it in a future Removed list.
+                                            priorPending.BudgetAppliedAmount = 0m;
+
+                                            _logger.LogInformation(
+                                                "PENDING_TO_POSTED_RECONCILIATION: " +
                                             "postedPlaidTxId={PostedId} " +
                                             "priorPendingPlaidTxId={PendingId} " +
                                             "priorApplied={PriorApplied} " +
@@ -806,28 +844,29 @@ namespace BudgetApp.Api.Services
                                             t.TransactionId, t.PendingTransactionId,
                                             existingApplied, desiredImpact, netDelta);
 
-                                        SentrySdk.AddBreadcrumb(
-                                            $"pending-to-posted-reconciliation: " +
-                                            $"posted={t.TransactionId} " +
-                                            $"pending={t.PendingTransactionId} " +
-                                            $"priorApplied={existingApplied} " +
-                                            $"desiredImpact={desiredImpact} " +
-                                            $"netDelta={netDelta}",
-                                            level: BreadcrumbLevel.Info);
-                                    }
+                                            SentrySdk.AddBreadcrumb(
+                                                $"pending-to-posted-reconciliation: " +
+                                                $"posted={t.TransactionId} " +
+                                                $"pending={t.PendingTransactionId} " +
+                                                $"priorApplied={existingApplied} " +
+                                                $"desiredImpact={desiredImpact} " +
+                                                $"netDelta={netDelta}",
+                                                level: BreadcrumbLevel.Info);
+                                        }
 
-                                    if (user.ExpectedPaycheckAmount > 0 &&
-                                        _budgetEngine.IsLargeExpense(absAmount, user.ExpectedPaycheckAmount))
-                                    {
-                                        newTx.IsLargeExpenseCandidate = true;
-                                        newTx.LargeExpenseHandled = false;
-                                        _logger.LogInformation(
-                                            "Transaction flagged as large expense candidate: " +
-                                            "plaidTxId={PlaidTxId} amount={Amount}",
-                                            t.TransactionId, absAmount);
+                                        if (user.ExpectedPaycheckAmount > 0 &&
+                                            _budgetEngine.IsLargeExpense(absAmount, user.ExpectedPaycheckAmount))
+                                        {
+                                            newTx.IsLargeExpenseCandidate = true;
+                                            newTx.LargeExpenseHandled = false;
+                                            _logger.LogInformation(
+                                                "Transaction flagged as large expense candidate: " +
+                                                "plaidTxId={PlaidTxId} amount={Amount}",
+                                                t.TransactionId, absAmount);
+                                        }
                                     }
-                                }
-                            }
+                                } // end else (not zero-impact transfer)
+                            } // end else (debit transaction)
 
                             await _dbContext.Transactions.AddAsync(newTx);
 
