@@ -7,6 +7,7 @@ import {
   createUserWithEmailAndPassword,
   signInWithEmailAndPassword,
 } from "firebase/auth";
+import { ensureDeviceRegisteredForCurrentUser } from "../services/notificationRegistration";
 
 export default function LoginScreen() {
   const [email, setEmail] = useState("");
@@ -18,7 +19,16 @@ export default function LoginScreen() {
     setIsLoading(true);
     setError(null);
     try {
-      await signInWithEmailAndPassword(auth, email, password);
+      const cred = await signInWithEmailAndPassword(auth, email, password);
+
+      // Register device for push notifications after successful login
+      // This handles existing users who may not have device rows yet
+      try {
+        await ensureDeviceRegisteredForCurrentUser(cred.user);
+      } catch (deviceRegError) {
+        console.error("[Login] Device registration failed:", deviceRegError);
+        // Don't block login flow if device registration fails
+      }
     } catch (e) {
       setError(e.message);
     }
@@ -69,6 +79,18 @@ export default function LoginScreen() {
         throw new Error(
           `Backend registration failed ${response.status}: ${responseText}`,
         );
+      }
+
+      // ── CRITICAL FIX: Register device AFTER backend user creation ──────────
+      // This eliminates the race condition where device registration arrives
+      // before the backend user exists, causing 404 "User not found" errors.
+      // The helper has retry logic to handle any remaining edge cases.
+      try {
+        await ensureDeviceRegisteredForCurrentUser(fbUser);
+      } catch (deviceRegError) {
+        console.error("[SignUp] Device registration failed:", deviceRegError);
+        // Don't block signup flow if device registration fails
+        // The App.js auth state listener will retry on next app launch
       }
     } catch (e) {
       setError(e.message);

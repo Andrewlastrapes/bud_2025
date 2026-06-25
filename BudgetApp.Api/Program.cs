@@ -2639,7 +2639,11 @@ app.MapPost("/api/notifications/register-device",
 
             var decodedToken = await FirebaseAuth.DefaultInstance.VerifyIdTokenAsync(idToken);
             var user = await dbContext.Users.FirstOrDefaultAsync(u => u.FirebaseUuid == decodedToken.Uid);
-            if (user == null) return Results.NotFound("User not found.");
+            if (user == null)
+            {
+                Console.WriteLine($"[DeviceReg] User not found for Firebase UID {decodedToken.Uid}");
+                return Results.NotFound("User not found.");
+            }
 
             var existing = await dbContext.UserDevices
                 .FirstOrDefaultAsync(d =>

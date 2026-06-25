@@ -32,6 +32,7 @@ import { Platform } from "react-native";
 
 import { auth } from "./firebaseConfig";
 import { onAuthStateChanged, signOut } from "firebase/auth";
+import { ensureDeviceRegisteredForCurrentUser } from "./services/notificationRegistration";
 
 // --- Screens & Navigators ---
 import HomeScreen from "./screens/HomeScreen";
@@ -71,27 +72,6 @@ Notifications.setNotificationHandler({
     shouldSetBadge: false,
   }),
 });
-
-async function registerForPushNotificationsAsync() {
-  if (!Device.isDevice) {
-    console.log("Push notifications require a physical device/emulator.");
-    return null;
-  }
-
-  const { status: existingStatus } = await Notifications.getPermissionsAsync();
-  let finalStatus = existingStatus;
-  if (existingStatus !== "granted") {
-    const { status } = await Notifications.requestPermissionsAsync();
-    finalStatus = status;
-  }
-  if (finalStatus !== "granted") {
-    console.log("Notification permission not granted.");
-    return null;
-  }
-
-  const tokenData = await Notifications.getExpoPushTokenAsync();
-  return tokenData.data;
-}
 
 /**
  * Bottom tab navigator for the main app
@@ -308,33 +288,18 @@ function App() {
   }, []);
 
   useEffect(() => {
-    const setupNotifications = async () => {
-      if (Platform.OS === "web") {
-        console.log("Skipping push notification registration on web");
-        return;
-      }
+    // Register device for push notifications when auth state changes
+    // This handles:
+    // 1. Existing users who log in (may not have device rows yet)
+    // 2. Users who complete onboarding
+    // 3. App restarts with authenticated user
+    // The helper has cache/in-flight guards to prevent duplicate calls
+    if (!fbUser) return;
 
-      if (!fbUser) return;
-
-      try {
-        const expoPushToken = await registerForPushNotificationsAsync();
-        if (!expoPushToken) return;
-
-        const idToken = await fbUser.getIdToken();
-
-        await axios.post(
-          `${API_BASE_URL}/api/notifications/register-device`,
-          { expoPushToken, platform: Platform.OS },
-          { headers: { Authorization: `Bearer ${idToken}` } },
-        );
-
-        console.log("Push token registered:", expoPushToken);
-      } catch (e) {
-        console.error("Failed to register push notifications:", e);
-      }
-    };
-
-    setupNotifications();
+    ensureDeviceRegisteredForCurrentUser(fbUser).catch((e) => {
+      console.error("[App] Device registration failed:", e);
+      // Don't block app flow if device registration fails
+    });
   }, [fbUser]);
 
   useEffect(() => {
