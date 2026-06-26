@@ -10,10 +10,9 @@ import {
 } from "react-native";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import { API_BASE_URL } from "../config/api";
-import { useTheme } from "../config/theme";
+import { colors } from "../config/theme";
 
 export default function PaycheckSummaryScreen({ route, navigation }) {
-  const { colors } = useTheme();
   const { summaryId } = route.params ?? {};
   const [summary, setSummary] = useState(null);
   const [loading, setLoading] = useState(true);
