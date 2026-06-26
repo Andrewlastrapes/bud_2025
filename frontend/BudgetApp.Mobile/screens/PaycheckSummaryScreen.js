@@ -8,7 +8,7 @@ import {
   ActivityIndicator,
   Alert,
 } from "react-native";
-import AsyncStorage from "@react-native-async-storage/async-storage";
+import { auth } from "../firebaseConfig";
 import { API_BASE_URL } from "../config/api";
 import { colors } from "../config/theme";
 
@@ -18,15 +18,22 @@ export default function PaycheckSummaryScreen({ route, navigation }) {
   const [loading, setLoading] = useState(true);
   const [submitting, setSubmitting] = useState(false);
 
+  const getAuthHeader = async () => {
+    const user = auth.currentUser;
+    if (!user) throw new Error("No user logged in.");
+    const token = await user.getIdToken(true);
+    return { Authorization: `Bearer ${token}` };
+  };
+
   useEffect(() => {
     fetchSummary();
   }, []);
 
   const fetchSummary = async () => {
     try {
-      const token = await AsyncStorage.getItem("authToken");
+      const headers = await getAuthHeader();
       const res = await fetch(`${API_BASE_URL}/api/paycheck-summary/current`, {
-        headers: { Authorization: `Bearer ${token}` },
+        headers,
       });
       if (res.ok && res.status !== 204) {
         const data = await res.json();
@@ -43,7 +50,7 @@ export default function PaycheckSummaryScreen({ route, navigation }) {
     if (!summary) return;
     setSubmitting(true);
     try {
-      const token = await AsyncStorage.getItem("authToken");
+      const headers = await getAuthHeader();
       const body = { decision };
       if (amount !== undefined) body.amount = amount;
 
@@ -52,7 +59,7 @@ export default function PaycheckSummaryScreen({ route, navigation }) {
         {
           method: "POST",
           headers: {
-            Authorization: `Bearer ${token}`,
+            ...headers,
             "Content-Type": "application/json",
           },
           body: JSON.stringify(body),
